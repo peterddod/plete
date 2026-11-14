@@ -458,8 +458,8 @@ fn handle_hook(
                     }
                     _ => None,
                 };
-                // Its agent profile's instructions, after its brief, on the
-                // same terms as the policy line.
+                // Its agent profile's instructions, then its project's shared
+                // docs, after its brief, on the same terms as the policy line.
                 let own =
                     parented || (task.parent_id.is_none() && names_task(launched_for, &task.id));
                 let profile = match (own, task.kind) {
@@ -472,9 +472,29 @@ fn handle_hook(
                     },
                     _ => None,
                 };
+                let docs = match (&task.project, task.kind, own) {
+                    (Some(project), TaskKind::Work, true) => {
+                        match crate::projects::ensure_docs(app, project) {
+                            Ok(dir) => Some(crate::projects::docs_line(
+                                project,
+                                &dir,
+                                crate::projects::may_write_docs(app, task),
+                            )),
+                            Err(e) => {
+                                eprintln!("plete task-hook {event}: {e:#}");
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
                 let context = brief.map(|brief| {
-                    let parts: Vec<String> =
-                        brief.into_iter().chain(profile).chain(policy).collect();
+                    let parts: Vec<String> = brief
+                        .into_iter()
+                        .chain(profile)
+                        .chain(policy)
+                        .chain(docs)
+                        .collect();
                     parts.join("\n\n")
                 });
                 match context {

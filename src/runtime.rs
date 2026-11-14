@@ -257,6 +257,21 @@ fn start_tmux(
         Ok(args) => spec.argv.extend(args),
         Err(e) => warnings.push(format!("no agent arguments from the task's project: {e:#}")),
     }
+    // The project's shared docs, outside the task, for its agent to read and,
+    // when it may, to write.
+    let docs = match (&task.project, task.kind) {
+        (Some(project), TaskKind::Work) => match projects::ensure_docs(app, project) {
+            Ok(docs) => spec.harness.add_dir_args(&docs).map(|args| {
+                spec.argv.extend(args);
+                docs
+            }),
+            Err(e) => {
+                warnings.push(format!("no shared docs for project {project}: {e:#}"));
+                None
+            }
+        },
+        _ => None,
+    };
     let dir = tasks::task_dir(app, task);
     if !dir.is_dir() {
         bail!("the task directory {} is missing", dir.display());
@@ -323,6 +338,13 @@ fn start_tmux(
                 let rules = &profile.settings.permissions;
                 hooks.extra_allow.extend(rules.allow.iter().cloned());
                 hooks.extra_deny.extend(rules.deny.iter().cloned());
+            }
+            if let Some(docs) = docs.as_deref() {
+                let rules = spec.harness.edit_rules(docs);
+                match projects::may_write_docs(app, task) {
+                    true => hooks.extra_allow.extend(rules),
+                    false => hooks.extra_deny.extend(rules),
+                }
             }
             Some(hooks)
         }
