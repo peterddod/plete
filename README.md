@@ -1656,6 +1656,65 @@ into tasks.
 | `plete cd` | `plete exec` (subshell) or `plete cd` via init-shell |
 | `plete cd --print` | `plete path` |
 
+## What's new in v0.16
+
+jeet is now **plete**, and it can search your documents.
+
+### Renamed to plete
+
+- **The binary, package, tap and apt repository are called plete.** The
+  repository is [peterddod/plete](https://github.com/peterddod/plete); the
+  old URLs redirect, except the apt repository, which moves to
+  `https://peterddod.github.io/plete` (rerun the installer once, or edit
+  `/etc/apt/sources.list.d/jeet.list`). See [Renamed from jeet](#renamed-from-jeet).
+- **`jeet` keeps working.** Homebrew installs `bin/jeet` as a link to
+  plete, and the deb a `/usr/bin/jeet` link, so running agents' hooks,
+  launchd jobs and the line in your shell rc carry on across the upgrade.
+  `brew upgrade` moves a `jeet` install to `plete` on its own; the deb
+  replaces the `jeet` package.
+- **Two homes.** Existing tasks, projects, reviews, the index and config stay
+  in `~/.jeet` and are read from there; new tasks, projects, reviews and
+  clones go to `~/.plete`. Everything that names plete reads the old name
+  too: `JEET_*` variables, `jeet-*` tmux sessions, `.jeet/` markers, `refs/jeet`,
+  `jeet://` links and keyring entries.
+- **`plete migrate-home`** moves everything left in `~/.jeet` to `~/.plete`,
+  when you choose to. It backs up first, prints its plan and what may break
+  (running sessions especially), needs `--yes`, refuses while agent sessions
+  are alive unless `--force`, can be run again if interrupted, and leaves
+  `~/.jeet` as a link to `~/.plete`.
+- **`pt`, if you want it.** `plete alias install` makes `pt` a short name for
+  plete in `~/.local/bin` or `~/bin`; `plete alias status|uninstall` check and
+  remove it. No package ships `pt`, and it never replaces another `pt`.
+- **`plete doctor`** lists what still runs under the old name: old launchd
+  jobs, `jeet-*` tmux sessions, `.jeet/` markers, the line in your shell rc.
+
+### Search
+
+- **`plete search <question>`** finds the notes, briefs, reports, plans,
+  design docs and READMEs that answer a question in plain language, ranked
+  by BM25 over their sections, with the best passages of each
+  ([Search](#search)). `--in`, `-n`, `--json`, `--status` and `--reset`.
+- **What it searches follows the caller**: the user and the assistant see
+  everything; a task sees its own folder, the tasks below it, their projects
+  and repositories, never the assistant's notes or a task above it.
+- `[search] exclude` and `[search] exclude_repos` leave paths and
+  repositories out ([Searching documents](#searching-documents)).
+
+### Permissions
+
+- **`assistant.interrupt`**: a task or manager granted it by name can push a
+  report or message straight into the assistant's session with
+  `plete report <kind> --interrupt "…"` or `plete task send assistant
+  --interrupt "…"`. No default grant includes it; without it the message
+  waits in the inbox as before
+  ([Letting a task interrupt the assistant](#letting-a-task-interrupt-the-assistant)).
+
+### Development
+
+- A development build refuses to migrate the index in the account's real
+  home, even with a faked `$HOME`: only `PLETE_ALLOW_DEV_MIGRATE=<index path>`
+  lets it. The test suite drops every inherited `PLETE_*` and `JEET_*`.
+
 ## What's new in v0.15
 
 Reviews that wait to be opened, one session per task, and no restrictions
