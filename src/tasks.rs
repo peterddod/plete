@@ -723,7 +723,7 @@ fn child_budget(
         }
         return Ok(Some(want));
     }
-    if kind != TaskKind::Manager && parent.kind == TaskKind::Assistant {
+    if kind != TaskKind::Manager && !d.default_budget && parent.kind == TaskKind::Assistant {
         return Ok(None);
     }
     let cut = |want: Option<i64>, left: Option<i64>| match (want, left) {

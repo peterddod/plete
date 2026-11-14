@@ -66,7 +66,11 @@ pub struct Capability {
 }
 
 pub const CAPABILITIES: &[Capability] = &[
-    cap("task.create", "create tasks", &["plete task new"]),
+    cap(
+        "task.create",
+        "create tasks",
+        &["plete task new", "plete manager new"],
+    ),
     cap("task.open", "start task agents", &["plete task open"]),
     cap(
         "task.send",
@@ -138,7 +142,6 @@ pub const CAPABILITIES: &[Capability] = &[
         "install or remove the background GitHub watcher",
         &["plete watch install", "plete watch uninstall"],
     ),
-    cap("manager.create", "make managers", &["plete manager new"]),
     cap(
         "task.grant",
         "change what tasks under it may do and spend",
@@ -332,6 +335,7 @@ pub const OWN: &[&str] = &["plete todo", "plete brief"];
 pub fn capability(name: &str) -> Option<&'static Capability> {
     let name = match name {
         // Their names before any task could have tasks under it.
+        "manager.create" => "task.create",
         "manager.grant" => "task.grant",
         "manager.stop" => "task.stop",
         name => name,
@@ -796,8 +800,8 @@ pub fn gate(command: Option<&Commands>, terminal: bool) -> Gate {
         Commands::Task { command } => task_gate(command),
         Commands::Manager { command } => match command {
             ManagerCommands::New { name, .. } => needs(
-                "manager.create",
-                format!("created manager {name} and started its agent"),
+                "task.create",
+                format!("created task {name}, a planner, and started its agent"),
             ),
             // Each checks who asks and shows only what it may see.
             ManagerCommands::Ls { .. } => Gate::Free,

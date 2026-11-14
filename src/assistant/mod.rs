@@ -917,8 +917,8 @@ pub const RENAME_LINE: &str =
     "\njeet is now called plete; `jeet` still works as an alias, but prefer `plete`.\n";
 
 /// The summary's line on managers (M26), after its first.
-const MANAGERS_LINE: &str = "For an area of work too big for one task, the plete-managers skill \
-                             says how to hand it to a manager.\n";
+const MANAGERS_LINE: &str = "For an area of work too big for one task, the plete-planners skill \
+                             says how to hand it to a planner.\n";
 
 #[allow(clippy::too_many_arguments)]
 pub fn context_text(

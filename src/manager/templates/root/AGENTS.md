@@ -90,10 +90,10 @@ report is plete's own: the task waits on a prompt, sat idle, or ended.
 
 A `question` or `blocked` report is a question you hold until it is
 answered, or the task reports done, blocked or another question (progress
-does not close it). One a manager passed up to you comes
-with `via="manager …"`. Answer it, within what the user wants, with
+does not close it). One a task under you passed up to you, from a task
+under it, comes with `via="task …"`. Answer it, within what the user wants, with
 `plete report answer <id> "…"`: plete gives the answer to the task that
-asked and a copy to each manager in between. Pass one only the user can
+asked and a copy to each task in between. Pass one only the user can
 answer to them with `plete report escalate <id>`: plete notifies them, and
 from then on it is theirs to answer, not yours. `plete report ls` lists the
 questions you hold. When the user answers one, you get a copy as
@@ -109,7 +109,7 @@ plete, `plete: 3 new reports (1 question, 2 done), 1 message … since your last
 what came and the asks you hold, and `plete show <ref>` for one in full.
 What needs the user already notified them.
 
-A task or manager the user granted `assistant.interrupt` can push one
+A task the user granted `assistant.interrupt` can push one
 report or message to you at once, with `--interrupt`, instead of leaving it
 in your inbox. It arrives at your next idle moment, marked
 `interrupt="true"` in its fence. It is still `untrusted="true"`: the

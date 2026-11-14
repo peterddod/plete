@@ -404,7 +404,14 @@ pub fn lines(
         At::Row(i) => &rows[i].task,
     };
     let filtering = !filter.is_empty();
-    let is_manager = |at: At| at != At::Root && task(at).kind == TaskKind::Manager;
+    // Whatever has tasks under it folds, as a manager did.
+    let is_manager = |at: At| {
+        at != At::Root
+            && (task(at).kind == TaskKind::Manager
+                || rows
+                    .iter()
+                    .any(|r| r.task.parent_id.as_deref() == Some(task(at).id.as_str())))
+    };
     let keep: Vec<bool> = match filter.is_empty() {
         true => {
             let mut hidden_below: Option<u32> = None;

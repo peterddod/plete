@@ -20,6 +20,9 @@ use crate::context::App;
 use crate::manager::budget;
 use crate::permissions;
 
+/// `budget = "default"`: `[tasks] default_budget`, as a manager gets.
+pub const DEFAULT_BUDGET: &str = "default";
+
 /// The fence around a profile's settings.
 const FENCE: &str = "+++";
 
@@ -89,7 +92,8 @@ pub struct Settings {
     /// parent's as any grant is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow: Option<Vec<String>>,
-    /// What it may spend unless `--budget` names it: `4h`, `2h,40turns`.
+    /// What it may spend unless `--budget` names it: `4h`, `2h,40turns`, or
+    /// `default` for `[tasks] default_budget`, cut to what is left above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<String>,
     /// How many active tasks it may keep under it.
@@ -208,7 +212,7 @@ fn check(s: &Settings) -> Result<()> {
             }
         }
     }
-    if let Some(b) = &s.budget {
+    if let Some(b) = s.budget.as_deref().filter(|b| *b != DEFAULT_BUDGET) {
         budget::parse_limits(b).map_err(|e| anyhow::anyhow!("budget: {e}"))?;
     }
     if s.max_children == Some(0) {

@@ -359,6 +359,18 @@ fn highest_delivered(home: &Path, task_dir: &Path) -> i64 {
 /// rendered quietly; otherwise as it was, with no ref and no file. It never
 /// fails the delivery: without a ref the item is rendered all the same, and
 /// the task still hears from the others.
+/// Whether what is queued for `task` is posted quiet ([`crate::render`]):
+/// `[messages] render`'s key for its kind, with a planner task, as every
+/// manager now is, taking the managers' key.
+pub fn quiet_for(app: &App, task: &TaskRecord) -> bool {
+    let planner = task.kind == TaskKind::Work
+        && app.db.task_agent(&task.id).ok().flatten().as_deref() == Some("planner");
+    match planner {
+        true => app.config.quiet_for(TaskKind::Manager),
+        false => app.config.quiet_for(task.kind),
+    }
+}
+
 pub fn number_if_quiet(
     app: &App,
     kind: TaskKind,

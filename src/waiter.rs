@@ -817,7 +817,7 @@ impl<'a> Watcher<'a> {
         if queue.is_empty() {
             return Ok(Next::Wait);
         }
-        let quiet = self.app.config.quiet_for(self.task.kind);
+        let quiet = crate::messages::quiet_for(self.app, &self.task);
         if quiet {
             if let Some(until) = render::held(&queue, now, self.app.config.digest_secs()) {
                 self.digest_until = until;
