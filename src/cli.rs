@@ -625,6 +625,10 @@ pub struct Delegation {
     /// `budget = "default"`.
     #[arg(skip)]
     pub default_budget: bool,
+    /// Unasked, grant it `[managers] manager_default` rather than `[tasks]
+    /// default_allow`: what `plete manager new` made, and makes.
+    #[arg(skip)]
+    pub manager_grant: bool,
 }
 
 #[derive(Subcommand)]

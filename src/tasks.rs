@@ -577,7 +577,17 @@ pub fn plan_child(
             bail!(crate::db::tasks::fan_out_full(&parent.slug, active, max));
         }
     }
-    let grant = permissions::check_grant(app, caller, &parent, kind, d.allow.as_deref(), &policy)?;
+    let grant = permissions::check_grant(
+        app,
+        caller,
+        &parent,
+        match d.manager_grant {
+            true => TaskKind::Manager,
+            false => kind,
+        },
+        d.allow.as_deref(),
+        &policy,
+    )?;
     let budget = child_budget(app, &parent, kind, d, &policy)?;
 
     let created_by = match caller {

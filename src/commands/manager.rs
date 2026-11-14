@@ -98,6 +98,8 @@ pub fn new(app: &App, args: &NewManager) -> Result<()> {
         d.parent = Some(crate::assistant::SLUG.to_string());
     }
     let profile = profiles::find(app, PLANNER, args.project)?;
+    // A manager's grant, unasked, as before: `[managers] manager_default`.
+    d.manager_grant = profile.settings.allow.is_none();
     let (d, max_children) = super::task::with_profile(&d, Some(&profile))?;
     let flags = super::task::notify_flags(app, &caller, &d)?;
     let plan = tasks::plan_child(

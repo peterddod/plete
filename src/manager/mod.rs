@@ -68,9 +68,10 @@ pub fn retire_home(dir: &Path, templates: &Path) -> Vec<String> {
     let mut notes = Vec::new();
     let agents = dir.join(instructions::AGENTS_MD);
     if let Ok(text) = std::fs::read_to_string(&agents) {
+        // The template ends in a newline; the import section starts with one.
         let own = text
             .find("\n## Project: ")
-            .map_or(text.as_str(), |at| &text[..=at]);
+            .map_or(text.as_str(), |at| &text[..at]);
         if own == MANAGER_AGENTS_MD {
             let project = dir.join(crate::projects::MANAGER_INSTRUCTIONS);
             let done = match project.is_file() {
@@ -96,6 +97,11 @@ pub fn retire_home(dir: &Path, templates: &Path) -> Vec<String> {
     }
     if let Err(e) = crate::tasks::install_skill(dir, templates) {
         notes.push(format!("could not install the task skill: {e:#}"));
+    }
+    // plete's, read-only to it, and stale now: its brief comes as each
+    // session starts.
+    if let Err(e) = std::fs::remove_file(dir.join(BRIEF_MD)) {
+        notes.push(format!("could not remove the manager's BRIEF.md: {e}"));
     }
     if let Err(e) = std::fs::write(&marker, "") {
         notes.push(format!("could not mark the home tidied: {e}"));
@@ -631,6 +637,49 @@ mod tests {
         assert!(templates(Role::Root)
             .iter()
             .any(|(rel, _)| *rel == ".claude/skills/plete-planners/SKILL.md"));
+    }
+
+    /// A former manager's home, at its first start as a planner: plete's own
+    /// AGENTS.md (with the project's import after it) gives way to the
+    /// project's, its skill to the task skill, its BRIEF.md goes; once.
+    #[test]
+    fn a_former_managers_home_is_tidied_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::write(home.join(BRIEF_MD), "brief").unwrap();
+        std::fs::write(home.join("PROJECT.md"), "# web\n").unwrap();
+        crate::tasks::write_marker(home, "id").unwrap();
+        std::fs::write(home.join(instructions::AGENTS_MD), MANAGER_AGENTS_MD).unwrap();
+        crate::tasks::link_project_instructions(home, "web").unwrap();
+        let skill = home.join(".claude/skills/plete-manager");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), MANAGER_SKILL).unwrap();
+
+        assert_eq!(retire_home(home, Path::new(NONE)), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(home.join("AGENTS.md")).unwrap(),
+            "# web\n"
+        );
+        assert!(!home.join("PROJECT.md").exists() && !home.join(BRIEF_MD).exists());
+        assert!(!skill.exists());
+        assert!(home.join(".claude/skills/plete/SKILL.md").is_file());
+
+        // Once: a BRIEF.md written again since is left alone.
+        std::fs::write(home.join(BRIEF_MD), "brief").unwrap();
+        assert!(retire_home(home, Path::new(NONE)).is_empty());
+        assert!(home.join(BRIEF_MD).exists());
+
+        // An AGENTS.md the user changed is kept, with a note.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join(BRIEF_MD), "brief").unwrap();
+        crate::tasks::write_marker(other.path(), "id2").unwrap();
+        std::fs::write(other.path().join("AGENTS.md"), "mine").unwrap();
+        let notes = retire_home(other.path(), Path::new(NONE));
+        assert!(notes[0].contains("kept AGENTS.md"), "{notes:?}");
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("AGENTS.md")).unwrap(),
+            "mine"
+        );
     }
 
     /// The managers skill, as plete wrote it, goes from an assistant's home;

@@ -300,8 +300,11 @@ fn start_tmux(
                 spec.harness.name()
             ));
         }
-        // A manager's home, the first time it starts as a planner task.
+        // A planner hears from the tasks under it as a manager did, so it
+        // needs what a manager's harness had; and a manager's home is
+        // tidied the first time it starts as one.
         if profile.name == "planner" {
+            tasks::manager_harness(spec.harness)?;
             let templates = crate::config::templates_dir(&app.home);
             warnings.extend(crate::manager::retire_home(&dir, &templates));
         }

@@ -354,11 +354,6 @@ fn highest_delivered(home: &Path, task_dir: &Path) -> i64 {
         .unwrap_or(0)
 }
 
-/// `meta` with no ref yet, of `text` for a task of `kind` in `dir`, given the
-/// ref `m<id>` and kept whole in `delivered.jsonl`, when that kind is
-/// rendered quietly; otherwise as it was, with no ref and no file. It never
-/// fails the delivery: without a ref the item is rendered all the same, and
-/// the task still hears from the others.
 /// Whether what is queued for `task` is posted quiet ([`crate::render`]):
 /// `[messages] render`'s key for its kind, with a planner task, as every
 /// manager now is, taking the managers' key.
@@ -371,6 +366,11 @@ pub fn quiet_for(app: &App, task: &TaskRecord) -> bool {
     }
 }
 
+/// `meta` with no ref yet, of `text` for a task of `kind` in `dir`, given the
+/// ref `m<id>` and kept whole in `delivered.jsonl`, when that kind is
+/// rendered quietly; otherwise as it was, with no ref and no file. It never
+/// fails the delivery: without a ref the item is rendered all the same, and
+/// the task still hears from the others.
 pub fn number_if_quiet(
     app: &App,
     kind: TaskKind,

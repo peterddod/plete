@@ -7831,7 +7831,7 @@ fn chat_sets_up_the_assistant_and_runs_each_session_in_its_own_window() {
         "AGENTS.md",
         "CLAUDE.md",
         ".claude/skills/plete-assistant/SKILL.md",
-        ".claude/skills/plete-managers/SKILL.md",
+        ".claude/skills/plete-planners/SKILL.md",
         "notes/worklog.md",
         "todo.md",
     ] {
@@ -8137,9 +8137,9 @@ fn the_assistant_starts_each_session_with_a_summary_of_the_work() {
         )
         .unwrap();
 
-    // A home made before the managers skill: the summary that points at
+    // A home made before the planners skill: the summary that points at
     // it puts it there first.
-    let skill = home.join(".claude/skills/plete-managers/SKILL.md");
+    let skill = home.join(".claude/skills/plete-planners/SKILL.md");
     std::fs::remove_file(&skill).unwrap();
     let session = assistant_sessions(&lab)[0].0.clone();
     let output = lab.hook(
@@ -11343,8 +11343,10 @@ fn a_root_worker_reaches_only_itself_reads_included() {
     let mut wp_agent = lab.task_pane("wp");
 
     for (args, says) in [
-        (&["manager", "new", "x"][..], "may not make managers"),
-        (&["task", "send", "sib", "hi"], "never message each other"),
+        (
+            &["task", "send", "sib", "hi"][..],
+            "never message each other",
+        ),
         (
             &["manager", "grant", "sib", "task.send"],
             "plete task grant",
