@@ -13,7 +13,7 @@ use crate::db::reviews::ReviewRecord;
 use crate::db::tasks::{ReportKind, TaskKind, TaskRecord, TaskReportRecord, TaskState};
 use crate::link::Link;
 use crate::manager;
-use crate::manager::budget::{self, Threshold};
+use crate::manager::budget::{self, Limits, Threshold};
 use crate::messages::{self, Agent, Delivered, Sender, TmuxAgent};
 use crate::notify::scope::{self, Origin, Raise, Raised};
 use crate::notify::{self, Event, Why};
@@ -1325,7 +1325,8 @@ fn idle_body(app: &App, id: &str, idle: i64) -> Result<String> {
 }
 
 /// What `task`'s parent asked of it, fenced, for its agent's session
-/// context: the brief, what it may do, and how to report.
+/// context: the brief, a planner's budget, what it may do, and how to
+/// report.
 pub fn brief_context(app: &App, task: &TaskRecord) -> Result<String> {
     let parent = match &task.parent_id {
         Some(id) => app.db.get_task(id)?,
@@ -1340,6 +1341,24 @@ pub fn brief_context(app: &App, task: &TaskRecord) -> Result<String> {
         if let Some(done_when) = brief.done_when {
             lines.push(format!("Done when: {done_when}"));
         }
+    }
+    // A worker's budget is its parent's to watch; a planner plans to its
+    // own.
+    if crate::tasks::role(app, task) == crate::db::tasks::Role::Planner {
+        let limits = app
+            .db
+            .budget(&task.id)?
+            .map_or_else(Limits::default, |b| Limits {
+                secs: b.max_secs,
+                turns: b.max_turns,
+            });
+        lines.push(match limits == Limits::default() {
+            true => "Budget: none of your own; those above you still count".to_string(),
+            false => format!(
+                "Budget: {}, for you and the tasks below you together",
+                budget::label(limits)
+            ),
+        });
     }
     // What it may do is a hint here: every command is checked again as it
     // runs, so a broken chain costs the list, not the brief.
@@ -2033,6 +2052,14 @@ mod tests {
     #[test]
     fn a_task_under_a_manager_is_briefed_by_and_reports_to_it() {
         let (_dir, app, m, mw) = manager_lab();
+        // A planner is told its budget; a worker is not.
+        app.db.set_task_agent(&m.id, "planner").unwrap();
+        let planner = brief_context(&app, &m).unwrap();
+        assert!(
+            planner.contains("\nBudget: none of your own; those above you still count\n"),
+            "{planner}"
+        );
+        assert!(!brief_context(&app, &mw).unwrap().contains("Budget:"));
         assert_eq!(crate::manager::label(&m), "task m");
         assert_eq!(crate::manager::label(&mw), "task mw");
         let brief = brief_context(&app, &mw).unwrap();
