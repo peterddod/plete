@@ -133,6 +133,11 @@ pub enum PendingAction {
 pub enum Overlay {
     /// Selection into [`Explorer::worktree_rows`].
     Worktrees { selected: usize },
+    /// ctrl-t: the places the explorer can jump to from here.
+    GoTo {
+        selected: usize,
+        targets: Vec<GoTarget>,
+    },
     Confirm {
         title: String,
         lines: Vec<String>,
@@ -166,6 +171,81 @@ pub enum Overlay {
         input: String,
         pending: Option<PendingReview>,
     },
+}
+
+/// Where a row of the ctrl-t menu leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoKind {
+    /// The worktree being browsed, or the one the explorer came from.
+    Root,
+    Task,
+    Project,
+    /// Not a place: the ctrl-w panel.
+    Worktrees,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoTarget {
+    pub key: char,
+    pub kind: GoKind,
+    pub name: String,
+    /// Where it goes; none for the worktrees panel.
+    pub path: Option<PathBuf>,
+}
+
+/// The ctrl-t menu for an explorer rooted at `root`, from the pieces that
+/// decide it: the task's directory, the project's name and directory, whether
+/// the explorer has a repository, and the worktree it left for the task or
+/// project (`away`). Only places that exist are listed.
+pub fn go_targets(
+    root: &Path,
+    task_dir: Option<&Path>,
+    project: Option<(&str, &Path)>,
+    has_repo: bool,
+    away: Option<&Path>,
+) -> Vec<GoTarget> {
+    let mut targets = Vec::new();
+    // On the task's own directory with nowhere to return to, `r` would be `t`
+    // again.
+    let root_target = match away {
+        Some(worktree) => Some(("worktree root", worktree)),
+        None if task_dir == Some(root) => None,
+        None if has_repo => Some(("worktree root", root)),
+        None => Some(("root", root)),
+    };
+    if let Some((name, path)) = root_target {
+        targets.push(GoTarget {
+            key: 'r',
+            kind: GoKind::Root,
+            name: name.into(),
+            path: Some(path.to_path_buf()),
+        });
+    }
+    if let Some(dir) = task_dir {
+        targets.push(GoTarget {
+            key: 't',
+            kind: GoKind::Task,
+            name: "task root".into(),
+            path: Some(dir.to_path_buf()),
+        });
+    }
+    if let Some((name, dir)) = project {
+        targets.push(GoTarget {
+            key: 'p',
+            kind: GoKind::Project,
+            name: format!("project {name}"),
+            path: Some(dir.to_path_buf()),
+        });
+    }
+    if has_repo {
+        targets.push(GoTarget {
+            key: 'w',
+            kind: GoKind::Worktrees,
+            name: "worktrees…".into(),
+            path: None,
+        });
+    }
+    targets
 }
 
 /// What `/` did, so the caller can explain a step that did not happen without
@@ -273,6 +353,9 @@ pub struct Explorer {
     pub review_job: Option<Job>,
     /// The screen esc returns to, when the explorer was opened from one.
     pub back: Option<String>,
+    /// The repository and worktree root the explorer left to browse the
+    /// task's or project's directory, which `r` in ctrl-t returns to.
+    pub away_from: Option<(RepoRecord, PathBuf)>,
 }
 
 /// Two presses on the same cell inside this window are one double-click.
@@ -320,6 +403,7 @@ impl Explorer {
             pr_area: None,
             review_job: None,
             back: None,
+            away_from: None,
         };
         explorer.set_root(explorer.root.clone())?;
         if cwd != explorer.root {
@@ -1191,6 +1275,51 @@ mod tests {
         std::fs::write(dir.path().join("README.md"), "hi").unwrap();
         std::fs::write(dir.path().join("alpha.txt"), "x").unwrap();
         dir
+    }
+
+    fn keys_of(targets: &[GoTarget]) -> String {
+        targets.iter().map(|t| t.key).collect()
+    }
+
+    #[test]
+    fn go_to_menu_of_a_worktree_outside_any_task() {
+        let root = Path::new("/w/api");
+        let targets = go_targets(root, None, None, true, None);
+        assert_eq!(keys_of(&targets), "rw");
+        assert_eq!(targets[0].path.as_deref(), Some(root));
+        assert_eq!(targets[1].path, None);
+    }
+
+    #[test]
+    fn go_to_menu_of_a_task_canvas_with_a_project() {
+        let task = Path::new("/t/fix");
+        let project = Some(("web", Path::new("/p/web")));
+        // Opened on the canvas: nowhere to return to, so no `r`.
+        assert_eq!(
+            keys_of(&go_targets(task, Some(task), project, false, None)),
+            "tp"
+        );
+        // Having come from a worktree, `r` is that worktree.
+        let away = Path::new("/t/fix/api");
+        let targets = go_targets(task, Some(task), project, false, Some(away));
+        assert_eq!(keys_of(&targets), "rtp");
+        assert_eq!(targets[0].path.as_deref(), Some(away));
+        // In a worktree of the task: everything.
+        let inside = Path::new("/t/fix/api");
+        assert_eq!(
+            keys_of(&go_targets(inside, Some(task), project, true, None)),
+            "rtpw"
+        );
+    }
+
+    #[test]
+    fn go_to_menu_of_a_task_without_a_project_has_no_p() {
+        let task = Path::new("/t/fix");
+        let inside = Path::new("/t/fix/api");
+        assert_eq!(
+            keys_of(&go_targets(inside, Some(task), None, true, None)),
+            "rtw"
+        );
     }
 
     #[test]

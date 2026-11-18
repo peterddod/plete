@@ -46,7 +46,9 @@ use crate::runtime::{self, Admission};
 use crate::tmux;
 use crate::worktrees::{self, WorktreeStatus};
 
-use state::{DiffMap, Exit, Explorer, Overlay, PendingAction, PrLookup, Step, WorktreeRow};
+use state::{
+    DiffMap, Exit, Explorer, GoKind, GoTarget, Overlay, PendingAction, PrLookup, Step, WorktreeRow,
+};
 pub use term::Tui;
 use term::{init_terminal, restore_terminal, suspended};
 
@@ -277,6 +279,7 @@ fn handle_browse_key(
         KeyCode::Char('o') if ctrl => open_repo_prs(app, terminal, explorer, None),
         KeyCode::Char('a') if ctrl => open_agent(app, terminal, explorer)?,
         KeyCode::Char('w') if ctrl => open_worktrees(app, terminal, explorer),
+        KeyCode::Char('t') if ctrl => open_go_to(app, explorer),
         // F1 alone would do, except macOS gives it to the media keys by
         // default and some terminals keep it for their own menu. ctrl-g is
         // "get help" in nano, and it always arrives.
@@ -564,6 +567,7 @@ fn handle_overlay_key(
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let toggled_shut = match (&overlay, key.code) {
         (Overlay::Worktrees { .. }, KeyCode::Char('w')) => ctrl,
+        (Overlay::GoTo { .. }, KeyCode::Char('t')) => ctrl,
         (Overlay::PullRequest { .. }, KeyCode::Char('p')) => ctrl,
         (Overlay::RepoPrs { .. }, KeyCode::Char('o')) => ctrl,
         (Overlay::Help { .. }, KeyCode::Char('g')) => ctrl,
@@ -618,6 +622,30 @@ fn handle_overlay_key(
                 }
             } else {
                 explorer.overlay = Some(overlay);
+            }
+        }
+        Overlay::GoTo {
+            mut selected,
+            targets,
+        } => {
+            let last = targets.len().saturating_sub(1);
+            let chosen = match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = selected.saturating_sub(1);
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(last);
+                    None
+                }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => targets.get(selected),
+                KeyCode::Char(c) => targets.iter().find(|t| t.key == c),
+                _ => None,
+            };
+            match chosen.cloned() {
+                Some(target) => go_to(app, terminal, explorer, &target),
+                None => explorer.overlay = Some(Overlay::GoTo { selected, targets }),
             }
         }
         Overlay::Worktrees { mut selected } => match key.code {
@@ -806,6 +834,117 @@ fn handle_overlay_key(
             }
         },
     }
+    Ok(())
+}
+
+/// ctrl-t: list where the explorer can jump to. The task is looked for at
+/// the root and, when the explorer has left a worktree for the task's or the
+/// project's directory, at the worktree it left: the project's directory is
+/// in no task, but the way back to the task should stay.
+fn open_go_to(app: &App, explorer: &mut Explorer) {
+    let task = crate::tasks::task_at(app, &explorer.root)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            let (_, worktree) = explorer.away_from.as_ref()?;
+            crate::tasks::task_at(app, worktree).ok().flatten()
+        });
+    let task_dir = task
+        .as_ref()
+        .map(|task| crate::tasks::task_dir(app, task))
+        .filter(|dir| dir.is_dir());
+    let project = task
+        .as_ref()
+        .and_then(|task| task.project.as_deref())
+        .and_then(|name| Some((name, crate::projects::existing_dir(app, name).ok()?)));
+    let away = explorer.away_from.as_ref().map(|(_, root)| root.as_path());
+    let targets = state::go_targets(
+        &explorer.root,
+        task_dir.as_deref(),
+        project.as_ref().map(|(name, dir)| (*name, dir.as_path())),
+        explorer.repo.is_some(),
+        away,
+    );
+    explorer.overlay = Some(Overlay::GoTo {
+        selected: 0,
+        targets,
+    });
+}
+
+/// Carry out a row of the ctrl-t menu.
+fn go_to(app: &App, terminal: &mut Tui, explorer: &mut Explorer, target: &GoTarget) {
+    if target.kind == GoKind::Worktrees {
+        open_worktrees(app, terminal, explorer);
+        return;
+    }
+    match go_to_place(app, explorer, target) {
+        Ok(()) => explorer.set_status(format!("went to {}", target.name)),
+        Err(e) => {
+            explorer.overlay = Some(Overlay::Message {
+                title: "could not go there".into(),
+                lines: vec![format!("{e:#}")],
+                from_panel: false,
+            })
+        }
+    }
+}
+
+/// Move to the folder a menu row names. Going where the explorer already is
+/// just puts the cursor back at the top level, open folders kept.
+fn go_to_place(app: &App, explorer: &mut Explorer, target: &GoTarget) -> Result<()> {
+    let Some(path) = target.path.clone() else {
+        return Ok(());
+    };
+    if path == explorer.root {
+        explorer.go_to_folder(&path)?;
+        explorer.overlay = None;
+        return Ok(());
+    }
+    match (target.kind, explorer.away_from.clone()) {
+        // Back to the worktree that was left, with its repository.
+        (GoKind::Root, Some((repo, _))) => {
+            reroot(app, explorer, path, Some(repo), None)?;
+            explorer.away_from = None;
+            Ok(())
+        }
+        (kind, _) => {
+            // Only a repository's worktree is worth coming back to.
+            let left = explorer
+                .repo
+                .clone()
+                .map(|repo| (repo, explorer.root.clone()));
+            let kind = (kind == GoKind::Project).then_some("project");
+            reroot(app, explorer, path, None, kind)?;
+            if left.is_some() {
+                explorer.away_from = left;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Re-root the explorer at `path` in `repo` — none for a folder that is no
+/// repository, such as a task's canvas — redoing everything
+/// [`switch_worktree`] does, so the header and the lookups describe the new
+/// root rather than the old one.
+fn reroot(
+    app: &App,
+    explorer: &mut Explorer,
+    path: PathBuf,
+    repo: Option<RepoRecord>,
+    kind: Option<&str>,
+) -> Result<()> {
+    explorer.set_root(path.clone())?;
+    explorer.repo = repo;
+    let (label, described, status) = describe_root(app, explorer.repo.as_ref(), &path);
+    explorer.root_label = label;
+    explorer.root_kind = kind.map(str::to_string).unwrap_or(described);
+    explorer.root_status = status;
+    // The old root's review has nothing to say about this one.
+    explorer.review_job = None;
+    explorer.overlay = None;
+    refresh_diffs(explorer);
+    start_pr_lookup(explorer);
     Ok(())
 }
 
@@ -1523,5 +1662,101 @@ pub fn start_dir(root: &Path, cwd: &Path) -> PathBuf {
         cwd.to_path_buf()
     } else {
         root.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::tasks::{RunState, TaskKind};
+
+    fn menu(app: &App, explorer: &mut Explorer) -> Vec<GoTarget> {
+        open_go_to(app, explorer);
+        match explorer.overlay.take() {
+            Some(Overlay::GoTo { targets, .. }) => targets,
+            _ => panic!("no menu"),
+        }
+    }
+
+    fn go(app: &App, explorer: &mut Explorer, key: char) {
+        let target = menu(app, explorer)
+            .into_iter()
+            .find(|t| t.key == key)
+            .unwrap_or_else(|| panic!("no row {key}"));
+        go_to_place(app, explorer, &target).unwrap();
+    }
+
+    fn keys(targets: &[GoTarget]) -> String {
+        targets.iter().map(|t| t.key).collect()
+    }
+
+    #[test]
+    fn going_to_the_task_root_the_project_and_back_to_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let app = App {
+            config: crate::config::load_or_create(&home).unwrap(),
+            db: crate::db::Database::open(&crate::config::index_path(&home)).unwrap(),
+            new_home: None,
+            home,
+        };
+        let task = TaskRecord {
+            id: "t1".into(),
+            slug: "fix".into(),
+            name: "fix".into(),
+            project: Some("web".into()),
+            kind: TaskKind::Work,
+            state: TaskState::Active,
+            created_at: 0,
+            last_activity: 0,
+            parent_id: None,
+            placement: crate::placement::for_new(),
+            run_state: RunState::Run,
+            run_state_by: None,
+            max_children: None,
+        };
+        app.db.insert_task(&task).unwrap();
+        let task_dir = crate::tasks::task_dir(&app, &task);
+        let worktree = task_dir.join("api");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(task_dir.join(".plete")).unwrap();
+        std::fs::write(crate::tasks::marker_path(&task_dir), "t1").unwrap();
+        let project_dir = crate::projects::dir(&app, "web").unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let repo = RepoRecord {
+            id: "github.com/acme/api".into(),
+            trunk_path: worktree.to_string_lossy().to_string(),
+            remote_url: "https://github.com/acme/api.git".into(),
+            default_branch: "main".into(),
+        };
+        let mut explorer = Explorer::new(
+            Some(repo),
+            worktree.clone(),
+            "main".into(),
+            "trunk".into(),
+            WorktreeStatus::default(),
+            worktree.clone(),
+        )
+        .unwrap();
+        assert_eq!(keys(&menu(&app, &mut explorer)), "rtpw");
+
+        go(&app, &mut explorer, 't');
+        assert!(explorer.repo.is_none());
+        assert_eq!((&explorer.root, &explorer.cwd), (&task_dir, &task_dir));
+        assert_eq!(explorer.root_kind, "task canvas");
+        assert_eq!(keys(&menu(&app, &mut explorer)), "rtp");
+
+        go(&app, &mut explorer, 'p');
+        assert!(explorer.repo.is_none());
+        assert_eq!(explorer.root, project_dir);
+        assert_eq!(explorer.root_kind, "project");
+        // The project's directory is in no task, but the way back stays.
+        assert_eq!(keys(&menu(&app, &mut explorer)), "rtp");
+
+        go(&app, &mut explorer, 'r');
+        assert!(explorer.repo.is_some());
+        assert_eq!((&explorer.root, &explorer.cwd), (&worktree, &worktree));
+        assert!(explorer.away_from.is_none());
     }
 }

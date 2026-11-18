@@ -223,6 +223,7 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 | key | action |
 |-----|--------|
 | `ctrl-a` | the task's coding agent, in its tmux session — started if it is not running |
+| `ctrl-t` | go to: `r` the worktree root (or back to the worktree you left), `t` the task's directory, `p` the task's project folder, `w` the worktrees |
 | `ctrl-w` | the repository's worktrees: `⏎` switches to one, `o` opens its PR |
 | `ctrl-f` | diff the highlighted file or folder against the default branch |
 | `ctrl-p` | the pull request: `o` open, `a` approve, `c` comment, `x` request changes, `d` diff, `v` review output |
