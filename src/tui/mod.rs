@@ -439,7 +439,10 @@ fn execute_command(
             .and_then(|path| descendant_of(&explorer.cwd, path));
         explorer.reload(keep.as_deref())?;
     } else {
+        // `show` reuses the open folders' listings, which still hold whatever
+        // the command just removed or moved: read them all again.
         explorer.show(dir, None)?;
+        explorer.reload(None)?;
     }
     refresh_root_status(app, explorer);
     ran?;
@@ -493,9 +496,14 @@ fn handle_mouse(terminal: &mut Tui, explorer: &mut Explorer, mouse: MouseEvent) 
                 // and canonicalising here would refuse to let you climb out.
                 // The cursor lands on that folder's row, so a crumb click can be
                 // undone by pressing → straight back.
+                let before = (explorer.cwd.clone(), explorer.cursor_row());
                 explorer.go_to_folder(&dir)?;
-                explorer.note_navigating_click(mouse.column, mouse.row);
-                explorer.set_status("");
+                // Only a click that moved us arms the double-click guard; the
+                // root crumb clicked at the root changes nothing.
+                if (explorer.cwd.clone(), explorer.cursor_row()) != before {
+                    explorer.note_navigating_click(mouse.column, mouse.row);
+                    explorer.set_status("");
+                }
             } else if let Some(row) = clicked_row(explorer, mouse.column, mouse.row) {
                 if explorer.select_row(row) {
                     // A folder opens or closes on a single click — that is what

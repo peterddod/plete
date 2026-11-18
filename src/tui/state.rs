@@ -322,8 +322,11 @@ impl Explorer {
             back: None,
         };
         explorer.set_root(explorer.root.clone())?;
-        if cwd != explorer.root {
-            explorer.show(cwd, None)?;
+        // A start that names the root's folders by another path (`/tmp` for
+        // `/private/tmp`, a symlinked cwd) is not lexically under it: browse
+        // from the root rather than refuse to open at all.
+        if cwd != explorer.root && explorer.show(cwd, None).is_err() {
+            explorer.set_root(explorer.root.clone())?;
         }
         Ok(explorer)
     }
@@ -354,10 +357,17 @@ impl Explorer {
         listings.insert(self.root.clone(), read_dir(&self.root, self.show_hidden)?);
         let mut open = BTreeSet::new();
         // A folder sorts after its parent, so one that was dropped has already
-        // kept its children from being read.
+        // kept its children from being read. Its parent must still list it as
+        // a folder, too: one that was hidden (ctrl-d), removed or replaced by a
+        // file would otherwise stay open with no row leading to it, and the
+        // cursor could sit in it unseen.
         for dir in &self.open {
-            let parent_kept = dir.parent().is_some_and(|p| listings.contains_key(p));
-            if !parent_kept {
+            let listed = dir.parent().and_then(|p| listings.get(p)).is_some_and(
+                |(entries, _): &(Vec<FsEntry>, usize)| {
+                    entries.iter().any(|e| e.is_dir && e.path == *dir)
+                },
+            );
+            if !listed {
                 continue;
             }
             if let Ok(listing) = read_dir(dir, self.show_hidden) {
@@ -2391,6 +2401,58 @@ mod tests {
         assert!(!explorer.select_row(99));
         assert!(explorer.select_row(3));
         assert_eq!(cursor(&explorer), "z");
+        assert_eq!(explorer.cwd, dir.path());
+    }
+
+    /// Hiding dotfiles with the cursor inside a dot-folder closes it: no
+    /// folder stays open, and no cursor stays in one, with no row leading there.
+    #[test]
+    fn hiding_the_folder_the_cursor_is_in_brings_it_back_up() {
+        let dir = tree();
+        std::fs::create_dir(dir.path().join(".github")).unwrap();
+        std::fs::write(dir.path().join(".github/ci.yml"), "c").unwrap();
+        let mut explorer = explorer_at(dir.path());
+        explorer.toggle_hidden(None).unwrap();
+        explorer.show(dir.path().join(".github"), None).unwrap();
+        assert_eq!(cursor(&explorer), "ci.yml");
+
+        explorer.toggle_hidden(None).unwrap();
+        assert_eq!(explorer.cwd, dir.path());
+        assert!(!explorer.is_open(&dir.path().join(".github")));
+        assert!(explorer.cursor_row().is_some(), "the cursor is on a row");
+        assert!(!names(&explorer).iter().any(|n| n.contains("ci.yml")));
+    }
+
+    /// A folder removed from under the tree drops out on the next reload,
+    /// its children with it.
+    #[test]
+    fn a_removed_open_folder_drops_out() {
+        let dir = tree();
+        let mut explorer = explorer_at(dir.path());
+        explorer.show(dir.path().join("a/b"), None).unwrap();
+        std::fs::remove_dir_all(dir.path().join("a/b")).unwrap();
+        explorer.show(dir.path().join("a"), None).unwrap();
+        explorer.reload(None).unwrap();
+        assert!(!explorer.is_open(&dir.path().join("a/b")));
+        assert!(!names(&explorer).iter().any(|n| n.trim() == "b"));
+        assert!(!names(&explorer).iter().any(|n| n.contains("deep.txt")));
+    }
+
+    /// A start directory that is not lexically under the root opens at the
+    /// root instead of refusing to open.
+    #[test]
+    fn a_start_outside_the_root_opens_at_the_root() {
+        let dir = tree();
+        let elsewhere = TempDir::new().unwrap();
+        let explorer = Explorer::new(
+            None,
+            dir.path().to_path_buf(),
+            "canvas".into(),
+            "task".into(),
+            WorktreeStatus::default(),
+            elsewhere.path().to_path_buf(),
+        )
+        .unwrap();
         assert_eq!(explorer.cwd, dir.path());
     }
 }
