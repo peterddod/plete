@@ -7,8 +7,17 @@
 //!   pass, and which of those PRs have since been merged or closed;
 //! - the items of each GitHub Project in `[watch] projects`.
 //!
-//! Each poll also archives the reviews whose PR has been merged or closed,
-//! once their agent is idle ([`crate::review::sweep`]).
+//! Notifications run on a faster cadence than the rest: `[watch]
+//! notifications_interval_secs` (60), never sooner than GitHub's
+//! `X-Poll-Interval`, against `interval_secs` (120) for the PRs' checks and
+//! the projects. The timer runs `plete watch --once` every tick (the smaller
+//! of the two), and each source is asked only when its own
+//! interval has passed ([`poll`]); a tick with nothing due asks GitHub
+//! nothing.
+//!
+//! Each poll that asks for the PRs' checks also archives the reviews whose
+//! PR has been merged or closed, once their agent is idle
+//! ([`crate::review::sweep`]).
 //!
 //! What is new since the last poll — by `$PLETE_HOME/watch.json` — becomes an
 //! [`Event`] of one [`EventKind`], and the first `[[assistant.rules]]` that
@@ -25,7 +34,7 @@
 //! its permissions by plete, whatever the event says.
 //!
 //! `plete watch install` has launchd run `plete watch --once` every
-//! `interval_secs` on macOS; elsewhere it prints a systemd user timer to
+//! tick on macOS; elsewhere it prints a systemd user timer to
 //! install by hand. The tasks list starts a poll in the background too,
 //! while it is open, when config.toml has a `[watch]` section.
 
@@ -39,9 +48,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::assistant;
-use crate::config::{
-    self, Config, EventKind, ProjectRef, Rule, RuleAction, WatchConfig, DEFAULT_WATCH_INTERVAL_SECS,
-};
+use crate::config::{self, Config, EventKind, ProjectRef, Rule, RuleAction, WatchConfig};
 use crate::context::App;
 use crate::db::reviews::ReviewRecord;
 use crate::db::tasks::{TaskKind, TaskRecord, TaskState};
@@ -283,6 +290,18 @@ pub struct WatchState {
     /// fingerprint of everything about the item.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, BTreeMap<String, String>>,
+    /// When notifications were last asked for, in unix seconds; missing
+    /// is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications_at: Option<i64>,
+    /// GitHub's last `X-Poll-Interval`: seconds notifications may not be
+    /// asked for again within.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<u64>,
+    /// When the PRs' checks and the projects were last polled; missing is
+    /// due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broad_at: Option<i64>,
 }
 
 /// One of the user's open PRs as last seen.
@@ -388,12 +407,51 @@ impl Source for Gh<'_> {
 pub struct Polled {
     pub events: Vec<Event>,
     pub errors: Vec<String>,
+    /// The PRs' checks and the projects were polled too, not only the
+    /// notifications.
+    pub broad: bool,
+}
+
+/// A timer fires a little early now and then, and times are whole seconds:
+/// an interval counts as passed this many seconds short. It applies to
+/// GitHub's `X-Poll-Interval` as well, since a 60 s timer that fired at 59 s
+/// would otherwise miss every other tick; a 304 is free, and a few seconds'
+/// haste is not what the header guards against.
+const SLACK_SECS: i64 = 5;
+
+fn passed(since: Option<i64>, now: i64, interval: u64) -> bool {
+    match since {
+        None => true,
+        // The clock moved back: ask rather than wait it out.
+        Some(at) if at > now => true,
+        Some(at) => now - at + SLACK_SECS >= interval as i64,
+    }
+}
+
+/// Whether the PRs' checks and the projects are due: `interval_secs` has
+/// passed since they were last polled.
+fn broad_due(watch: &WatchConfig, state: &WatchState, now: i64) -> bool {
+    passed(state.broad_at, now, watch.interval_secs())
+}
+
+/// Whether notifications are due: the configured interval, and GitHub's
+/// last `X-Poll-Interval` if longer, has passed since they were last asked
+/// for.
+fn notifications_due(watch: &WatchConfig, state: &WatchState, now: i64) -> bool {
+    let every = watch
+        .notifications_interval_secs()
+        .max(state.poll_interval.unwrap_or(0));
+    passed(state.notifications_at, now, every)
 }
 
 /// Ask `source` what is new since `state`, and bring `state` up to date. A
 /// source that fails keeps what it had, and is asked again next time.
 pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, now: i64) -> Polled {
     let mut out = Polled::default();
+    let broad = broad_due(watch, state, now);
+    let notifications = notifications_due(watch, state, now);
+    // A source that failed is asked again on the next tick.
+    let mut broad_failed = false;
     let watched =
         |repo: &str| watch.repos.is_empty() || watch.repos.iter().any(|p| repo_matches(p, repo));
 
@@ -404,37 +462,50 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
         .iter()
         .flat_map(|c| c.keys().cloned())
         .collect();
-    match source.my_open_prs() {
-        Ok(prs) => {
-            let prs: Vec<MyPr> = prs.into_iter().filter(|p| watched(&p.repo)).collect();
-            own.extend(prs.iter().map(|p| pr_key(&p.repo, p.number)));
-            let diff = diff_checks(state.checks.as_ref(), &prs, now);
-            out.events.extend(diff.events);
-            let mut checks = diff.checks;
-            for gone in diff.departed {
-                match source.pull_state(&gone.repo, gone.number) {
-                    Ok(pull) => out
-                        .events
-                        .extend(closed_event(checked_event(&gone, now), &pull)),
-                    // Kept, to be asked about again next time.
-                    Err(e) => {
-                        out.errors
-                            .push(format!("{} #{}: {e:#}", gone.repo, gone.number));
-                        checks.insert(pr_key(&gone.repo, gone.number), gone);
+    if broad {
+        match source.my_open_prs() {
+            Ok(prs) => {
+                let prs: Vec<MyPr> = prs.into_iter().filter(|p| watched(&p.repo)).collect();
+                own.extend(prs.iter().map(|p| pr_key(&p.repo, p.number)));
+                let diff = diff_checks(state.checks.as_ref(), &prs, now);
+                out.events.extend(diff.events);
+                let mut checks = diff.checks;
+                for gone in diff.departed {
+                    match source.pull_state(&gone.repo, gone.number) {
+                        Ok(pull) => out
+                            .events
+                            .extend(closed_event(checked_event(&gone, now), &pull)),
+                        // Kept, to be asked about again next time.
+                        Err(e) => {
+                            out.errors
+                                .push(format!("{} #{}: {e:#}", gone.repo, gone.number));
+                            checks.insert(pr_key(&gone.repo, gone.number), gone);
+                        }
                     }
                 }
+                state.checks = Some(checks);
             }
-            state.checks = Some(checks);
+            Err(e) => {
+                broad_failed = true;
+                out.errors.push(format!("your pull requests: {e:#}"))
+            }
         }
-        Err(e) => out.errors.push(format!("your pull requests: {e:#}")),
     }
 
-    match source.notifications(state.last_modified.as_deref()) {
-        Ok(Notifications::NotModified) => {}
-        Ok(Notifications::Changed {
+    if notifications {
+        state.notifications_at = Some(now);
+    }
+    match notifications.then(|| source.notifications(state.last_modified.as_deref())) {
+        None => {}
+        Some(Ok(Notifications::NotModified { poll_interval })) => {
+            state.poll_interval = poll_interval.or(state.poll_interval);
+        }
+        Some(Ok(Notifications::Changed {
             last_modified,
             threads,
-        }) => {
+            poll_interval,
+        })) => {
+            state.poll_interval = poll_interval.or(state.poll_interval);
             let first = state.seen.is_none();
             let before = state.seen.take().unwrap_or_default();
             let mut seen = BTreeMap::new();
@@ -477,13 +548,13 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
             state.seen = Some(seen);
             state.last_modified = last_modified;
         }
-        Err(e) => out.errors.push(format!("notifications: {e:#}")),
+        Some(Err(e)) => out.errors.push(format!("notifications: {e:#}")),
     }
 
     // Projects are watched because they were named, whatever their items'
     // repositories.
     let mut projects = BTreeMap::new();
-    for project in &watch.projects {
+    for project in watch.projects.iter().filter(|_| broad) {
         let key = format!("{}/{}", project.owner, project.number);
         if !valid_owner(&project.owner) {
             out.errors.push(format!(
@@ -499,6 +570,7 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
                 projects.insert(key, seen);
             }
             Err(e) => {
+                broad_failed = true;
                 out.errors.push(format!("project {key}: {e:#}"));
                 if let Some(before) = state.projects.remove(&key) {
                     projects.insert(key, before);
@@ -506,7 +578,11 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
             }
         }
     }
-    state.projects = projects;
+    if broad {
+        state.projects = projects;
+        state.broad_at = Some(now).filter(|_| !broad_failed);
+    }
+    out.broad = broad;
 
     // One PR's news told twice — its notification and its checks — is told
     // once.
@@ -1188,7 +1264,8 @@ fn start_review(
     let has_agent = crate::review::asked(&crate::review::folded(app, review)).is_some();
     if app.config.review.command().is_some() && !has_agent {
         eprintln!(
-            "plete: not reviewing {place}: [review] command is deprecated and not run by a              watch rule; remove it to have the agent review; it is notified"
+            "plete: not reviewing {place}: [review] command is deprecated and not run by a \
+             watch rule; remove it to have the agent review; it is notified"
         );
         return Ok(None);
     }
@@ -1496,10 +1573,14 @@ pub fn run_once(app: &App) -> Result<()> {
     if let Err(e) = reports::sweep_asks(app, now_secs()) {
         eprintln!("plete: warning: could not look for unanswered asks: {e:#}");
     }
-    // A reviewed PR merged or closed archives its review, once idle.
-    match crate::review::sweep(app) {
-        Ok(lines) => lines.iter().for_each(|l| eprintln!("plete: {l}")),
-        Err(e) => eprintln!("plete: warning: could not look for finished reviews: {e:#}"),
+    // A reviewed PR merged or closed archives its review, once idle. It
+    // asks GitHub about each, so only when the checks and projects were
+    // polled too.
+    if polled.broad {
+        match crate::review::sweep(app) {
+            Ok(lines) => lines.iter().for_each(|l| eprintln!("plete: {l}")),
+            Err(e) => eprintln!("plete: warning: could not look for finished reviews: {e:#}"),
+        }
     }
     // A session whose wake channel stopped is resumed for a new watcher.
     if let Err(e) = crate::wake::sweep_wake(app, now_secs(), true) {
@@ -1536,7 +1617,10 @@ pub fn run_once(app: &App) -> Result<()> {
     if let Err(e) = log_events(&app.home, &logged) {
         eprintln!("plete: warning: {e:#}");
     }
-    eprintln!("plete: {}", summary(&sent));
+    // A tick that found nothing and polled no more is not worth a log line.
+    if !sent.is_empty() || polled.broad {
+        eprintln!("plete: {}", summary(&sent));
+    }
     if polled.errors.is_empty() {
         return Ok(());
     }
@@ -1578,7 +1662,7 @@ pub fn maybe_background(home: &Path, new_home: Option<&Path>, config: &Config) {
         return;
     };
     let now = now_secs();
-    if !store::is_due(last_claim(home), now, watch.interval_secs()) {
+    if !store::is_due(last_claim(home), now, watch.tick_secs()) {
         return;
     }
     // Held: a poll is running. Taken: released straight away for the one
@@ -1747,11 +1831,12 @@ pub fn systemd_units(
     ]
 }
 
-fn interval(app: &App) -> u64 {
-    app.config
-        .watch
-        .as_ref()
-        .map_or(DEFAULT_WATCH_INTERVAL_SECS, WatchConfig::interval_secs)
+/// How often the timer runs `plete watch --once`.
+fn tick(app: &App) -> u64 {
+    app.config.watch.as_ref().map_or_else(
+        || WatchConfig::default().tick_secs(),
+        WatchConfig::tick_secs,
+    )
 }
 
 /// The plist of the launchd job `label`.
@@ -1827,7 +1912,7 @@ pub(crate) fn first_line(bytes: &[u8]) -> String {
 
 /// `plete watch install`.
 pub fn install(app: &App) -> Result<()> {
-    let interval = interval(app);
+    let interval = tick(app);
     if interval == 0 {
         bail!("`[watch] interval_secs` is 0; set how often to poll GitHub first");
     }
@@ -1943,14 +2028,19 @@ pub fn status(app: &App) -> Result<()> {
         None => "does not poll (no `[watch]` in config.toml)",
     };
     println!("tasks list:  {tasks_list}");
-    println!("every:       {}s", interval(app));
+    let watch = app.config.watch.clone().unwrap_or_default();
+    println!(
+        "every:       {}s (notifications {}s, the rest {}s)",
+        tick(app),
+        watch.notifications_interval_secs(),
+        watch.interval_secs()
+    );
     let state = load_state(&config::watch_state_path(&app.home));
     let last = match state.last_run {
         Some(at) => format!("{} ({})", assistant::date(at), crate::agent::age_label(at)),
         None => "never".into(),
     };
     println!("last poll:   {last}");
-    let watch = app.config.watch.clone().unwrap_or_default();
     let repos = match watch.repos.is_empty() {
         true => "all".to_string(),
         false => watch.repos.join(", "),
@@ -2014,7 +2104,9 @@ mod tests {
                 .push(since.map(str::to_string));
             match self.notifications.borrow_mut().pop() {
                 Some(answer) => answer,
-                None => Ok(Notifications::NotModified),
+                None => Ok(Notifications::NotModified {
+                    poll_interval: None,
+                }),
             }
         }
         fn my_open_prs(&self) -> Result<Vec<MyPr>> {
@@ -2035,6 +2127,7 @@ mod tests {
         Ok(Notifications::Changed {
             last_modified: Some(last_modified.into()),
             threads: github::parse_notifications(&fixture(file)).unwrap(),
+            poll_interval: None,
         })
     }
 
@@ -2127,14 +2220,123 @@ mod tests {
             checks: Some(BTreeMap::new()),
             ..WatchState::default()
         };
-        let before = state.clone();
+        let mut before = state.clone();
         let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000);
         assert!(polled.events.is_empty());
+        assert_eq!(state.notifications_at, Some(1000));
+        assert_eq!(state.broad_at, Some(1000));
+        before.notifications_at = Some(1000);
+        before.broad_at = Some(1000);
         assert_eq!(
             *fake.asked_since.borrow(),
             [Some("Sat, 10 Oct 2026 12:00:00 GMT".to_string())]
         );
         assert_eq!(state, before);
+    }
+
+    fn state_polled_at(at: i64) -> WatchState {
+        WatchState {
+            last_modified: Some("then".into()),
+            seen: Some(BTreeMap::new()),
+            checks: Some(BTreeMap::from([(
+                "acme/api#1".to_string(),
+                PrCheck {
+                    repo: "acme/api".into(),
+                    number: 1,
+                    title: "t".into(),
+                    url: String::new(),
+                    branch: String::new(),
+                    sha: "a".into(),
+                    state: "SUCCESS".into(),
+                    failures: 0,
+                },
+            )])),
+            projects: BTreeMap::from([("acme/3".into(), BTreeMap::new())]),
+            notifications_at: Some(at),
+            broad_at: Some(at),
+            ..WatchState::default()
+        }
+    }
+
+    #[test]
+    fn a_tick_inside_the_interval_asks_only_for_notifications() {
+        let fake = Fake::default();
+        // The PRs would say the one open PR is gone, if asked.
+        let watch = WatchConfig {
+            projects: vec![ProjectRef {
+                owner: "acme".into(),
+                number: 3,
+            }],
+            ..WatchConfig::default()
+        };
+        let mut state = state_polled_at(1000);
+        let before = state.clone();
+        // 60 s on: notifications are due (60 s), the rest (120 s) is not.
+        let polled = poll(&fake, &watch, &mut state, 1060);
+        assert!(!polled.broad);
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        assert_eq!(fake.prs.borrow().len(), 0);
+        assert_eq!(state.checks, before.checks);
+        assert_eq!(state.projects, before.projects);
+        assert_eq!(state.broad_at, Some(1000));
+        assert_eq!(state.notifications_at, Some(1060));
+        // A tick that early again asks nothing at all.
+        let polled = poll(&fake, &watch, &mut state, 1070);
+        assert!(!polled.broad && polled.events.is_empty());
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        // At 120 s everything is due again.
+        let polled = poll(&fake, &watch, &mut state, 1120);
+        assert!(polled.broad);
+        assert_eq!(state.broad_at, Some(1120));
+        assert_eq!(fake.asked_since.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_timer_a_few_seconds_early_is_not_missed() {
+        let fake = Fake::default();
+        let mut state = state_polled_at(1000);
+        poll(&fake, &WatchConfig::default(), &mut state, 1056);
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        poll(&fake, &WatchConfig::default(), &mut state, 1060);
+        assert_eq!(fake.asked_since.borrow().len(), 1, "4 s after is too soon");
+    }
+
+    #[test]
+    fn notifications_wait_out_githubs_poll_interval() {
+        let fake = Fake::default();
+        let mut state = state_polled_at(1000);
+        state.poll_interval = Some(300);
+        poll(&fake, &WatchConfig::default(), &mut state, 1100);
+        assert!(fake.asked_since.borrow().is_empty());
+        poll(&fake, &WatchConfig::default(), &mut state, 1300);
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        // What GitHub says next is kept; a 304 answer carries it too.
+        fake.notifications
+            .borrow_mut()
+            .push(Ok(Notifications::NotModified {
+                poll_interval: Some(90),
+            }));
+        poll(&fake, &WatchConfig::default(), &mut state, 1600);
+        assert_eq!(state.poll_interval, Some(90));
+    }
+
+    #[test]
+    fn old_state_polls_everything() {
+        let fake = Fake::default();
+        let mut state = WatchState {
+            last_run: Some(999),
+            last_modified: Some("then".into()),
+            seen: Some(BTreeMap::new()),
+            checks: Some(BTreeMap::new()),
+            ..WatchState::default()
+        };
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000);
+        assert!(polled.broad);
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        assert_eq!(
+            (state.notifications_at, state.broad_at),
+            (Some(1000), Some(1000))
+        );
     }
 
     #[test]
@@ -2774,9 +2976,19 @@ mod tests {
             seen: Some(BTreeMap::from([("1".into(), "t".into())])),
             checks: Some(BTreeMap::new()),
             projects: BTreeMap::from([("acme/3".into(), BTreeMap::new())]),
+            notifications_at: Some(7),
+            poll_interval: Some(60),
+            broad_at: Some(6),
         };
         save_state(&path, &state).unwrap();
         assert_eq!(load_state(&path), state);
+        // State from before the fast tick has none of the three: all due.
+        std::fs::write(&path, r#"{"last_run":5,"seen":{}}"#).unwrap();
+        let old = load_state(&path);
+        assert_eq!(
+            (old.notifications_at, old.poll_interval, old.broad_at),
+            (None, None, None)
+        );
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_state(&path), WatchState::default());
     }

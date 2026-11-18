@@ -1457,7 +1457,7 @@ no permission for its own list.
 
 ```bash
 plete watch --once        # poll now: what launchd and the tasks list run
-plete watch install       # every `interval_secs`, with launchd (macOS)
+plete watch install       # every tick (see `[watch]` below), with launchd (macOS)
 plete watch uninstall
 plete watch status        # installed? last poll, what it follows
 ```
@@ -1479,7 +1479,8 @@ none matches is a desktop notification:
 [watch]
 repos = ["acme/*", "me/plete"]                 # only these (default: all)
 projects = [{ owner = "acme", number = 3 }]   # needs `gh auth refresh -s read:project`
-interval_secs = 120
+interval_secs = 120                           # PRs' checks, projects (0: the tasks list does not poll)
+notifications_interval_secs = 60              # notifications; 0: no faster than interval_secs
 
 [[assistant.rules]]
 on = ["review_requested"]
@@ -1522,6 +1523,16 @@ never cloned): otherwise, or on any error, the event goes to the assistant.
 For any other kind of event the action is a notification. The first rule that
 matches wins, so put this one before a broader `review_requested` rule.
 
+Notifications are asked for every `notifications_interval_secs` (default 60,
+so a review request is seen within about a minute), your open PRs' checks and
+the projects every `interval_secs`. An answer of "not modified" costs nothing
+against GitHub's rate limit, and GitHub's own `X-Poll-Interval` is honoured:
+notifications are never asked for sooner than it says, whatever you set. The
+timer runs `plete watch --once` every tick, the smaller of the two intervals,
+and each source is asked only when it is due; a tick with nothing due asks
+GitHub nothing. An installed timer picks up a changed interval only after you
+run `plete watch install` again.
+
 `on` and `repos` may be left out to match anything. Events for the assistant
 go to its sessions by the rules above (primary, else most recent, else a new
 `events <date>` session), several to a message; an event for a task goes to
@@ -1540,7 +1551,7 @@ event, and where it went, is appended to
 `~/.plete/watch-events.jsonl`.
 
 `plete watch install` writes `~/Library/LaunchAgents/dev.plete.watch.plist`,
-which runs `plete watch --once` every `interval_secs` with the `PATH` you
+which runs `plete watch --once` every tick with the `PATH` you
 installed it from, logging to `~/.plete/watch.log`, and loads it with
 `launchctl bootstrap`. Elsewhere it installs nothing, and prints a systemd user
 service and timer to set up instead. The job never starts a tmux server: one

@@ -1367,11 +1367,15 @@ pub struct NotificationRepo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notifications {
     /// Nothing has changed since the `If-Modified-Since` given.
-    NotModified,
+    NotModified {
+        /// GitHub's `X-Poll-Interval`: seconds before it may be asked again.
+        poll_interval: Option<u64>,
+    },
     /// The unread notifications, and the `Last-Modified` to ask with next.
     Changed {
         last_modified: Option<String>,
         threads: Vec<Notification>,
+        poll_interval: Option<u64>,
     },
 }
 
@@ -1391,6 +1395,7 @@ const NOTIFICATIONS_MAX_PAGES: usize = 10;
 pub fn notifications(dir: &Path, if_modified_since: Option<&str>) -> Result<Notifications> {
     let mut threads = Vec::new();
     let mut last_modified = None;
+    let mut poll_interval = None;
     for page in 1..=NOTIFICATIONS_MAX_PAGES {
         let endpoint = format!("notifications?per_page={NOTIFICATIONS_PER_PAGE}&page={page}");
         let mut args = vec!["api", "--include", endpoint.as_str()];
@@ -1406,11 +1411,16 @@ pub fn notifications(dir: &Path, if_modified_since: Option<&str>) -> Result<Noti
             bail!("{}", gh_error(&output));
         };
         match response.status {
-            304 if page == 1 => return Ok(Notifications::NotModified),
+            304 if page == 1 => {
+                return Ok(Notifications::NotModified {
+                    poll_interval: x_poll_interval(&response),
+                })
+            }
             200 => {}
             status => bail!("GitHub answered {status}: {}", gh_error(&output)),
         }
         if page == 1 {
+            poll_interval = x_poll_interval(&response);
             last_modified = response
                 .header("last-modified")
                 .filter(|v| header_value_ok(v))
@@ -1426,7 +1436,13 @@ pub fn notifications(dir: &Path, if_modified_since: Option<&str>) -> Result<Noti
     Ok(Notifications::Changed {
         last_modified,
         threads,
+        poll_interval,
     })
+}
+
+/// The `X-Poll-Interval` of a response, in seconds.
+fn x_poll_interval(response: &Included) -> Option<u64> {
+    response.header("x-poll-interval")?.parse().ok()
 }
 
 /// A header value safe to send back: printable ASCII on one line.
@@ -1853,6 +1869,7 @@ mod tests {
             response.header("last-modified"),
             Some("Sat, 10 Oct 2026 12:05:00 GMT")
         );
+        assert_eq!(x_poll_interval(&response), Some(60));
         let threads = parse_notifications(response.body).unwrap();
         assert_eq!(threads.len(), 6);
         assert_eq!(threads[0].id, "100");
@@ -1865,6 +1882,9 @@ mod tests {
             parse_included("HTTP/2.0 304 Not Modified\r\nX-Poll-Interval: 60\r\n\r\n").unwrap();
         assert_eq!(response.status, 304);
         assert_eq!(response.body, "");
+        assert_eq!(x_poll_interval(&response), Some(60));
+        let bare = parse_included("HTTP/2.0 304 Not Modified\r\nX-Poll-Interval: soon\r\n\r\n");
+        assert_eq!(x_poll_interval(&bare.unwrap()), None);
         assert!(parse_included("gh: HTTP 401").is_none());
         assert!(parse_included("").is_none());
         // A thread in a shape plete does not know is skipped.
