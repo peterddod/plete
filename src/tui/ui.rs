@@ -1,5 +1,7 @@
 //! Rendering for the explorer.
 
+use std::path::Path;
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -524,6 +526,19 @@ fn listing_title(shown: usize, total: usize, hidden: usize, filter: &str, pane: 
     truncate(&title, run)
 }
 
+/// `path` with the home directory shortened to `~`, for display.
+fn tilde(path: &Path) -> String {
+    let home = dirs::home_dir();
+    match home
+        .as_deref()
+        .and_then(|home| path.strip_prefix(home).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 fn draw_overlay(frame: &mut Frame, explorer: &Explorer, overlay: &Overlay) {
     match overlay {
         Overlay::Worktrees { selected } => {
@@ -581,6 +596,55 @@ fn draw_overlay(frame: &mut Frame, explorer: &Explorer, overlay: &Overlay) {
                         .title_style(Style::default().fg(Color::Green))
                         // Below, where a narrow panel has the room the title lacks.
                         .title_bottom(" ↑↓ move  ⏎ switch  o open PR  r refresh  esc close "),
+                )
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                );
+            frame.render_stateful_widget(list, area, &mut state);
+        }
+        Overlay::GoTo { selected, targets } => {
+            let area = centered_rect(80, 40, frame.area());
+            frame.render_widget(Clear, area);
+            // The menu's own legend lists the letters it offers.
+            let letters = targets
+                .iter()
+                .map(|t| t.key.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let items: Vec<ListItem> = targets
+                .iter()
+                .map(|t| {
+                    let mut spans = vec![
+                        Span::styled(format!(" {}  ", t.key), Style::default().fg(Color::Green)),
+                        Span::styled(
+                            format!("{:<22}", truncate(&t.name, 22)),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ];
+                    if let Some(path) = &t.path {
+                        spans.push(Span::styled(
+                            tilde(path),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    ListItem::new(Line::from(spans))
+                })
+                .collect();
+            let mut state = ListState::default();
+            state.select(if targets.is_empty() {
+                None
+            } else {
+                Some((*selected).min(targets.len() - 1))
+            });
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" go to ")
+                        .title_style(Style::default().fg(Color::Green))
+                        .title_bottom(format!(" ↑↓ move  ⏎ go  {letters}  esc close ")),
                 )
                 .highlight_style(
                     Style::default()
@@ -941,7 +1005,7 @@ pub(super) fn draw_review_body(
 }
 
 /// The key list, as it is both rendered and measured.
-const HELP: [(&str, &str); 26] = [
+const HELP: [(&str, &str); 27] = [
     (
         "a-z, 0-9, …",
         "type to filter this level (live, no key needed)",
@@ -969,6 +1033,10 @@ const HELP: [(&str, &str); 26] = [
     ("Home / End", "jump to the top / bottom"),
     ("", ""),
     ("ctrl-a", "this task's agent, in tmux: started if need be"),
+    (
+        "ctrl-t",
+        "go to: the worktree root, task root, project root, or worktrees",
+    ),
     ("ctrl-w", "worktrees of this repository: switch to one"),
     ("", "  in the panel: o open its PR, r refresh, esc close"),
     (
