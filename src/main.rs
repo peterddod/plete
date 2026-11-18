@@ -367,6 +367,16 @@ fn run(command: Option<Commands>, wake: Option<waiter::WakeEnv>) -> Result<()> {
         }
         Commands::Manager { command } => {
             let app = context::App::open()?;
+            // `new` says so itself; `drain` is plete's own.
+            if matches!(
+                command,
+                ManagerCommands::Ls { .. } | ManagerCommands::Subtree(_)
+            ) {
+                eprintln!(
+                    "plete: `plete manager …` is deprecated: use `plete task …` (`manager ls` is \
+                     `task tree`)"
+                );
+            }
             match command {
                 ManagerCommands::New {
                     name,

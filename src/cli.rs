@@ -654,6 +654,15 @@ pub struct Delegation {
     /// stuck still does. Only the user or the assistant sets it
     #[arg(long)]
     pub quiet: bool,
+    /// Give it `[tasks] default_budget`, cut to what is left, when no
+    /// `--budget` names one: what a manager gets, and a profile asks for with
+    /// `budget = "default"`.
+    #[arg(skip)]
+    pub default_budget: bool,
+    /// Unasked, grant it `[managers] manager_default` rather than `[tasks]
+    /// default_allow`: what `plete manager new` made, and makes.
+    #[arg(skip)]
+    pub manager_grant: bool,
 }
 
 #[derive(Subcommand)]

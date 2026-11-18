@@ -37,9 +37,12 @@ pub enum Role {
 
 const AGENTS_MD: &str = include_str!("templates/root/AGENTS.md");
 const SKILL: &str = include_str!("templates/root/SKILL.md");
-/// The root's skill on making and steering managers (M26): a path of its
-/// own, so a home from before managers gets it too.
-const MANAGERS_SKILL: &str = include_str!("templates/root/managers-SKILL.md");
+/// The root's skill on handing an area of work to a planner: a path of its
+/// own, so a home from before planners gets it too.
+const PLANNERS_SKILL: &str = include_str!("templates/root/planners-SKILL.md");
+/// The skill on managers it replaces, as plete wrote it: taken out of a
+/// home that kept it unchanged.
+const OLD_MANAGERS_SKILL: &str = include_str!("templates/root/old-managers-SKILL.md");
 const WORKLOG: &str = include_str!("templates/root/worklog.md");
 /// What `todo.md` starts as, for the root and for a manager.
 pub const TODO: &str = include_str!("templates/root/todo.md");
@@ -47,6 +50,64 @@ pub const TODO: &str = include_str!("templates/root/todo.md");
 const MANAGER_AGENTS_MD: &str = include_str!("templates/manager/AGENTS.md");
 const MANAGER_SKILL: &str = include_str!("templates/manager/SKILL.md");
 const MANAGER_WORKLOG: &str = include_str!("templates/manager/worklog.md");
+
+/// Marks a former manager's home as tidied for its life as a planner task.
+const RETIRED: &str = "manager-retired";
+
+/// Tidy the home of a task that was a manager, once, as it first starts as a
+/// planner task: the manager's own AGENTS.md (as plete wrote it, with the
+/// project's import at its end) gives way to the project's instructions,
+/// `PROJECT.md`, as a task's AGENTS.md; the manager's skill, unchanged,
+/// gives way to the task skill. What the user changed is kept. `BRIEF.md`,
+/// the notes and the todo list stay. Returns notes for the user.
+pub fn retire_home(dir: &Path, templates: &Path) -> Vec<String> {
+    let marker = crate::tasks::marker_dir(dir).join(RETIRED);
+    if marker.exists() || !dir.join(BRIEF_MD).is_file() {
+        return Vec::new();
+    }
+    let mut notes = Vec::new();
+    let agents = dir.join(instructions::AGENTS_MD);
+    if let Ok(text) = std::fs::read_to_string(&agents) {
+        // The template ends in a newline; the import section starts with one.
+        let own = text
+            .find("\n## Project: ")
+            .map_or(text.as_str(), |at| &text[..at]);
+        if own == MANAGER_AGENTS_MD {
+            let project = dir.join(crate::projects::MANAGER_INSTRUCTIONS);
+            let done = match project.is_file() {
+                true => std::fs::rename(&project, &agents),
+                false => std::fs::remove_file(&agents),
+            };
+            if let Err(e) = done {
+                notes.push(format!("could not replace the manager's AGENTS.md: {e}"));
+            }
+        } else {
+            notes.push(
+                "kept AGENTS.md, which was changed from the manager's: it may still say \
+                 manager things"
+                    .to_string(),
+            );
+        }
+    }
+    let skill = dir.join(".claude/skills/plete-manager");
+    if std::fs::read_to_string(skill.join("SKILL.md")).is_ok_and(|t| t == MANAGER_SKILL) {
+        if let Err(e) = std::fs::remove_dir_all(&skill) {
+            notes.push(format!("could not remove the manager's skill: {e}"));
+        }
+    }
+    if let Err(e) = crate::tasks::install_skill(dir, templates) {
+        notes.push(format!("could not install the task skill: {e:#}"));
+    }
+    // plete's, read-only to it, and stale now: its brief comes as each
+    // session starts.
+    if let Err(e) = std::fs::remove_file(dir.join(BRIEF_MD)) {
+        notes.push(format!("could not remove the manager's BRIEF.md: {e}"));
+    }
+    if let Err(e) = std::fs::write(&marker, "") {
+        notes.push(format!("could not mark the home tidied: {e}"));
+    }
+    notes
+}
 
 /// A manager's brief, which plete writes in its home.
 pub const BRIEF_MD: &str = "BRIEF.md";
@@ -62,7 +123,7 @@ pub(crate) fn templates(role: Role) -> Vec<(&'static str, &'static str)> {
             AGENTS_MD,
             vec![
                 (".claude/skills/plete-assistant/SKILL.md", SKILL),
-                (".claude/skills/plete-managers/SKILL.md", MANAGERS_SKILL),
+                (".claude/skills/plete-planners/SKILL.md", PLANNERS_SKILL),
                 (WORKLOG_MD, WORKLOG),
                 ("todo.md", TODO),
             ],
@@ -118,6 +179,14 @@ pub(crate) fn has_legacy_counterpart(dir: &Path, rel: &str) -> bool {
 
 pub fn ensure_files(dir: &Path, role: Role, overrides: &Path) -> Result<Vec<&'static str>> {
     instructions::migrate(dir).context("move CLAUDE.md to AGENTS.md")?;
+    // The managers skill goes where the planners skill comes, unless the
+    // user changed it.
+    if role == Role::Root {
+        let old = dir.join(".claude/skills/plete-managers");
+        if std::fs::read_to_string(old.join("SKILL.md")).is_ok_and(|t| t == OLD_MANAGERS_SKILL) {
+            let _ = std::fs::remove_dir_all(&old);
+        }
+    }
     let role_dir = match role {
         Role::Root => "root",
         Role::Manager => "manager",
@@ -436,8 +505,8 @@ mod tests {
     #[test]
     fn a_renamed_template_has_its_old_name_as_counterpart() {
         assert_eq!(
-            legacy_counterpart(".claude/skills/plete-managers/SKILL.md").as_deref(),
-            Some(".claude/skills/jeet-managers/SKILL.md")
+            legacy_counterpart(".claude/skills/plete-planners/SKILL.md").as_deref(),
+            Some(".claude/skills/jeet-planners/SKILL.md")
         );
         assert_eq!(
             legacy_counterpart(".claude/skills/plete/SKILL.md").as_deref(),
@@ -509,8 +578,8 @@ mod tests {
             "my skill\n"
         );
         assert_eq!(
-            read(".claude/skills/plete-managers/SKILL.md"),
-            MANAGERS_SKILL
+            read(".claude/skills/plete-planners/SKILL.md"),
+            PLANNERS_SKILL
         );
         assert_eq!(read("CLAUDE.md"), CLAUDE_SHIM);
         assert_eq!(read("todo.md"), TODO);
@@ -563,11 +632,74 @@ mod tests {
         for root_only in ["plete watch", "plete notify", "pr merge", "pr.merge"] {
             assert!(!MANAGER_AGENTS_MD.contains(root_only), "{root_only}");
         }
-        // The root learns of managers in a skill of its own.
-        assert!(MANAGERS_SKILL.starts_with("---\nname: plete-managers\ndescription: "));
+        // The root learns of planners in a skill of its own.
+        assert!(PLANNERS_SKILL.starts_with("---\nname: plete-planners\ndescription: "));
         assert!(templates(Role::Root)
             .iter()
-            .any(|(rel, _)| *rel == ".claude/skills/plete-managers/SKILL.md"));
+            .any(|(rel, _)| *rel == ".claude/skills/plete-planners/SKILL.md"));
+    }
+
+    /// A former manager's home, at its first start as a planner: plete's own
+    /// AGENTS.md (with the project's import after it) gives way to the
+    /// project's, its skill to the task skill, its BRIEF.md goes; once.
+    #[test]
+    fn a_former_managers_home_is_tidied_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::write(home.join(BRIEF_MD), "brief").unwrap();
+        std::fs::write(home.join("PROJECT.md"), "# web\n").unwrap();
+        crate::tasks::write_marker(home, "id").unwrap();
+        std::fs::write(home.join(instructions::AGENTS_MD), MANAGER_AGENTS_MD).unwrap();
+        crate::tasks::link_project_instructions(home, "web").unwrap();
+        let skill = home.join(".claude/skills/plete-manager");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), MANAGER_SKILL).unwrap();
+
+        assert_eq!(retire_home(home, Path::new(NONE)), Vec::<String>::new());
+        assert_eq!(
+            std::fs::read_to_string(home.join("AGENTS.md")).unwrap(),
+            "# web\n"
+        );
+        assert!(!home.join("PROJECT.md").exists() && !home.join(BRIEF_MD).exists());
+        assert!(!skill.exists());
+        assert!(home.join(".claude/skills/plete/SKILL.md").is_file());
+
+        // Once: a BRIEF.md written again since is left alone.
+        std::fs::write(home.join(BRIEF_MD), "brief").unwrap();
+        assert!(retire_home(home, Path::new(NONE)).is_empty());
+        assert!(home.join(BRIEF_MD).exists());
+
+        // An AGENTS.md the user changed is kept, with a note.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join(BRIEF_MD), "brief").unwrap();
+        crate::tasks::write_marker(other.path(), "id2").unwrap();
+        std::fs::write(other.path().join("AGENTS.md"), "mine").unwrap();
+        let notes = retire_home(other.path(), Path::new(NONE));
+        assert!(notes[0].contains("kept AGENTS.md"), "{notes:?}");
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("AGENTS.md")).unwrap(),
+            "mine"
+        );
+    }
+
+    /// The managers skill, as plete wrote it, goes from an assistant's home;
+    /// one the user changed stays.
+    #[test]
+    fn the_old_managers_skill_goes_unless_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join(".claude/skills/plete-managers/SKILL.md");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, OLD_MANAGERS_SKILL).unwrap();
+        ensure_files(dir.path(), Role::Root, Path::new(NONE)).unwrap();
+        assert!(!old.exists());
+        assert!(dir
+            .path()
+            .join(".claude/skills/plete-planners/SKILL.md")
+            .is_file());
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, "mine").unwrap();
+        ensure_files(dir.path(), Role::Root, Path::new(NONE)).unwrap();
+        assert!(old.exists());
     }
 
     /// An index in a tempdir with the assistant and manager `api` under

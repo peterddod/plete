@@ -300,6 +300,14 @@ fn start_tmux(
                 spec.harness.name()
             ));
         }
+        // A planner hears from the tasks under it as a manager did, so it
+        // needs what a manager's harness had; and a manager's home is
+        // tidied the first time it starts as one.
+        if profile.name == "planner" {
+            tasks::manager_harness(spec.harness)?;
+            let templates = crate::config::templates_dir(&app.home);
+            warnings.extend(crate::manager::retire_home(&dir, &templates));
+        }
         warnings.extend(profiles::install_skills(
             app,
             profile,
@@ -309,10 +317,15 @@ fn start_tmux(
     }
     // After the project's arguments, so a `--model` there wins too; the
     // profile's over `[models]`.
+    // A planner, as every manager now is, takes `[models] manager`.
+    let kind = match profile.as_ref().is_some_and(|p| p.name == "planner") {
+        true => TaskKind::Manager,
+        false => task.kind,
+    };
     let model = profile
         .as_ref()
         .and_then(|p| p.settings.model.as_deref())
-        .or(app.config.models.for_kind(task.kind));
+        .or(app.config.models.for_kind(kind));
     let spec = spec.with_model(model);
     // Refused before anything is read for the launch, as it always was.
     if prompt.is_some() && spec.harness.prompt_args("").is_none() {

@@ -1124,7 +1124,7 @@ fn stop(
     let quiet = ctx
         .task
         .as_ref()
-        .is_some_and(|t| ctx.app.config.quiet_for(t.kind));
+        .is_some_and(|t| crate::messages::quiet_for(&ctx.app, t));
     let (queued, rendered) = match &inbox {
         Some(inbox) => take_at_stop(inbox, task_dir, session_id, &ctx.app, quiet, now)
             .unwrap_or_else(|e| {
@@ -2158,6 +2158,12 @@ mod tests {
         full.config = toml::from_str("[messages]\nrender = { managers = \"full\" }\n").unwrap();
         assert!(!full.config.quiet_for(TaskKind::Manager));
         assert!(!app.config.quiet_for(TaskKind::Work));
+        // A planner task is quiet as a manager was; another work task is not.
+        let w = app.db.get_task("w").unwrap().unwrap();
+        assert!(!messages::quiet_for(&app, &w));
+        app.db.set_task_agent("w", "planner").unwrap();
+        assert!(messages::quiet_for(&app, &w));
+        assert!(!messages::quiet_for(&full, &w));
     }
 
     #[test]

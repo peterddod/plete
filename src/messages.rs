@@ -354,6 +354,18 @@ fn highest_delivered(home: &Path, task_dir: &Path) -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether what is queued for `task` is posted quiet ([`crate::render`]):
+/// `[messages] render`'s key for its kind, with a planner task, as every
+/// manager now is, taking the managers' key.
+pub fn quiet_for(app: &App, task: &TaskRecord) -> bool {
+    let planner = task.kind == TaskKind::Work
+        && app.db.task_agent(&task.id).ok().flatten().as_deref() == Some("planner");
+    match planner {
+        true => app.config.quiet_for(TaskKind::Manager),
+        false => app.config.quiet_for(task.kind),
+    }
+}
+
 /// `meta` with no ref yet, of `text` for a task of `kind` in `dir`, given the
 /// ref `m<id>` and kept whole in `delivered.jsonl`, when that kind is
 /// rendered quietly; otherwise as it was, with no ref and no file. It never

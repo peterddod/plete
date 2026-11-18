@@ -2437,14 +2437,15 @@ impl TasksUi {
                         None
                     }
                     (true, Some(node))
-                        if matches!(node.kind, TaskKind::Assistant | TaskKind::Manager) =>
+                        if matches!(node.kind, TaskKind::Assistant | TaskKind::Manager)
+                            || (node.kind == TaskKind::Work && node.parent_id.is_some()) =>
                     {
                         Some(Action::NewChildForm { parent_id: node.id })
                     }
                     (true, Some(node)) => {
                         self.set_status(format!(
-                            "task {} is not a manager: only the assistant and managers have \
-                             tasks under them",
+                            "task {} is not under the assistant: only the assistant and the \
+                             tasks under it have tasks under them",
                             printable(&node.slug)
                         ));
                         None
@@ -4952,7 +4953,8 @@ impl Screen<'_> {
                     return Ok(());
                 };
                 let label = manager::label(&row.task);
-                if !matches!(row.task.kind, TaskKind::Assistant | TaskKind::Manager) {
+                // A planner keeps one, as a manager did; any task may.
+                if row.task.kind == TaskKind::Setup {
                     self.ui.set_status(format!("{label} keeps no worklog"));
                     return Ok(());
                 }
@@ -8423,7 +8425,7 @@ mod tests {
     }
 
     #[test]
-    fn n_opens_a_form_under_the_assistant_or_a_manager_only() {
+    fn n_opens_a_form_under_any_node() {
         let mut ui = agents_sample();
         assert_eq!(press(&mut ui, KeyCode::Char('n')), None);
         assert_eq!(ui.status_line, NOT_USER);
@@ -8441,12 +8443,13 @@ mod tests {
                 parent_id: "m".into()
             })
         );
-        // A worker is refused at the key, in `plan_child`'s words.
+        // A worker under the assistant may have tasks under it too.
         press(&mut ui, KeyCode::Down);
-        assert_eq!(press(&mut ui, KeyCode::Char('n')), None);
         assert_eq!(
-            ui.status_line,
-            "task w is not a manager: only the assistant and managers have tasks under them"
+            press(&mut ui, KeyCode::Char('n')),
+            Some(Action::NewChildForm {
+                parent_id: "w".into()
+            })
         );
         // `n` is still a top-level task in the active view.
         press(&mut ui, KeyCode::BackTab);

@@ -52,10 +52,12 @@ pub fn manager_candidates() -> Vec<CompletionCandidate> {
     tree_candidates(|_| true)
 }
 
-/// What `--parent` takes: `assistant`, and the managers under it.
+/// What `--parent` takes: `assistant`, and the tasks under it.
 pub fn parent_candidates() -> Vec<CompletionCandidate> {
     let mut out = vec![CompletionCandidate::new(crate::assistant::SLUG)];
-    out.extend(tree_candidates(|t| t.kind == TaskKind::Manager));
+    out.extend(tree_candidates(|t| {
+        matches!(t.kind, TaskKind::Manager | TaskKind::Work)
+    }));
     out
 }
 

@@ -43,13 +43,13 @@ says everything else on stderr.
   lists them; `plete agents show <name>` prints one): its instructions
   follow the brief, and its settings (model, grant, budget, skills…) are the
   task's. `--agent planner` makes a task that plans an area of work and
-  delegates it to tasks under it, as a manager does.
+  delegates it to tasks under it (what a manager was; the plete-planners
+  skill says more).
 - When the user asks you for a task, add `--for-user`: like one they make
   themselves, its done and questions notify them at any depth. When they
   ask you to keep a task quiet, `--quiet`, or `plete task quiet <task>
   [--off]` later: its done and questions then notify nobody, while what is
-  escalated or stuck still does. Both only on the user's word; both work on
-  `plete manager new` too.
+  escalated or stuck still does. Both only on the user's word.
 - `plete task send <task> "<message>"` gets a message to a task's agent:
   typed in when it is idle, queued until it stops when it is busy, its first
   prompt when it is not running.

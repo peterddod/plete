@@ -577,7 +577,17 @@ pub fn plan_child(
             bail!(crate::db::tasks::fan_out_full(&parent.slug, active, max));
         }
     }
-    let grant = permissions::check_grant(app, caller, &parent, kind, d.allow.as_deref(), &policy)?;
+    let grant = permissions::check_grant(
+        app,
+        caller,
+        &parent,
+        match d.manager_grant {
+            true => TaskKind::Manager,
+            false => kind,
+        },
+        d.allow.as_deref(),
+        &policy,
+    )?;
     let budget = child_budget(app, &parent, kind, d, &policy)?;
 
     let created_by = match caller {
@@ -723,7 +733,7 @@ fn child_budget(
         }
         return Ok(Some(want));
     }
-    if kind != TaskKind::Manager && parent.kind == TaskKind::Assistant {
+    if kind != TaskKind::Manager && !d.default_budget && parent.kind == TaskKind::Assistant {
         return Ok(None);
     }
     let cut = |want: Option<i64>, left: Option<i64>| match (want, left) {

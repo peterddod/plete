@@ -590,8 +590,7 @@ fn path_from(output: &std::process::Output) -> std::path::PathBuf {
 /// bare repo. Commands run against it with only `PLETE_HOME` set, so the
 /// trunk's own config refuses the network outright should anything try.
 /// What a child is granted unless something narrows it, by name.
-const EVERY_CAPABILITY: [&str; 25] = [
-    "manager.create",
+const EVERY_CAPABILITY: [&str; 24] = [
     "pr.comment",
     "pr.merge",
     "pr.review",
@@ -7832,7 +7831,7 @@ fn chat_sets_up_the_assistant_and_runs_each_session_in_its_own_window() {
         "AGENTS.md",
         "CLAUDE.md",
         ".claude/skills/plete-assistant/SKILL.md",
-        ".claude/skills/plete-managers/SKILL.md",
+        ".claude/skills/plete-planners/SKILL.md",
         "notes/worklog.md",
         "todo.md",
     ] {
@@ -8138,9 +8137,9 @@ fn the_assistant_starts_each_session_with_a_summary_of_the_work() {
         )
         .unwrap();
 
-    // A home made before the managers skill: the summary that points at
+    // A home made before the planners skill: the summary that points at
     // it puts it there first.
-    let skill = home.join(".claude/skills/plete-managers/SKILL.md");
+    let skill = home.join(".claude/skills/plete-planners/SKILL.md");
     std::fs::remove_file(&skill).unwrap();
     let session = assistant_sessions(&lab)[0].0.clone();
     let output = lab.hook(
@@ -10993,9 +10992,6 @@ fn a_manager_makes_and_reaches_only_its_own_subtree() {
     lab.new_task_with("sib", &["--parent", "assistant"]);
     let index = lab.index();
     index
-        .execute("UPDATE tasks SET kind = 'manager' WHERE id = ?1", [&api])
-        .unwrap();
-    index
         .execute("DELETE FROM task_grants WHERE task_id = ?1", [&api])
         .unwrap();
     for cap in ["task.create", "task.send", "manager.grant", "pr.merge"] {
@@ -11019,7 +11015,7 @@ fn a_manager_makes_and_reaches_only_its_own_subtree() {
     let output = mp.plete(&["task", "new", "w", "--goal", "g"], &api_dir, &[]);
     succeeded(&output);
     assert!(
-        stderr_of(&output).contains("reports to manager api"),
+        stderr_of(&output).contains("reports to task api"),
         "{}",
         stderr_of(&output)
     );
@@ -11077,14 +11073,7 @@ fn a_manager_makes_and_reaches_only_its_own_subtree() {
         .collect();
     listed.sort();
     assert_eq!(listed, ["api", "w"], "{stdout}");
-    // A manager is said to be one.
-    assert!(
-        stdout
-            .lines()
-            .any(|l| l.starts_with("api ") && l.ends_with("api (manager)")),
-        "{stdout}"
-    );
-    assert!(!stdout.contains("w (manager)"), "{stdout}");
+    assert!(!stdout.contains("(manager)"), "{stdout}");
     let output = mp.plete(&["manager", "ls", "--json"], &api_dir, &[]);
     succeeded(&output);
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
@@ -11100,7 +11089,7 @@ fn a_manager_makes_and_reaches_only_its_own_subtree() {
     let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         shown["brief"]["goal"],
-        "<plete-message from=\"manager api\" untrusted=\"true\">\ng\n</plete-message>"
+        "<plete-message from=\"task api\" untrusted=\"true\">\ng\n</plete-message>"
     );
 
     // A held capability the manager grants is logged in its own name,
@@ -11277,9 +11266,6 @@ fn a_manager_acts_on_the_task_its_check_resolved() {
     let sib = lab.new_task_with("sib", &["--parent", "assistant"]);
     let index = lab.index();
     index
-        .execute("UPDATE tasks SET kind = 'manager' WHERE id = ?1", [&api])
-        .unwrap();
-    index
         .execute("DELETE FROM task_grants WHERE task_id = ?1", [&api])
         .unwrap();
     for cap in ["task.create", "task.send", "task.archive", "manager.grant"] {
@@ -11357,8 +11343,10 @@ fn a_root_worker_reaches_only_itself_reads_included() {
     let mut wp_agent = lab.task_pane("wp");
 
     for (args, says) in [
-        (&["manager", "new", "x"][..], "may not make managers"),
-        (&["task", "send", "sib", "hi"], "never message each other"),
+        (
+            &["task", "send", "sib", "hi"][..],
+            "never message each other",
+        ),
         (
             &["manager", "grant", "sib", "task.send"],
             "plete task grant",
@@ -11385,13 +11373,13 @@ fn a_root_worker_reaches_only_itself_reads_included() {
     succeeded(&wp_agent.plete(&["task", "path", "wp"], &wp_dir, &[]));
 }
 
-/// The user makes a manager: under the assistant, with its brief (the
-/// file's text after --goal), grant and budget, its role's files and a
-/// read-only BRIEF.md, and its agent started on a prompt that points there.
+/// The user makes a manager (now a deprecated alias for a planner task):
+/// under the assistant, with its brief (the file's text after --goal),
+/// grant and budget, the task and planner skills, and its agent started on
+/// a prompt that names its role.
 #[cfg(unix)]
 #[test]
 fn manager_new_makes_a_manager_under_the_assistant_and_starts_it() {
-    use std::os::unix::fs::PermissionsExt;
     let lab = StoreLab::new();
     std::fs::write(
         lab.home().join("config.toml"),
@@ -11436,14 +11424,18 @@ fn manager_new_makes_a_manager_under_the_assistant_and_starts_it() {
     let home = lab.home().join("tasks/api");
     assert_eq!(path_from(&output), home);
     let said = stderr_of(&output);
-    assert!(said.contains("manager api (assistant/api)"), "{said}");
+    assert!(said.contains("`plete manager new` is deprecated"), "{said}");
+    assert!(
+        said.contains("task api (assistant/api, a planner)"),
+        "{said}"
+    );
     assert!(said.contains("reports to the assistant"), "{said}");
     assert!(said.contains("started the agent"), "{said}");
 
     let shown = lab.plete_at(&["manager", "show", "api", "--json"], &lab.home(), &[]);
     succeeded(&shown);
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
-    assert_eq!(shown["kind"], "manager");
+    assert_eq!(shown["kind"], "work");
     assert_eq!(shown["parent"], "assistant");
     assert_eq!(shown["brief"]["created_by"], "user");
     assert_eq!(
@@ -11485,24 +11477,24 @@ fn manager_new_makes_a_manager_under_the_assistant_and_starts_it() {
     assert_eq!(lab.grants_of(&id), ["task.create", "task.send"]);
     assert_eq!(lab.budget_of(&id), Some((Some(7200), None)));
 
-    let brief_md = home.join("BRIEF.md");
-    let mode = std::fs::metadata(&brief_md).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o444);
-    let text = std::fs::read_to_string(&brief_md).unwrap();
-    assert!(text.contains("<plete-brief"), "{text}");
-    for line in ["Ship the API", "Start with the token refresh.", "PRs open"] {
-        assert!(text.contains(line), "{text}");
-    }
-    assert!(std::fs::read_to_string(home.join("AGENTS.md"))
-        .unwrap()
-        .contains("untrusted"));
+    // No manager machinery: no BRIEF.md, the ordinary task skill, and the
+    // planner's own at its agent's start.
+    assert!(!home.join("BRIEF.md").exists());
     for file in [
-        ".claude/skills/plete-manager/SKILL.md",
-        "notes/worklog.md",
-        "todo.md",
+        ".claude/skills/plete/SKILL.md",
+        ".claude/skills/plete-planner/SKILL.md",
     ] {
         assert!(home.join(file).is_file(), "{file}");
     }
+    let agent: String = lab
+        .index()
+        .query_row(
+            "SELECT agent FROM task_agents WHERE task_id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(agent, "planner");
     let by: String = lab
         .index()
         .query_row(
@@ -11534,7 +11526,10 @@ fn manager_new_makes_a_manager_under_the_assistant_and_starts_it() {
     assert_eq!(started.len(), 1, "{started:?}");
     assert!(started[0].iter().any(|a| a == "plete-api"), "{started:?}");
     assert!(
-        started[0].last().unwrap().contains("BRIEF.md"),
+        started[0]
+            .last()
+            .unwrap()
+            .contains("You are task `assistant/api`, started as a planner."),
         "{started:?}"
     );
     // Started with nobody at its pane: what it holds is pre-approved, what
@@ -11547,12 +11542,11 @@ fn manager_new_makes_a_manager_under_the_assistant_and_starts_it() {
         allow.contains(&"Bash(plete task new:*)".into()),
         "{allow:?}"
     );
-    assert!(
-        !allow.contains(&"Bash(plete manager new:*)".into()),
-        "{allow:?}"
-    );
     let deny = settings["permissions"]["deny"].as_array().unwrap();
-    assert!(deny.contains(&"Bash(git push *)".into()), "{deny:?}");
+    assert!(
+        deny.contains(&"Bash(git push --force *)".into()),
+        "{deny:?}"
+    );
 
     // Above what the assistant may pass on, a name that could pass for a
     // fence, and no goal to work towards: refused, and nothing is made.
@@ -11603,12 +11597,12 @@ fn manager_new_keeps_the_manager_when_its_agent_does_not_start() {
         said.contains("was made, but its agent did not start"),
         "{said}"
     );
-    assert!(lab.home().join("tasks/api/BRIEF.md").is_file());
+    assert!(lab.home().join("tasks/api").is_dir());
     let listed = lab.plete_at(&["manager", "ls", "--json"], &lab.home(), &[]);
     succeeded(&listed);
     let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(listed[0]["task"], "api");
-    assert_eq!(listed[0]["kind"], "manager");
+    assert_eq!(listed[0]["kind"], "work");
 }
 
 /// A manager with no goal is refused before its parent is resolved: on a
@@ -11636,12 +11630,12 @@ fn manager_new_without_a_goal_makes_no_assistant() {
     assert!(calls_of(&tmux, "new-session").is_empty());
 }
 
-/// A manager needs a harness with hooks and the rest (M36): on one without,
-/// `manager new` is refused by what is missing and nothing is made, while a
-/// worker under the same harness is made and runs, with today's warning.
+/// A planner is a work task, so `manager new` is no longer refused up front
+/// on a harness without hooks and the rest (M36): the task is made, and the
+/// check comes when a task is made under it.
 #[cfg(unix)]
 #[test]
-fn manager_new_is_refused_on_a_harness_a_manager_cannot_run_on() {
+fn manager_new_is_not_refused_on_a_harness_without_hooks() {
     let lab = StoreLab::new();
     std::fs::write(
         lab.home().join("config.toml"),
@@ -11654,70 +11648,44 @@ fn manager_new_is_refused_on_a_harness_a_manager_cannot_run_on() {
     let tmux_env = tmux.to_string_lossy().to_string();
     let env = [("PLETE_TMUX", tmux_env.as_str())];
 
+    // Made as a planner task; this harness takes no first prompt, so its
+    // agent is not started, and the command says so and fails.
     let output = lab.plete_at(&["manager", "new", "api", "--goal", "g"], &lab.home(), &env);
     assert!(!output.status.success());
     let said = stderr_of(&output);
-    assert!(said.contains("hook events"), "{said}");
-    assert!(said.contains("deny rules"), "{said}");
-    assert!(!lab.home().join("tasks/api").exists());
-    let made: i64 = lab
+    assert!(
+        said.contains("was made, but its agent did not start"),
+        "{said}"
+    );
+    assert!(lab.home().join("tasks/api").is_dir());
+    let kind: String = lab
         .index()
-        .query_row("SELECT COUNT(*) FROM tasks WHERE slug = 'api'", [], |r| {
+        .query_row("SELECT kind FROM tasks WHERE slug = 'api'", [], |r| {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(made, 0);
-    // Nor is the assistant it would have gone under made for it.
-    let roots: i64 = lab
-        .index()
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE kind = 'assistant'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(roots, 0);
-    assert!(!lab.home().join("assistant").exists());
+    assert_eq!(kind, "work");
     assert!(calls_of(&tmux, "new-session").is_empty());
 
-    // Made while Claude Code was configured (its agent not started, with no
-    // tmux), it is not started on the harness configured since.
+    // A task under it is what needs the hooks.
     let output = lab.plete_at(
-        &["manager", "new", "mgr", "--goal", "g"],
+        &["task", "new", "sub", "--parent", "api", "--goal", "g"],
         &lab.home(),
-        &[("PLETE_AGENT", "claude")],
+        &env,
     );
-    assert!(
-        stderr_of(&output).contains("was made, but its agent did not start"),
-        "{}",
-        stderr_of(&output)
-    );
-    let output = lab.plete_at(&["task", "open", "mgr"], &lab.home(), &env);
     assert!(!output.status.success());
     let said = stderr_of(&output);
-    assert!(
-        said.contains("a task with tasks under it needs what"),
-        "{said}"
-    );
     assert!(said.contains("hook events"), "{said}");
+    assert!(!lab.home().join("tasks/sub").exists());
     assert!(calls_of(&tmux, "new-session").is_empty());
-
-    lab.new_task_with("w", &["--parent", "assistant"]);
-    let output = lab.plete_at(&["task", "open", "w"], &lab.home(), &env);
-    succeeded(&output);
-    assert!(
-        stderr_of(&output).contains("the agent has no deny rules"),
-        "{}",
-        stderr_of(&output)
-    );
-    assert_eq!(calls_of(&tmux, "new-session").len(), 1);
 }
 
-/// The assistant makes a manager only when `[assistant] allow` holds
-/// `manager.create`; one it makes is its, by its id.
+/// The assistant makes a manager (a planner task) only when `[assistant]
+/// allow` holds `task.create`, which the old `manager.create` now names;
+/// one it makes is its, by its id.
 #[cfg(unix)]
 #[test]
-fn the_assistant_makes_a_manager_only_with_manager_create() {
+fn the_assistant_makes_a_manager_only_with_task_create() {
     let lab = StoreLab::new();
     let config = |allow: &str| {
         std::fs::write(
@@ -11726,7 +11694,7 @@ fn the_assistant_makes_a_manager_only_with_manager_create() {
         )
         .unwrap();
     };
-    config("\"task.create\"");
+    config("\"task.send\"");
     let scratch = TempDir::new().unwrap();
     let tmux = stub_tmux(scratch.path());
     multi_session(&tmux);
@@ -11739,11 +11707,13 @@ fn the_assistant_makes_a_manager_only_with_manager_create() {
     let output = root.plete(&["manager", "new", "api", "--goal", "g"], &lab.home(), &env);
     assert!(!output.status.success());
     let said = stderr_of(&output);
-    assert!(said.contains("`manager.create`"), "{said}");
+    assert!(said.contains("`task.create`"), "{said}");
+    assert!(!said.contains("`manager.create`"), "{said}");
     assert!(!lab.home().join("tasks/api").exists());
     assert!(calls_of(&tmux, "new-session").is_empty());
 
-    config("\"task.create\", \"manager.create\"");
+    // The old name still grants it.
+    config("\"manager.create\"");
     let output = root.plete(&["manager", "new", "api", "--goal", "g"], &lab.home(), &env);
     succeeded(&output);
     let api = task_id(&path_from(&output));
@@ -11864,7 +11834,7 @@ fn manager_new_past_max_live_queues_its_start() {
         "{api_start:?}"
     );
     assert!(
-        api_start.last().unwrap().contains("BRIEF.md"),
+        api_start.last().unwrap().contains("started as a planner"),
         "{api_start:?}"
     );
 }
@@ -11903,15 +11873,14 @@ fn session_settings(lab: &StoreLab, tmux: &std::path::Path, session: &str) -> se
     settings_file(lab, value_after(&agent_argv(start), "--settings"))
 }
 
-/// A manager made with `plete manager new` runs its subtree from its own
-/// pane: it makes and starts workers and sub-managers under itself within
-/// its grant, budget and depth, reaches nothing outside, reads its
-/// children fenced, holds read-only worktrees, may not push, has what it
+/// A manager made with `plete manager new` (a planner task) runs its
+/// subtree from its own pane: it makes and starts workers and sub-planners
+/// under itself within its grant, budget and depth, reaches nothing
+/// outside, reads its children fenced, has ordinary worktrees, has what it
 /// holds pre-approved and nothing else, and hears from its workers.
 #[cfg(unix)]
 #[test]
 fn a_manager_runs_its_own_subtree_and_nothing_else() {
-    use std::os::unix::fs::PermissionsExt;
     let lab = StoreLab::new();
     std::fs::write(
         lab.home().join("config.toml"),
@@ -11996,7 +11965,7 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
     succeeded(&output);
     let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(shown["path"], "assistant/api/sub");
-    assert_eq!(shown["kind"], "manager");
+    assert_eq!(shown["kind"], "work");
     assert!(stub.join("alive/plete-sub").exists());
 
     // Every reach outside its subtree is refused, and leaves things as
@@ -12159,23 +12128,16 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         "{said}"
     );
 
-    // Its worktrees are read-only: no branch, detached, marked so.
+    // Its worktrees are an ordinary task's: a branch, writable.
     let output = mp.plete(
         &["worktree", "add", "widget", "--branch", "x"],
         &api_dir,
         &env,
     );
-    assert!(!output.status.success());
-    assert!(
-        stderr_of(&output).contains("read-only worktrees"),
-        "{}",
-        stderr_of(&output)
-    );
-    let output = mp.plete(&["worktree", "add", "widget"], &api_dir, &env);
     succeeded(&output);
     let checkout = path_from(&output);
     assert_eq!(checkout, api_dir.join("widget"));
-    assert!(is_detached(&checkout));
+    assert!(!is_detached(&checkout));
     let read_only: bool = lab
         .index()
         .query_row(
@@ -12184,11 +12146,9 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(read_only);
+    assert!(!read_only);
 
-    // It may not commit or push; its worker, which writes the code, may
-    // (M24). Claude matches `Bash(git push *)` against a bare `git push`
-    // too, so it is the one rule each.
+    // Nor is it denied committing or pushing, any more than its worker is.
     let api_settings = session_settings(&lab, &tmux, "plete-api");
     let w_settings = session_settings(&lab, &tmux, "plete-w");
     for rule in [
@@ -12198,13 +12158,14 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         "Bash(git switch -c *)",
     ] {
         let api_deny = api_settings["permissions"]["deny"].as_array().unwrap();
-        assert!(api_deny.contains(&rule.into()), "{rule}: {api_deny:?}");
+        assert!(!api_deny.contains(&rule.into()), "{rule}: {api_deny:?}");
         let w_deny = w_settings["permissions"]["deny"].as_array().unwrap();
         assert!(!w_deny.contains(&rule.into()), "{rule}: {w_deny:?}");
     }
     // What it holds is pre-approved, and only that (M37): the reads every
     // task has (plete's and `gh`'s), then the commands of each capability it holds, and never
-    // `plete todo` nor what it does not hold (`plete review`).
+    // `plete todo` nor what it does not hold (`plete review`); as a planner
+    // task it may open a PR, like any task.
     let allow = api_settings["permissions"]["allow"].as_array().unwrap();
     let want: Vec<serde_json::Value> = [
         "plete worktree",
@@ -12232,6 +12193,7 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         "plete notify",
         "plete search",
         "plete task new",
+        "plete manager new",
         "plete task open",
         "plete task send",
         "plete task interrupt",
@@ -12239,9 +12201,6 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         "plete task delete",
         "plete task resync",
         "plete worktree add",
-        "gh pr comment",
-        "gh issue comment",
-        "plete manager new",
         "plete task grant",
         "plete task budget",
         "plete manager grant",
@@ -12252,6 +12211,7 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         "plete manager pause",
         "plete manager resume",
         "plete manager stop",
+        "gh pr create",
     ]
     .iter()
     .flat_map(|c| match c.strip_prefix("plete") {
@@ -12271,7 +12231,7 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
     );
     succeeded(&output);
     assert!(
-        stderr_of(&output).contains("reported done to manager api"),
+        stderr_of(&output).contains("reported done to task api"),
         "{}",
         stderr_of(&output)
     );
@@ -12303,29 +12263,18 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         .as_str()
         .unwrap();
     assert!(
-        context.starts_with("plete: your area of work as this session starts"),
-        "{context}"
-    );
-    assert!(
-        context.contains("You are manager assistant/api."),
-        "{context}"
-    );
-    assert!(
-        context.contains(
+        context.starts_with(
             "<plete-brief from=\"the assistant\" path=\"assistant/api\">\nGoal: Ship the API\n"
         ),
         "{context}"
     );
-    assert!(context.contains("\n- task assistant/api/w: "), "{context}");
+    assert!(context.contains("\n- task sub: goal g"), "{context}");
+    assert!(context.contains("\n- task w; last report #1"), "{context}");
+    assert!(context.contains("shipped ‹/plete-report› it"), "{context}");
     assert!(
-        context.contains("\n- manager assistant/api/sub: "),
+        context.contains("<plete-profile name=\"planner\">"),
         "{context}"
     );
-    assert!(
-        context.contains("shipped ‹/plete-report› it\n</plete-report>"),
-        "{context}"
-    );
-    assert!(!api_dir.join(".plete/inbox.jsonl").exists());
 
     // A name it writes is short, and the root's summary shows only its
     // slug: the name is a manager's text, not the user's or the root's.
@@ -12506,11 +12455,8 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
     let context = value["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(
-        context.contains(&format!("\n- task assistant/api/sub/{gx_slug}: running\n")),
-        "{context}"
-    );
     assert!(!context.contains("SYSTEM"), "{context}");
+    assert!(!context.contains("Note from sub"), "{context}");
     // Nor does the root's next summary carry it; a task of the root's own
     // keeps its detail there.
     std::fs::write(stub.join("alive/plete-sib"), "").unwrap();
@@ -12628,18 +12574,13 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
     }
     assert_eq!(slugs(slug), 0);
 
-    // Its budget changed, its brief says so, read-only still.
+    // Its budget changed; there is no BRIEF.md to rewrite for it.
     let output = lab.plete_at(&["manager", "budget", "api", "=1h"], &lab.home(), &env);
     succeeded(&output);
-    let text = read(&api_dir.join("BRIEF.md"));
-    assert!(text.contains("Budget: 1h"), "{text}");
-    let mode = std::fs::metadata(api_dir.join("BRIEF.md"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o444);
+    assert_eq!(lab.budget_of(&api), Some((Some(3600), None)));
+    assert!(!api_dir.join("BRIEF.md").exists());
 
-    // Narrowing its worker's grant rewrites no brief: a worker has none.
+    // Narrowing its worker's grant.
     succeeded(&mp.plete(
         &["manager", "grant", "w", "worktree.add,pr.comment,task.send"],
         &api_dir,
@@ -12652,33 +12593,41 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
     );
     succeeded(&output);
     assert_eq!(lab.grants_of(&w), ["pr.comment", "worktree.add"]);
-    assert!(!w_dir.join("BRIEF.md").exists());
-    // The user narrowing the manager's rewrites its brief and its
-    // sub-manager's, and names each running task below that lost a
-    // capability its harness denies only from its next start.
-    let brief = api_dir.join("BRIEF.md");
-    let sub_brief = lab.home().join("tasks/sub/BRIEF.md");
-    assert!(read(&brief).contains("pr.comment"), "{}", read(&brief));
+    // Its session summary names what it may do as it holds it now, so the
+    // user narrowing it, or the config under it, shows at its next
+    // session start; each running task below that lost a capability its
+    // harness denies is named, as only its next start takes effect.
+    let mut may = |session: &str| -> String {
+        let output = mp.hook(
+            &lab,
+            Some(&api),
+            "SessionStart",
+            &hook_input("SessionStart", session, &api_dir),
+            &[("PLETE_BACKGROUND", "1")],
+        );
+        succeeded(&output);
+        let value: serde_json::Value = serde_json::from_str(stdout_of(&output).trim()).unwrap();
+        let context = value["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        context
+            .lines()
+            .find(|l| l.starts_with("You may: "))
+            .unwrap_or_else(|| panic!("{context}"))
+            .to_string()
+    };
     assert!(
-        read(&sub_brief).contains("pr.comment"),
-        "{}",
-        read(&sub_brief)
+        may("88888888-9999-4aaa-8bbb-cccccccccccc").contains("pr.comment"),
+        "no pr.comment before"
     );
     let narrowed = held.replace(",pr.comment", "");
     let output = lab.plete_at(&["manager", "grant", "api", &narrowed], &lab.home(), &env);
     succeeded(&output);
-    let text = read(&brief);
-    assert!(!text.contains("pr.comment"), "{text}");
-    assert!(text.contains("task.create"), "{text}");
-    let mode = std::fs::metadata(&brief).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o444);
-    assert!(
-        !read(&sub_brief).contains("pr.comment"),
-        "{}",
-        read(&sub_brief)
-    );
+    let line = may("99999999-aaaa-4bbb-8ccc-dddddddddddd");
+    assert!(!line.contains("pr.comment"), "{line}");
+    assert!(line.contains("task.create"), "{line}");
     let said = stderr_of(&output);
-    for name in ["manager api", "manager sub", "task w"] {
+    for name in ["task api", "task sub", "task w"] {
         assert!(
             said.contains(&format!("warning: {name} is running and lost pr.comment")),
             "{name}: {said}"
@@ -12691,25 +12640,17 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
     let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(shown["effective"], serde_json::json!(["worktree.add"]));
 
-    // What changed outside `manager grant`, in config here, is in its
-    // brief as its next session starts.
-    assert!(read(&brief).contains("task.resync"), "{}", read(&brief));
+    // What changed outside `manager grant`, in config here, shows as its
+    // next session starts.
+    assert!(
+        may("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").contains("task.resync"),
+        "no task.resync before"
+    );
     let config = read(&lab.home().join("config.toml")).replace("\"task.resync\", ", "");
     std::fs::write(lab.home().join("config.toml"), config).unwrap();
-    succeeded(&mp.hook(
-        &lab,
-        Some(&api),
-        "SessionStart",
-        &hook_input(
-            "SessionStart-clear",
-            "55555555-6666-4777-8888-999999999999",
-            &api_dir,
-        ),
-        &[("PLETE_BACKGROUND", "1")],
-    ));
-    let text = read(&brief);
-    assert!(!text.contains("task.resync"), "{text}");
-    assert!(text.contains("task.create"), "{text}");
+    let line = may("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff");
+    assert!(!line.contains("task.resync"), "{line}");
+    assert!(line.contains("task.create"), "{line}");
 
     // Its next start pre-approves only what it holds now: the allow list
     // is recomputed on each start (M37), not kept from `manager new`.
@@ -12806,7 +12747,7 @@ fn a_managers_run_state_holds_its_whole_subtree() {
     // Paused: the row is the manager's alone, and each pane below it gets
     // one Escape, the worker's first.
     let said = plete(&["manager", "pause", "api"]);
-    assert!(said.contains("paused manager api"), "{said}");
+    assert!(said.contains("paused task api"), "{said}");
     assert!(said.contains("w: interrupted"), "{said}");
     assert!(said.contains("api: interrupted"), "{said}");
     assert_eq!(
@@ -12841,7 +12782,7 @@ fn a_managers_run_state_holds_its_whole_subtree() {
 
     // Stopped: each session is ended by its own name.
     let said = plete(&["manager", "stop", "api"]);
-    assert!(said.contains("stopped manager api"), "{said}");
+    assert!(said.contains("stopped task api"), "{said}");
     let mut killed: Vec<String> = calls_of(&tmux, "kill-session")
         .iter()
         .map(|c| value_after(c, "-t").to_string())
@@ -13074,10 +13015,6 @@ fn delete_reparent_moves_the_tasks_under_it_to_its_parent() {
     );
     succeeded(&output);
     let lead = task_id(&path_from(&output));
-    let lead_brief = lab.home().join("tasks/lead/BRIEF.md");
-    assert!(std::fs::read_to_string(&lead_brief)
-        .unwrap()
-        .contains("Report to manager api"),);
     let output = panes[1].plete(&["report", "question", "keep v1?"], &lab.home(), &env);
     succeeded(&output);
     // The assistant may send; api may not, so w's grant may not use it.
@@ -13157,7 +13094,7 @@ fn delete_reparent_moves_the_tasks_under_it_to_its_parent() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("moved task w from manager api to the assistant (assistant/w)"),
+        stderr.contains("moved task w from task api to the assistant (assistant/w)"),
         "{stderr}"
     );
     assert!(
@@ -13170,10 +13107,6 @@ fn delete_reparent_moves_the_tasks_under_it_to_its_parent() {
     assert_eq!(lab.parent_of(&w), Some(assistant.clone()));
     assert_eq!(lab.parent_of(&w2), Some(assistant.clone()));
     assert_eq!(lab.parent_of(&lead), Some(assistant.clone()));
-    // A moved manager's BRIEF.md says where it sits now.
-    let text = std::fs::read_to_string(&lead_brief).unwrap();
-    assert!(text.contains("Report to the assistant"), "{text}");
-    assert!(text.contains("path=\"assistant/lead\""), "{text}");
     let rows: i64 = lab
         .index()
         .query_row("SELECT COUNT(*) FROM tasks WHERE id = ?1", [&api], |r| {
@@ -13221,16 +13154,14 @@ fn delete_reparent_moves_the_tasks_under_it_to_its_parent() {
         .unwrap();
     assert_eq!(
         moved[0].2,
-        format!(
-            "moved here from manager api by the user; its open question #{ask_id} is yours now"
-        )
+        format!("moved here from task api by the user; its open question #{ask_id} is yours now")
     );
     assert_eq!(
         lab.reports_of(&w2),
         [(
             "status".into(),
             assistant.clone(),
-            "moved here from manager api by the user".into()
+            "moved here from task api by the user".into()
         )]
     );
     let inbox = std::fs::read_to_string(lab.home().join("assistant/.plete/inbox.jsonl")).unwrap();
@@ -13325,7 +13256,7 @@ fn a_manager_reparents_a_manager_below_it() {
     succeeded(&output);
     let stderr = stderr_of(&output);
     assert!(
-        stderr.contains("moved task x from manager sub to manager api (assistant/api/x)"),
+        stderr.contains("moved task x from task sub to task api (assistant/api/x)"),
         "{stderr}"
     );
     assert_eq!(lab.parent_of(&x), Some(api.clone()));
@@ -13334,7 +13265,7 @@ fn a_manager_reparents_a_manager_below_it() {
         [(
             "status".into(),
             api.clone(),
-            "moved here from manager sub by manager api".into()
+            "moved here from task sub by task api".into()
         )]
     );
     let by: Option<String> = lab
@@ -15235,7 +15166,7 @@ fn agents_tab_pauses_and_resumes() {
     screen.type_keys(b"j");
     std::thread::sleep(std::time::Duration::from_millis(300));
     screen.type_keys(b"z");
-    screen.wait_for_text("paused manager api");
+    screen.wait_for_text("paused task api");
     assert!(screen.shows("w: interrupted"), "{}", screen.plain());
     assert!(screen.shows("api: interrupted"), "{}", screen.plain());
     assert_eq!(
@@ -15252,7 +15183,7 @@ fn agents_tab_pauses_and_resumes() {
 
     screen.esc();
     screen.type_keys(b"Z");
-    screen.wait_for_text("resumed manager api");
+    screen.wait_for_text("resumed task api");
     assert!(screen.shows("api: resumed"), "{}", screen.plain());
     assert_eq!(lab.run_state_of(&api), ("run".into(), None));
     assert_eq!(lab.run_state_of(&w), ("run".into(), None));
@@ -15287,7 +15218,7 @@ fn agents_tab_stops_after_a_confirm() {
     screen.type_keys(b"j");
     std::thread::sleep(std::time::Duration::from_millis(300));
     screen.type_keys(b"x");
-    screen.wait_for_text("stop manager api");
+    screen.wait_for_text("stop task api");
     // Each on a line of its own, between the panel's borders, leaves first.
     screen.wait_for_words("running now:");
     assert!(
@@ -15304,7 +15235,7 @@ fn agents_tab_stops_after_a_confirm() {
     screen.type_keys(b"x");
     std::thread::sleep(std::time::Duration::from_millis(500));
     screen.type_keys(b"y");
-    screen.wait_for_text("stopped manager api");
+    screen.wait_for_text("stopped task api");
     assert!(screen.shows("w: stopped its agent"), "{}", screen.plain());
     assert_eq!(
         lab.run_state_of(&api),
@@ -15330,7 +15261,7 @@ fn agents_tab_stops_after_a_confirm() {
     screen.type_keys(b"j");
     std::thread::sleep(std::time::Duration::from_millis(300));
     screen.type_keys(b"\r");
-    screen.wait_for_words("task w is stopped under manager api; `plete task resume api` first");
+    screen.wait_for_words("task w is stopped under task api; `plete task resume api` first");
     assert!(!stub.join("alive/plete-w").exists());
 
     // Pausing a stopped manager keeps it stopped.
@@ -15338,7 +15269,7 @@ fn agents_tab_stops_after_a_confirm() {
     screen.type_keys(b"k");
     std::thread::sleep(std::time::Duration::from_millis(300));
     screen.type_keys(b"z");
-    screen.wait_for_text("kept manager api stopped");
+    screen.wait_for_text("kept task api stopped");
     assert_eq!(
         lab.run_state_of(&api),
         ("stopped".into(), Some("user".into()))
@@ -15415,10 +15346,10 @@ fn agents_tab_makes_a_worker_under_a_node() {
     screen.type_keys(b"j");
     std::thread::sleep(std::time::Duration::from_millis(300));
     screen.type_keys(b"n");
-    screen.wait_for_text("new task under manager api");
+    screen.wait_for_text("new task under task api");
     // The kind stays a task; a name, and more than api holds to give.
     screen.type_keys(b"\tleaf\tfix the bug\t\t\ttask.archive\r");
-    screen.wait_for_words("cannot grant `task.archive`: its parent, manager api, does not hold it");
+    screen.wait_for_words("cannot grant `task.archive`: its parent, task api, does not hold it");
     let row = || {
         lab.index()
             .query_row(
@@ -15436,7 +15367,7 @@ fn agents_tab_makes_a_worker_under_a_node() {
     };
     assert_eq!(row(), None);
     screen.type_keys(b"\x15task.create\r");
-    screen.wait_for_words("made leaf under manager api");
+    screen.wait_for_words("made leaf under task api");
     let (parent, kind, leaf) = row().unwrap();
     assert_eq!(parent.as_deref(), Some(api.as_str()));
     assert_eq!(kind, "work");
@@ -15452,9 +15383,10 @@ fn agents_tab_makes_a_worker_under_a_node() {
     assert!(screen.wait_for_exit().success());
 }
 
-/// `n` on a manager makes a manager under it, as `plete manager new
-/// --parent` does, as the user: `plan_child`'s refusals stay on the form,
-/// and once made it starts at once with its brief.
+/// `n` on a node makes a manager (the form's kind) under it as the user:
+/// `plan_child`'s refusals stay on the form, and once made it starts at
+/// once with its brief. Under the assistant here: `n` on a task with tasks
+/// under it is still refused in the Agents tab.
 #[cfg(unix)]
 #[test]
 fn agents_tab_makes_a_manager_under_a_node() {
@@ -15466,15 +15398,13 @@ fn agents_tab_makes_a_manager_under_a_node() {
     let scratch = TempDir::new().unwrap();
     let tmux = stub_tmux(scratch.path());
     multi_session(&tmux);
-    let (api, _w, _panes) = running_tree(&lab, &tmux);
+    let (_api, _w, _panes) = running_tree(&lab, &tmux);
 
     let mut screen = tasks_screen(&lab, &tmux);
     screen.type_keys(b"\t");
     screen.wait_for_text("└─ ▾ api");
-    screen.type_keys(b"j");
-    std::thread::sleep(std::time::Duration::from_millis(300));
     screen.type_keys(b"n");
-    screen.wait_for_text("new task under manager api");
+    screen.wait_for_words("new task under the assistant");
     // A manager, called sub, with no goal yet.
     screen.type_keys(b" ");
     screen.wait_for_text("‹ manager ›");
@@ -15482,7 +15412,7 @@ fn agents_tab_makes_a_manager_under_a_node() {
     screen.wait_for_words("a manager needs --goal or --brief-file");
     // A goal, and more than api holds to give.
     screen.type_keys(b"\tship the v2 api\t\t\ttask.archive\r");
-    screen.wait_for_words("cannot grant `task.archive`: its parent, manager api, does not hold it");
+    screen.wait_for_words("cannot grant `task.archive`: the assistant does not hold it");
     let made = || {
         lab.index()
             .query_row("SELECT COUNT(*) FROM tasks WHERE slug = 'sub'", [], |r| {
@@ -15492,31 +15422,20 @@ fn agents_tab_makes_a_manager_under_a_node() {
     };
     assert_eq!(made(), 0);
     screen.type_keys(b"\x15task.create\r");
-    screen.wait_for_words("made manager sub under manager api");
+    screen.wait_for_words("made manager sub under the assistant");
     screen.wait_for_words("started the agent with its brief in tmux session plete-sub");
 
-    let (sub, parent, kind) = lab
+    let (sub, parent) = lab
         .index()
         .query_row(
-            "SELECT id, parent_id, kind FROM tasks WHERE slug = 'sub'",
+            "SELECT id, parent_id FROM tasks WHERE slug = 'sub'",
             [],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            },
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
         )
         .unwrap();
-    assert_eq!(
-        (parent.as_deref(), kind.as_str()),
-        (Some(api.as_str()), "manager")
-    );
+    assert_eq!(parent.as_deref(), Some(lab.assistant_id().as_str()));
     let (goal, _, by) = lab.brief_of(&sub).unwrap();
     assert_eq!((goal.as_str(), by.as_str()), ("ship the v2 api", "user"));
-    let brief = std::fs::read_to_string(lab.home().join("tasks/sub/BRIEF.md")).unwrap();
-    assert!(brief.contains("ship the v2 api"), "{brief}");
     let started: Vec<_> = calls_of(&tmux, "new-session")
         .into_iter()
         .filter(|c| c.iter().any(|a| a == "plete-sub"))
@@ -15527,7 +15446,7 @@ fn agents_tab_makes_a_manager_under_a_node() {
     // message; under it, the cursor is on the new node.
     screen.wait_for_words("cannot be identified");
     screen.esc();
-    screen.wait_for_words("├─ ▾ sub");
+    screen.wait_for_words("└─ ▾ sub");
     screen.type_keys(b"b");
     screen.wait_for_words("goal (from user): ship the v2 api");
     assert!(screen.shows("may: task.create"), "{}", screen.plain());
@@ -15583,7 +15502,7 @@ fn agents_tab_reads_worklog_and_reports() {
         .query_row("SELECT MAX(id) FROM task_reports", [], |r| r.get(0))
         .unwrap();
     screen.wait_for_words("open ask");
-    screen.wait_for_words(&format!("#{asked} question to manager api"));
+    screen.wait_for_words(&format!("#{asked} question to task api"));
     assert!(screen.shows("keep v1?"), "{}", screen.plain());
 
     screen.esc();
@@ -15617,9 +15536,9 @@ fn agents_tab_shows_a_queued_start() {
     screen.type_keys(b"j");
     std::thread::sleep(std::time::Duration::from_millis(300));
     screen.type_keys(b"n");
-    screen.wait_for_text("new task under manager api");
+    screen.wait_for_text("new task under task api");
     screen.type_keys(b" \tlater\tdo it later\r");
-    screen.wait_for_words("made manager later under manager api");
+    screen.wait_for_words("made manager later under task api");
     screen.wait_for_words("queued (tasks in the tree running: 2/1");
     assert!(!screen.plain().contains("plete:"), "{}", screen.plain());
     assert!(calls_of(&tmux, "new-session")
@@ -16474,10 +16393,7 @@ fn a_manager_made_under_a_paused_manager_starts_once_it_is_resumed() {
     let tmux_env = tmux.to_string_lossy().to_string();
     let env = [("PLETE_TMUX", tmux_env.as_str()), ("PLETE_AGENT", "claude")];
     std::fs::write(stub.join("alive/main"), "").unwrap();
-    let m = lab.new_task_with("m", &["--parent", "assistant"]);
-    lab.index()
-        .execute("UPDATE tasks SET kind = 'manager' WHERE id = ?1", [&m])
-        .unwrap();
+    lab.new_task_with("m", &["--parent", "assistant"]);
     succeeded(&lab.plete_at(&["manager", "pause", "m"], &lab.home(), &env));
 
     let output = lab.plete_at(
@@ -16487,7 +16403,7 @@ fn a_manager_made_under_a_paused_manager_starts_once_it_is_resumed() {
     );
     succeeded(&output);
     assert!(
-        stderr_of(&output).contains("not started: manager sub is paused under manager m"),
+        stderr_of(&output).contains("not started: task sub is paused under task m"),
         "{}",
         stderr_of(&output)
     );
@@ -16503,7 +16419,7 @@ fn a_manager_made_under_a_paused_manager_starts_once_it_is_resumed() {
     assert_eq!(started.len(), 1, "{started:?}");
     let prompts = started[0]
         .iter()
-        .filter(|arg| arg.contains("BRIEF.md"))
+        .filter(|arg| arg.contains("started as a planner"))
         .count();
     assert_eq!(prompts, 1, "{:?}", started[0]);
     assert!(lab.start_queue().is_empty());
@@ -16884,7 +16800,7 @@ fn a_question_climbs_to_the_user_and_the_answer_comes_back() {
     assert!(
         to_root.contains(&format!(
             "<plete-report id=\"{id}\" from=\"task w\" path=\"assistant/api/w\" kind=\"question\" \
-             via=\"manager api\" untrusted=\"true\">\nkeep v1?\n</plete-report>"
+             via=\"task api\" untrusted=\"true\">\nkeep v1?\n</plete-report>"
         )),
         "{to_root}"
     );
@@ -17134,7 +17050,7 @@ fn a_manager_answers_what_it_holds() {
     let to_w = given(&w_dir, &tmux, "w");
     assert!(
         to_w.contains(&format!(
-            "<plete-answer to=\"{id}\" from=\"manager api\">\nuse the staging ones\n</plete-answer>"
+            "<plete-answer to=\"{id}\" from=\"task api\">\nuse the staging ones\n</plete-answer>"
         )),
         "{to_w}"
     );
@@ -17173,11 +17089,11 @@ fn answers_are_refused_sideways_and_from_a_top_level_tasks_pane() {
 
     refused(
         fe.plete(&["report", "answer", &id, "x"], &lab.home(), &env),
-        &format!("#{id} is held by manager api"),
+        &format!("#{id} is held by task api"),
     );
     refused(
         fe.plete(&["report", "escalate", &id], &lab.home(), &env),
-        &format!("#{id} is held by manager api"),
+        &format!("#{id} is held by task api"),
     );
     refused(
         panes[1].plete(&["report", "answer", &id, "x"], &w_dir, &env),
@@ -17282,7 +17198,7 @@ fn report_ls_lists_what_you_hold() {
     let output = lab.plete_at(&["report", "ls"], &lab.home(), &env);
     succeeded(&output);
     let out = stdout_of(&output);
-    let first = format!("#{with_user} blocked manager assistant/api ");
+    let first = format!("#{with_user} blocked task assistant/api ");
     let second = format!("#{at_api} question task assistant/api/w ");
     assert!(out.starts_with(&first), "{out}");
     assert!(
@@ -17291,12 +17207,13 @@ fn report_ls_lists_what_you_hold() {
     );
     assert!(!out.contains('\x1b'), "{out}");
     assert!(out.contains(&second), "{out}");
-    assert!(out.contains(", held by manager api\n  keep v1?\n"), "{out}");
+    assert!(out.contains(", held by task api\n  keep v1?\n"), "{out}");
 
+    // A planner lists what it holds, and its own question too, as any task.
     let output = panes[0].plete(&["report", "ls"], &api_dir, &env);
     succeeded(&output);
     let out = stdout_of(&output);
-    assert!(out.starts_with(&second), "{out}");
+    assert!(out.contains(&second), "{out}");
     assert!(!out.contains("held by"), "{out}");
     assert!(
         out.contains(&format!(
@@ -17305,7 +17222,10 @@ fn report_ls_lists_what_you_hold() {
         )),
         "{out}"
     );
-    assert!(!out.contains("need a budget"), "{out}");
+    assert!(
+        out.contains(&format!("#{with_user} blocked task assistant/api ")),
+        "{out}"
+    );
 
     let output = root.plete(&["report", "ls"], &lab.home(), &env);
     succeeded(&output);
@@ -17745,8 +17665,8 @@ fn project_of(lab: &StoreLab, slug: &str) -> Option<String> {
         .unwrap()
 }
 
-/// `manager new --project` stores the project, copies its skills, and keeps
-/// the manager's own instructions, importing the project's after them.
+/// `manager new --project` is a normal project task: it stores the project,
+/// copies its skills, and takes the project's AGENTS.md as its own.
 #[test]
 fn a_manager_from_a_project_keeps_its_role_and_gets_the_projects_files() {
     let lab = StoreLab::new();
@@ -17766,39 +17686,26 @@ fn a_manager_from_a_project_keeps_its_role_and_gets_the_projects_files() {
     assert_eq!(project_of(&lab, "api").as_deref(), Some("web"));
     let dir = home.join("tasks/api");
     assert_eq!(
-        std::fs::read_to_string(dir.join("PROJECT.md")).unwrap(),
-        "be careful\n"
-    );
-    assert_eq!(
         std::fs::read_to_string(dir.join(".claude/skills/deploy/SKILL.md")).unwrap(),
         "deploy it\n"
     );
-    // The role's own files, not the project's AGENTS.md or the worker skill.
-    let agents = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-    assert!(agents.contains("manager"), "{agents}");
-    assert!(!agents.contains("be careful"), "{agents}");
-    assert!(agents.contains("@PROJECT.md"), "{agents}");
-    assert!(dir.join(".claude/skills/plete-manager/SKILL.md").is_file());
-    assert!(!dir.join(".claude/skills/plete/SKILL.md").exists());
-    // No worktrees of the project's repositories for a manager.
+    // The project's AGENTS.md as AGENTS.md, and the task skill; no
+    // manager files.
     assert_eq!(
-        std::fs::read_dir(&dir)
-            .unwrap()
-            .filter(|e| e.as_ref().unwrap().path().join(".git").exists())
-            .count(),
-        0
+        std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
+        "be careful\n"
     );
+    assert!(!dir.join("PROJECT.md").exists());
+    assert!(dir.join(".claude/skills/plete/SKILL.md").is_file());
+    assert!(!dir.join(".claude/skills/plete-manager/SKILL.md").exists());
+    assert!(!dir.join("BRIEF.md").exists());
 
-    // Resync keeps the manager's own files and brings the project's up to date.
+    // Resync brings the project's AGENTS.md up to date.
     std::fs::write(home.join("projects/web/AGENTS.md"), "changed\n").unwrap();
     succeeded(&lab.plete_at(&["task", "resync", "api"], &home, &[]));
     assert_eq!(
-        std::fs::read_to_string(dir.join("PROJECT.md")).unwrap(),
-        "changed\n"
-    );
-    assert_eq!(
         std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
-        agents
+        "changed\n"
     );
 }
 
@@ -17888,8 +17795,8 @@ fn project_of_opt(lab: &StoreLab, slug: &str) -> Option<String> {
         .flatten()
 }
 
-/// A project with skills and no AGENTS.md gives a manager its skills and no
-/// link to a file that is not there.
+/// A project with skills and no AGENTS.md gives a manager (a project task)
+/// its skills and no link to a file that is not there.
 #[test]
 fn a_manager_from_a_skills_only_project_has_no_project_link() {
     let lab = StoreLab::new();
@@ -17914,8 +17821,9 @@ fn a_manager_from_a_skills_only_project_has_no_project_link() {
     let dir = home.join("tasks/api");
     assert!(dir.join(".claude/skills/deploy/SKILL.md").is_file());
     assert!(!dir.join("PROJECT.md").exists());
-    let agents = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-    assert!(!agents.contains("PROJECT.md"), "{agents}");
+    if let Ok(agents) = std::fs::read_to_string(dir.join("AGENTS.md")) {
+        assert!(!agents.contains("PROJECT.md"), "{agents}");
+    }
 }
 
 #[cfg(unix)]

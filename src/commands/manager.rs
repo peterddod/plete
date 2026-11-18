@@ -23,6 +23,7 @@ use crate::manager::budget::{self, Change, Limits};
 use crate::manager::run::{self, NodeOutcome};
 use crate::messages;
 use crate::permissions::{self, Caller, Target, Verb};
+use crate::profiles;
 use crate::runtime;
 use crate::tasks::{self, NewTask};
 use crate::tmux;
@@ -84,16 +85,30 @@ pub fn new(app: &App, args: &NewManager) -> Result<()> {
         }
         d.goal = Some(goal);
     }
-    // `plan_child` refuses a manager with no goal, so the brief file is
-    // folded into it first.
+    // Made as it always was asked for: a goal, under the assistant unless
+    // placed lower; but as a task started as the planner profile.
+    if d.goal.is_none() {
+        bail!("a manager needs --goal or --brief-file: it is what it works towards");
+    }
+    eprintln!(
+        "plete: `plete manager new` is deprecated: it makes `plete task new <name> --agent \
+         planner`, which plans and delegates as a manager did"
+    );
+    if d.parent.is_none() && caller == Caller::User {
+        d.parent = Some(crate::assistant::SLUG.to_string());
+    }
+    let profile = profiles::find(app, PLANNER, args.project)?;
+    // A manager's grant, unasked, as before: `[managers] manager_default`.
+    d.manager_grant = profile.settings.allow.is_none();
+    let (d, max_children) = super::task::with_profile(&d, Some(&profile))?;
     let flags = super::task::notify_flags(app, &caller, &d)?;
     let plan = tasks::plan_child(
         app,
         &caller,
-        TaskKind::Manager,
+        TaskKind::Work,
         args.name,
         &d,
-        args.max_children,
+        args.max_children.or(max_children),
     )?;
     let created = tasks::create(
         app,
@@ -109,25 +124,38 @@ pub fn new(app: &App, args: &NewManager) -> Result<()> {
     warn_all(&created.warnings);
     let task = created.task;
     super::task::set_notify_flags(app, &task.id, &flags)?;
+    app.db.set_task_agent(&task.id, &profile.name)?;
+    if let Some(pr) = profile.settings.pr {
+        app.db.set_task_pr(&task.id, Some(pr))?;
+    }
     let dir = tasks::task_dir(app, &task);
+    let path = manager::tree_path(app, &task)?;
     eprintln!(
-        "plete: manager {} ({}) -> {}",
+        "plete: task {} ({}, a planner) -> {}",
         task.slug,
-        manager::fence::fenced(&manager::tree_path(app, &task)?),
+        manager::fence::fenced(&path),
         dir.display()
     );
     if let Some(parent) = &task.parent_id {
         if let Some(parent) = app.db.get_task(parent)? {
             eprintln!(
-                "plete: manager {} reports to {}",
+                "plete: task {} reports to {}",
                 task.slug,
                 manager::label(&parent)
             );
         }
     }
     println!("{}", dir.display());
-    start_new(app, &task, &manager::first_prompt(app, &task)?)
+    let prompt = format!(
+        "You are task `{}`, started as a planner. Read your brief, then plan your area of \
+         work and delegate it to tasks under you.",
+        manager::fence::fenced(&path)
+    );
+    start_new(app, &task, &prompt)
 }
+
+/// The profile `plete manager new` starts a task as.
+const PLANNER: &str = "planner";
 
 /// The text of `--brief-file`: a regular file, read no further than a
 /// brief may be long. An agent's command is pre-approved and its brief

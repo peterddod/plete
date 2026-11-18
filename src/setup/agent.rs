@@ -546,7 +546,7 @@ mod tests {
         for id in [
             "assistant/AGENTS.md",
             "assistant/.claude/skills/plete-assistant/SKILL.md",
-            "assistant/.claude/skills/plete-managers/SKILL.md",
+            "assistant/.claude/skills/plete-planners/SKILL.md",
             "templates/root/AGENTS.md",
             "templates/manager/AGENTS.md",
             "templates/worker/SKILL.md",

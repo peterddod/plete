@@ -106,7 +106,7 @@ plete chat --pick                         # choose, rename, end or mark one prim
 plete todo add "ship the fix" -p 1 --task fix-login
 plete todo                                # its todo list; done, rm, --json
 plete task new fix-x --parent assistant --goal "Fix X" --done "tests pass"  # a task that reports to it
-plete manager new api --goal "Ship the v2 API" --budget 4h  # a manager under it, started
+plete task new api --agent planner --goal "Ship the v2 API" --budget 4h  # a planner under it, started
 plete task tree                          # the tree under it; show, grant, budget <task> …
 plete task pause fix-x                 # interrupt it and hand it nothing; resume, stop (--all)
 plete report done "PR #12 is up"          # from inside such a task: tell the assistant
@@ -401,7 +401,7 @@ holds `pr.comment`/`pr.review`, and nothing else unless you set
 review: a review the assistant asked for reports to the assistant (as a
 sender labelled `review <repo>#<number>`), and a review you asked for reports
 to no one. The assistant is not its parent: the review is in no tree, takes
-no manager's budget or `max_live` slot, and nothing is delegated to it.
+no task's budget or `max_live` slot, and nothing is delegated to it.
 
 To limit every review agent to reading instead, set `[review] read_only =
 true`: it then runs only `plete ls`, `plete path` and `plete prs` (and `plete
@@ -411,9 +411,9 @@ their API equivalents.
 
 #### Review limits
 
-Reviews have limits of their own, apart from `[managers]`: review agents
-neither take a `[managers] max_live` slot nor spend any budget above them,
-and tasks and managers take nothing from the review limits. They apply to
+Reviews have limits of their own, apart from `[tasks]`: review agents
+neither take a `[tasks] max_live` slot nor spend any budget above them,
+and tasks take nothing from the review limits. They apply to
 every review, yours included.
 
 ```toml
@@ -436,7 +436,7 @@ with a parent may not run `plete review` at all, so no agent's review escapes
 these caps that way. The defaults keep
 reviews from crowding out other work (2 at once) and stop a stuck one
 (an hour of busy time, or 20 turns, a turn being one prompt answered: a
-review is one or a few). Like `[managers]`, these are checked when used: 0,
+review is one or a few). Like `[tasks]`, these are checked when used: 0,
 or a `time` that is not a time, refuses starting a review.
 
 #### Legacy `[review] command`
@@ -560,16 +560,14 @@ A project is a template for tasks, in `~/.plete/projects/<name>`: a
 `AGENTS.md` with instructions for the agent, and `skills/`. `plete task new
 --project <name>` copies the instructions and skills into the new task — a
 snapshot — and `plete task resync` brings them up to date later, keeping any file
-the task changed. `plete manager new --project <name>` starts a manager from one
-too, with the project's skills and its `AGENTS.md` as `PROJECT.md`, imported
-from the end of the manager's own `AGENTS.md`, never replacing it; it adds no
-worktrees, and tasks made under it default to the same project.
+the task changed. `plete task new --agent planner --project <name>` starts a planner from one
+like any task, and tasks made under it default to the same project.
 
 ```bash
 plete projects new web --repo api --repo web   # prints ~/.plete/projects/web
 plete task new "Launch" --project web
 plete task resync launch                       # --force replaces the task's edits too
-plete manager new web --goal "Own the web app" --project web   # its tasks start from web too
+plete task new web --agent planner --goal "Own the web app" --project web   # its tasks start from web too
 ```
 
 A project also keeps shared docs, in `docs/` beside its `AGENTS.md` (made with
@@ -612,7 +610,7 @@ plete          # or `plete tasks`
 ┌ 3 active tasks ───────────────────────────────────────────────────────────┐
 │  task    Fix login        ● running        2 wt: api, web   1.2G just now │
 │          Edit the token refresh                                           │
-│ manager  backend          ◆ needs you (1)  empty             12K   5m ago │
+│  task    backend          ◆ needs you (1)  empty             12K   5m ago │
 │          progress: api-docs is up                                         │
 │  task    notes            ○ idle 1h        empty             12K   1h ago │
 │                                                                           │
@@ -620,20 +618,20 @@ plete          # or `plete tasks`
 ```
 
 The active tasks are a tree, walked like the explorer's folders: the list
-opens on the managers and tasks directly under the assistant (and any with no
-parent), `→` on a manager goes into it, to the managers and tasks under it,
+opens on the tasks directly under the assistant (and any with no
+parent), `→` on a task with tasks under it goes into it, to the tasks under it,
 `⏎` opens its agent, and `←` or `⌫` backs up to the level above. The line over the list says
 where you are (`assistant › backend › …`). Each task takes two lines: a
-`manager` or `task` tag, its name, what its agent is doing, its project (the
+`task` tag, its name, what its agent is doing, its project (the
 project it was started from, blank for none; from 120 columns), the worktrees
 it holds (as of the last look at the disk, since the agent adds them as it
 goes), its size and when anything last happened in it; and under the name, dimmed,
 the running agent's latest prompt, else its last report (`progress: …`). A
-manager shows the most urgent of its own state and everything below it, as in
+task with tasks under it shows the most urgent of its own state and everything below it, as in
 the [agents tab](#the-agents-tab), with how many below are so: running when
 any task under it runs, though its own chat is idle, and needs you over
 running over idle. `/` filters by name the way the explorer does, across every
-level: each match says where it is under its name, and `→` on a manager there
+level: each match says where it is under its name, and `→` on a task with tasks under it there
 goes into it.
 
 Each level is most recently active first. Statuses refresh
@@ -652,10 +650,10 @@ read from its files on a thread of its own, like the statuses.
 
 | Key | |
 |---|---|
-| `→` | on a manager, or a task with tasks under it, go into it: the managers and tasks under it |
+| `→` | on a task with tasks under it, go into it: the tasks under it |
 | `←` / `⌫` | back up a level; with a filter, drop it, the cursor on the match, on its level |
-| `ctrl-a` | attach to the agent of the manager or task under the cursor, as `⏎` |
-| `⏎` | on a manager or task, attach to its agent in tmux, starting it if need be — resuming its one session. `Ctrl-Q` comes back here and leaves it running. |
+| `ctrl-a` | attach to the agent of the task under the cursor, as `⏎` |
+| `⏎` | on a task, attach to its agent in tmux, starting it if need be — resuming its one session. `Ctrl-Q` comes back here and leaves it running. |
 | `e` | the explorer, on the task's only worktree, or a choice of its worktrees and the task directory itself; `esc` comes back |
 | `w` | the task's worktrees, with branch, ahead/behind and diff: `n` adds one, `D` removes one, `⏎` explores it |
 | `n` | a new task: a name, and optionally a project, repositories and a branch. Left blank, an empty canvas |
@@ -680,8 +678,8 @@ due. `plete projects` on a terminal opens it on the projects tab.
 ### The agents tab
 
 The second tab shows the tree under the [assistant](#the-assistant): the
-assistant at the root, then its managers and tasks and theirs, as `plete manager
-ls` orders them (top-level tasks stay in *active*, archived ones in the
+assistant at the root, then its tasks and theirs, as `plete task
+tree` orders them (top-level tasks stay in *active*, archived ones in the
 archived list).
 
 ```text
@@ -710,7 +708,7 @@ still needs you. Then its budget used
 against its limit (the assistant: how many tasks are under it) and notes: its
 inbox, the assistant's open todo items, its newest open PR, a budget past 80%
 and a start waiting on `max_live`. The header counts the agents live against
-`[managers] max_live`, the prompts and questions waiting on you and the
+`[tasks] max_live`, the prompts and questions waiting on you and the
 starts queued.
 Statuses come from the same poll as the active tab; the rest is read from the
 index every two seconds while the tab is shown.
@@ -718,26 +716,25 @@ index every two seconds while the tab is shown.
 | Key | |
 |---|---|
 | `⏎` | attach to the node's agent, as in the active tab; on the assistant, pick one of its sessions |
-| `→` / `←` / `⌫` | open / close a manager (everything starts open); else to the first task under it / to its parent |
-| `l` | the worklog (`notes/worklog.md`) of the assistant or a manager, scrollable: `↑↓`, `PgUp`/`PgDn`, `g`/`G` |
+| `→` / `←` / `⌫` | open / close a task with tasks under it (everything starts open); else to the first task under it / to its parent |
+| `l` | the worklog (`notes/worklog.md`) of the assistant or a task that keeps one, scrollable: `↑↓`, `PgUp`/`PgDn`, `g`/`G` |
 | `I` | the node's open question, what is queued in its inbox and the reports by and to it, newest first; `⏎` its pull requests |
 | `b` | its brief, grant, what it may do (and who cut the rest), budget, run state and the tasks under it, as `plete task show` |
 | `z` / `Z` | pause the node and everything below it / let it run again, as `plete task pause` / `resume` |
 | `x` | stop the node and everything below it, as `plete task stop`, after a confirm listing what runs; on the assistant, every task under it (`--all`) |
-| `n` | a new task or manager under the assistant or a manager, as `plete task new --parent` / `plete manager new --parent`: its kind (`space`), name, goal, done, budget (`2h,40turns`) and allow (capabilities, comma-separated); a manager also takes a project; a task takes a project, repositories and a branch (left on "no project", a task under a manager with a project gets the manager's) |
+| `n` | a new task under the assistant or any task under it, as `plete task new --parent`: its kind (`space`; ‹manager› is still offered for now and goes in the next release), name, goal, done, budget (`2h,40turns`) and allow (capabilities, comma-separated); a task takes a project, repositories and a branch (left on "no project", a task under a task with a project gets that project) |
 | `y` | answer the open question at the node or nearest below it, one passed to you first, as `plete report answer` does: type the answer, `⏎` sends it, `esc` cancels |
 | `c` `C` `t` `i` | the assistant, as in the active tab: `i` is its inbox, not the node's reports (`I`) |
 
 What each node made of a pause, resume or stop is shown when it is done. A
-manager made with `n` starts at once, with its brief, and the status line
-says whether it started, was queued on `max_live` or is held by a paused
-manager above it; a task made with `n` is not started (`⏎` starts it), as
-in the active tab. What plete refuses (a manager with no goal, a capability
+task made with `n` is not started (`⏎` starts it), as in the active tab;
+only a manager-kind one starts at once, and the status line says whether it
+started, was queued on `max_live` or is held by a paused task above it. What plete refuses (a capability
 the parent does not hold) is shown on the form. `l`, `I` and `b` show what
 agents wrote, unfenced, and `z`, `Z`, `x`, `n` and `y` act as you, so they
 work only when you run plete from your own terminal: not inside an agent's or
 a top-level task's pane, nor any window of plete's tmux sessions. An answer
-goes to the task that asked, with a copy to each manager it passed through;
+goes to the task that asked, with a copy to each task it passed through;
 how each went is shown when it is done, and a refusal (answered meanwhile,
 say) stays on the form. The worktree, PR, archive and delete keys are the
 active tab's: `⇥` back to it.
@@ -749,7 +746,7 @@ brief, the model it runs, what it is granted and may spend, and the skills,
 MCP servers, environment and harness rules it starts with. plete ships two:
 `default` (a task's agent as it always was) and `planner` (plans an area of
 work, delegates it to tasks under it, checks what they report and reports
-up: what a manager does). `plete task new <name> --agent <profile>` starts
+up: what a manager used to do). `plete task new <name> --agent <profile>` starts
 a task as one:
 
 - as it is made, the profile's `allow`, `budget`, `max_children` and `pr`
@@ -800,12 +797,12 @@ grant. Any agent may list and show them; only you write them.
 
 ### The projects tab
 
-The fourth tab groups the active tasks and managers by project: the plete
+The fourth tab groups the active tasks by project: the plete
 project a task was started from (`plete task new --project`, `n` in the form).
 These are the projects this tab manages (see below); it also shows the work in
-them. A manager is listed under every project that a task below it,
+them. A task with tasks under it is listed under every project that a task below it,
 through any tasks in between, was started from, and under its own project if it
-has one. Tasks and managers with no project are not listed here (the active
+has one. Tasks with no project are not listed here (the active
 tab has them).
 
 ```text
@@ -813,7 +810,7 @@ tab has them).
 │ active 5   agents 6   reviews 2   projects 2    / filter  ⇥ switch        │
 └───────────────────────────────────────────────────────────────────────────┘
 ┌ 2 projects ───────────────────────────────────────────────────────────────┐
-│ api                      ◆ needs input  1 manager, 2 tasks       just now │
+│ api                      ◆ needs input  3 tasks                  just now │
 │ ops, deploy, fix-login                                                    │
 │ web                      ● running      1 task                     5m ago │
 │ ship-web                                                                  │
@@ -821,11 +818,11 @@ tab has them).
 ```
 
 Each project takes two lines: its name, the most urgent status among the tasks
-and managers in it, how many managers and tasks it has and when anything last
+in it, how many tasks it has and when anything last
 happened in it, most recent first; and under the name, dimmed, who is in it.
-`→` or `⏎` goes into a project, to every manager and task
-in it, drawn as in the active tab and walked the same way: `→` goes into a manager
-or a task with tasks under it, `⏎` opens its agent, `←` or `⌫` backs up a level
+`→` or `⏎` goes into a project, to every task
+in it, drawn as in the active tab and walked the same way: `→` goes into a task
+with tasks under it, `⏎` opens its agent, `←` or `⌫` backs up a level
 and, from the top of the project, out of it. The line over the list says where
 you are (`projects › api › …`). `e`, `w`, `p`, `v`, `a`, `D`, `n` and `S` act on
 the task under the cursor as in the active tab. `/` filters the projects by
@@ -836,8 +833,7 @@ project, `E` edits its `project.toml` and `D` deletes it, after a confirm. A new
 project with no tasks yet is listed under `A`. Inside a project, `n` starts a
 task in it and `D` deletes the task.
 
-`A` switches the tab to the other projects, every one with no active task or
-manager: those with only archived tasks and those with no tasks at all; inside
+`A` switches the tab to the other projects, every one with no active task: those with only archived tasks and those with no tasks at all; inside
 one, the archived tasks are a flat list (empty for a project with none), and `a`
 brings one back. Both lists end with a dim reminder of it.
 
@@ -939,7 +935,7 @@ task directory, so it keeps working when you detach (`Ctrl-Q`, or tmux's own `C-
 terminal. tmux is required (`brew install tmux`, `apt install tmux`); without
 it `plete task open` says so. Opening a task attaches to its session, starting
 the agent first if it is not running: Claude Code resumes the task's one
-session, or starts a new one. A task or manager has one session, as a review
+session, or starts a new one. A task has one session, as a review
 has: a `/clear` or a compact starts a new one, which replaces it from then on
 (the old one stays on record). Without a terminal, `open` leaves the agent
 running detached and prints the task directory.
@@ -1039,7 +1035,7 @@ the prompt is answered, and a message never answers the prompt. What you
 send yourself, from your own terminal, to an idle agent is still typed in,
 as your turn; unless you have unsent text in its input box, when it goes
 through the channel as a message from another session, not over your text.
-Everything else (messages from the assistant or a manager, reports,
+Everything else (messages from the assistant or a parent task, reports,
 answers, watch events, and what you send to an agent that is busy) arrives
 as a message from another session, which Claude Code tells the agent cannot
 approve anything, and `plete task send` says "it gets it now, through its
@@ -1147,9 +1143,9 @@ put detail in the pull request or a file and say where. By default a
 report to the assistant is kept for it, not pushed (see [The assistant
 off the push path](#the-assistant-off-the-push-path)); with `[assistant]
 push = true`, `done`, `blocked` and `question` start an assistant session
-when none is running, and `progress` waits for the next one. A task under a manager reports to that manager the
+when none is running, and `progress` waits for the next one. A task under another task reports to that task the
 same way, fenced with its path in the tree (`path="assistant/backend/fix-x"`):
-handed to the manager now through its wake channel (or, without one, typed
+handed to the parent now through its wake channel (or, without one, typed
 into its pane when it sits idle and queued while it is busy), and held in
 its inbox when it is not running, unless the report is one that starts it.
 
@@ -1164,7 +1160,7 @@ A `question` or `blocked` report stays open until it is answered or the
 task reports done, blocked or another question (a `progress` report, or
 plete's own `status` report, does not close it). Its parent holds it, and
 either answers it or passes it to its own parent, which gets it fenced
-with `via="manager …"` and may be started by it. Only
+with `via="task …"` and may be started by it. Only
 the holder answers or passes it on. Once the assistant passes one up it is
 yours: plete raises one desktop notification (`plete: task w asks you
 (#42)`), even with `[assistant] notify = false`. You may answer any open
@@ -1172,7 +1168,7 @@ question in the tree, from a terminal of your own (not a task's pane, nor
 any pane of plete's tmux sessions); `plete report ls` there lists every one,
 those with you first. The answer reaches the task that asked as
 `<plete-answer to="42" from="user">`, as a message does, and may start it;
-each manager the question passed through, up to the one holding it, gets a
+each task the question passed through, up to the one holding it, gets a
 copy with the question. An answer is kept even if it is not delivered, and
 is not sent again: the TUI's `i` shows it. No agent can pass its words off
 as an answer: `plete task send` and `plete task new --prompt` from anyone but
@@ -1183,7 +1179,7 @@ only you can answer, sits idle longer than `[tasks] idle_report_mins`
 (default 10; `plete watch` and the assistant's own turns look), or ends without
 reporting done. These never start an assistant session.
 
-Any task under the assistant, not only a manager, may have tasks under it,
+Any task under the assistant may have tasks under it,
 to any depth (`[tasks] max_depth` caps it; unset, there is no limit): its
 agent runs `plete task new` when its grant holds `task.create`, and you or
 the assistant may pass `--parent <task>`. Its tasks report to it, their
@@ -1219,71 +1215,67 @@ task whose directory has gone is dropped from the queue with a warning.
 show <task> [--json]` a task's brief, grant (and what cut it), budget, run
 state and children, and `plete task grant <task> <caps>|--none` replaces
 its grant (`task.grant`); what a task loses, the tasks below it lose too.
-(`plete manager ls|show|grant|budget|pause|resume|stop` do the same as
-before, and `manager.grant` and `manager.stop`, in config or a grant, are
-read as `task.grant` and `task.stop`.)
 `plete task budget <task> +1h` raises a limit it has, and `=2h,40turns`
 sets one (`task.grant`), within what is left above it (a unit kept or
 lowered is not checked); the 80% and 100%
 reports start over, and a limit set at or below what the task has used
-pauses it at once. Both write a manager's `BRIEF.md` again, as does each
-of its sessions starting.
+pauses it at once.
+
+`plete manager new|ls|show|grant|budget|pause|resume|stop` still work for
+one release as deprecated aliases (each prints a deprecation line): `manager
+new` makes a planner task, `manager ls` is `task tree` and the rest are the
+`task` verbs. `manager.grant`, `manager.stop` and `manager.create`, in config
+or a grant, are read as `task.grant`, `task.stop` and `task.create`.
+
+### Planners
+
+A planner is a task started as the built-in `planner` [agent
+profile](#agent-profiles): it takes an area of work, hands it to tasks under
+it, checks what they report and reports up. It is an ordinary task in every
+other way.
 
 ```bash
-plete manager new api --goal "Ship the v2 API" --done "PRs open, CI green" \
-  --brief-file brief.md --allow task.create,task.send --budget 6h --max-children 4
+plete task new api --agent planner --goal "Ship the v2 API" --done "PRs open, CI green" \
+  --allow task.create,task.send --budget 6h --max-children 4
 ```
 
-`plete manager new` (`manager.create`) makes a manager and starts its agent.
-It goes under the assistant, or under `--parent` (a manager by its exact
-name); made by a manager, it goes under that manager. `--goal`, `--done`,
-`--allow` and `--budget` work as on `task new`, but an unasked grant is
-`[managers] manager_default` (every capability but `assistant.interrupt` unless set) and an unasked budget `[tasks]
-default_budget`; `--brief-file` adds a longer brief after the goal (the two
-together at most 8,000 bytes; a regular file, and, named by the assistant
-or a manager, one inside its own home and of one name, no hard link), and
-`--max-children` lowers `[tasks] max_children` for it. `--project <name>`
-starts it from a [project](#projects): its skills are copied in and its
-`AGENTS.md` becomes `PROJECT.md`, imported from the end of the manager's own
-`AGENTS.md` (which stays as it is); no worktrees are added, as a manager holds
-them read-only and asks for them when it wants one. The project is stored with
-the manager, and a task or manager made under it (`plete task new` from its
+It goes under the assistant, or under `--parent` (a task by its exact
+name); made by a task, it goes under that task. `--goal`, `--done`, `--allow`
+and `--budget` work as on any `task new`, and an unasked budget is `[tasks]
+default_budget`, as a manager's was; `--prompt` adds to what it is first told.
+`--project <name>` starts it from a [project](#projects) like any task, with the
+project's `AGENTS.md` and skills, and its repositories as worktrees. The project
+is stored with the task, and a task made under it (`plete task new` from its
 agent, `--parent`, or `n` on its node in the agents tab) starts from the same
 project unless given `--project` of its own (and so with that project's
 repositories as worktrees, a `--repo` for one of them with no `--branch` adding
 nothing twice); the command line has no way to ask for none, but the `n` form
 starts on the parent's project and takes "no project" at its word. A project
-that can no longer be read costs the new task its project, with a warning. The
-project's `[agent] args` are not applied to the manager itself, and relative
-`@` imports inside the project's `AGENTS.md` do not resolve for a manager, whose
-copy is `PROJECT.md`. A manager is
-not made without `--goal` or `--brief-file`: its brief is all it works
-towards. A manager sits at
-most `max_depth` − 1 below the assistant, and needs a harness with recorded sessions, hooks,
-continue-turn output, `interrupt_keys` and deny rules (Claude Code has them
-all), and is not started on one configured since that lacks them. It prints its home and its place in the tree, then starts it as any
-start is: now, queued over `max_live`, or held while its parent is paused.
-If its agent cannot start, the manager is kept and the command fails.
+that can no longer be read costs the new task its project, with a warning.
+A task needs a harness with recorded sessions, hooks, continue-turn output,
+`interrupt_keys` and deny rules to have tasks under it (Claude Code has them
+all), and is not started on one configured since that lacks them. It prints its home and its place in the tree, then starts as any
+start does: now, queued over `max_live`, or held while its parent is paused.
+If its agent cannot start, the task is kept and the command fails.
 A task made under a parent, by anyone, may not have a control character,
 a line break, a bidirectional, zero-width or other invisible format
 character (such as Unicode tag characters or variation selectors), `<` or `>` in its
 name, nor more than 100 characters: other agents read it, and the user sees
-it. The assistant's session summary lists a task a manager
-made by its slug alone, since its name is that manager's text; `plete task
+it. The assistant's session summary lists a task a planner or other task
+made by its slug alone, since its name is that task's text; `plete task
 ls` and `plete task last --json`, run by an agent, show only the names of
 tasks with no parent, made under the assistant, or made under itself
 (others get `-` and `null`), and the other `plete task` commands name such
 a task by its slug in what they print.
 
-A manager's home is a task directory with a manager's role in place of
-the worker's skill: `AGENTS.md` (plan, delegate, report; stay in your
-subtree; worktrees are read-only; the limits are cooperative), the
-`plete-manager` skill, `notes/worklog.md`, `todo.md`, which it edits by
-hand (`plete todo` stays the assistant's list), and `BRIEF.md`: its goal,
-done-when, budget and what it may do, fenced as its parent's brief and
-read-only. Each of its sessions starts with that brief, the tasks below it
-and their last reports, its budget, its todo list and what is queued for
-it. The assistant learns of managers from its `plete-managers` skill.
+A planner's worktrees are ordinary: it may commit and push like any task,
+within its grant and the PR policy. No `BRIEF.md` is written for it: its goal,
+done-when, budget and what it may do are in the context each session starts
+with, with the tasks below it and their last reports, its budget, its todo
+list and what is queued for it. By its profile's instructions it keeps
+`notes/worklog.md` and `todo.md`, which it edits by hand (`plete todo` stays
+the assistant's list). The assistant learns of planners from its
+`plete-planners` skill.
 
 ```bash
 plete task pause fix-x       # interrupt its turn, and every task's below it
@@ -1310,13 +1302,13 @@ asked for (one you ran yourself after it asked counts too, as the assistant
 stays its asker) and takes it off the `max_live` queue; a review holds no
 stop, so it starts again the next time it is asked for;
 Resume is refused while a
-task above holds it, while its budget is used up (`manager budget` first),
+task above holds it, while its budget is used up (`task budget` first),
 and to anyone ranked below whoever paused or stopped it: you, then the
-assistant, then a manager above, so what you stop only you resume. Once
+assistant, then a task above, so what you stop only you resume. Once
 resumed, a task a message was held for starts with what waited for it if
 its agent is not running, and one still running is handed it; reports
 (progress, idle and the like) never start it, and wait for its next start.
-`task new --prompt` under a paused manager makes the task and keeps its
+`task new --prompt` under a paused task makes the task and keeps its
 brief for then.
 
 ### Archiving and deleting
@@ -1353,7 +1345,7 @@ and any git checkout on the canvas that is none of the task's worktrees (a
 clone made there, or a worktree of a repository outside the store) — and asks;
 without a terminal it needs `--force`.
 
-**A task with tasks under it**, a manager's say, is not deleted while any
+**A task with tasks under it** is not deleted while any
 task sits under it, archived ones included, nor archived while one under it is active, nor unarchived under
 an archived parent or past its parent's `max_children`. `--recursive`
 (`-r`) takes the tree instead: archive and delete list what every task in
@@ -1366,25 +1358,24 @@ part-way leaves what is done done, and running the command again finishes
 the job. In the tasks list, `a` and `D` on a task with tasks under it are
 recursive, and `a` in the archived list brings its tree back.
 
-**`delete --reparent`** deletes a manager alone and moves the tasks under
+**`delete --reparent`** deletes a task alone and moves the tasks under
 it, archived ones too, with their own tasks, to its parent; it conflicts
 with `--recursive`, and a task with nothing under it is refused (a plain
 delete takes it). It needs what delete needs (`task.delete`, held, for an
-agent). It asks once, listing what the manager would lose and which tasks
+agent). It asks once, listing what the task would lose and which tasks
 move where (`--force` without a terminal), and checks every rule of the
-tree before ending the manager's agent and removing its files, then again
+tree before ending the task's agent and removing its files, then again
 as it moves the tasks, all at once: the new parent's `max_children`
 (archived tasks do not count), and that no task's pause or stop would
-change. A manager whose pause holds the tasks under it is refused ("pause
+change. A task whose pause holds the tasks under it is refused ("pause
 or resume first"), since deleting it would free them. Each moved task
 keeps only what it could use where it was and its new parent lets
 through, so nothing it may do changes, and a capability its grant drops is
-named. The reports sent to the manager are kept, as sent to its parent;
+named. The reports sent to the task are kept, as sent to its parent;
 what it used still counts toward every budget above it. The new parent is
 told of each task, in plete's words, with the open question it now holds,
-and is handed each question the manager held, as passed on by plete;
-a running task is handed its new brief, and every manager moved gets its
-`BRIEF.md` again. If the move is refused after the files are gone, the
+and is handed each question the task held, as passed on by plete;
+a running task is handed its new brief. If the move is refused after the files are gone, the
 row is kept, and running the delete again once the cause is gone finishes
 the job. It is CLI only.
 
@@ -1496,7 +1487,7 @@ action = "task"        # tell the task whose PR it is (by its PR history); else 
 [[assistant.rules]]
 on = ["comment"]
 repos = ["acme/api"]
-action = "manager:backend"   # hand it to the manager with that slug; else the assistant
+action = "manager:backend"   # hand it to the planner task with that slug; else the assistant
 
 [[assistant.rules]]
 on = ["mention"]
@@ -1506,16 +1497,16 @@ action = "notify"      # just a notification
 `on` and `repos` may be left out to match anything. Events for the assistant
 go to its sessions by the rules above (primary, else most recent, else a new
 `events <date>` session), several to a message; an event for a task goes to
-its agent the way `plete task send` would send it (never to a manager, which
+its agent the way `plete task send` would send it (never to a planner, which
 may have a worker's PR in its history from reading it). A `manager:<slug>`
-rule hands its events to the active manager with exactly that slug (not its
+rule (the name is kept) hands its events to the active planner task with exactly that slug (not its
 name), several to a message under a line in plete's words, and may start it
 through the start gate, as an event for a task may; the slug is looked up at
-each poll, and one with no active manager of that slug sends its events to
+each poll, and one with no active planner of that slug sends its events to
 the assistant, with a warning in the watch log. Either way the event is
 fenced as `<github-event untrusted="true">`, since titles and comments are
-written by other people: data to weigh, never instructions. One a task or a
-manager cannot be given goes to the assistant; one the assistant cannot be
+written by other people: data to weigh, never instructions. One a task
+cannot be given goes to the assistant; one the assistant cannot be
 given is notified, as is one held for an agent plete could not start. Each
 event, and where it went, is appended to
 `~/.plete/watch-events.jsonl`.
@@ -1594,7 +1585,7 @@ plete setup discard                 # drop everything staged
 
 `plete setup` opens a chat with the setup agent in the tmux session
 `plete-setup`, resuming its last session. It goes through plete one topic at a
-time (repos, the harness, permissions, PR policy, the assistant, managers and
+time (repos, the harness, permissions, PR policy, the assistant, tasks and
 reviews, watching GitHub, notifications, instructions), shows what is set,
 asks what you want and stages the changes. It applies nothing itself:
 `plete setup apply` runs in a pane beside it, where you take or refuse each
@@ -1614,7 +1605,7 @@ can be called `setup`.
 Changes to plete's own files are staged in `~/.plete/setup/proposed/`, each at
 its target id (`config.toml`, `assistant/AGENTS.md`,
 `assistant/.claude/skills/<name>/SKILL.md`, Markdown files under
-`templates/{root,manager,worker}/`),
+`templates/{root,worker}/`),
 with a `manifest.toml` beside them:
 
 ```toml
@@ -1628,7 +1619,7 @@ hash = "af63dc4c8601ec8c"              # the target's hash when staged; omit for
 manifest, a staged file reached through a symlink, and a target that is one.
 For each file it prints a coloured unified diff (or "new file") and
 asks `Apply this change? [y/N/q]`. A staged `config.toml` is first loaded as
-plete would load it, with the `[managers]` and `[review]` policies, the
+plete would load it, with the `[tasks]` and `[review]` policies, the
 `[assistant] allow` capabilities and the `[notify] via` backends (`command`
 needs `[notify] command`) checked, and refused if any fails. The diff
 shows exactly the bytes that would be written. A file
@@ -1751,6 +1742,46 @@ into tasks.
 | `plete worktree list` | `plete worktree ls` |
 | `plete cd` | `plete exec` (subshell) or `plete cd` via init-shell |
 | `plete cd --print` | `plete path` |
+
+## What's new in v0.17
+
+Any task can have tasks under it, agent profiles, and managers retired.
+
+- **Subtasks anywhere.** Any task under the assistant may have tasks under it,
+  to any depth. Its grant passes on, its subtasks report to it, and it
+  answers or escalates their questions ([Reporting to the
+  parent](#reporting-to-the-parent)). A task with tasks under it folds in the
+  TUI (▾/▸), and `n` makes a task under any of them.
+- **`[tasks]` keys.** `max_depth` (unset: no limit), `max_children` (default 6),
+  `default_budget`, `default_allow` and `held` all live in `[tasks]`; the old
+  `[managers]` keys are still read where `[tasks]` does not set them.
+  `[managers] manager_default` and `[permissions.manager]` matter only for
+  old-style manager rows, which are no longer made, and are kept for one
+  release.
+- **Task tree verbs.** `plete task tree|show|grant|budget|pause|resume|stop`
+  work on any task and its subtree. They need `task.grant` and `task.stop`;
+  `manager.grant` and `manager.stop` are read as those, and `manager.create`
+  as `task.create`.
+- **Agent profiles.** `plete agents` lists, shows, creates and edits profiles
+  (instructions, model, grant, budget, skills, MCP servers, environment), and
+  `plete task new --agent <profile>` starts a task as one
+  ([Agent profiles](#agent-profiles)). The built-in `planner` profile is what
+  a manager was.
+- **Project shared docs.** A project's `docs/` folder holds what its tasks
+  know and keep for the tasks after them; tasks whose grant holds
+  `project.write` (in the default grant) may edit it ([Projects](#projects)).
+- **Managers become planners.** On upgrade every manager turns into a task
+  started as `planner`, keeping its place, grant, budget, `max_children` and
+  children. Its worktrees are no longer read-only, it may commit and push, and
+  it gets no `BRIEF.md`. At its first start its plete-written manager
+  `AGENTS.md` is replaced by the project's `PROJECT.md` (or removed) and the
+  manager skill by the task skill; files you edited are kept. The assistant's
+  `plete-managers` skill is replaced by `plete-planners`, and `manager:<slug>`
+  watch rules find planner tasks.
+- **`plete manager …` is deprecated.** `manager new` makes a planner task,
+  `manager ls` is `task tree`, and the rest are the `task` verbs; each
+  prints a deprecation line and they go in the next release, with the
+  new-task form's ‹manager› kind.
 
 ## What's new in v0.16
 
@@ -1996,7 +2027,7 @@ setup chat that walks you through plete's config.
   ([Pull requests from tasks](#pull-requests-from-tasks)).
 - **`[models]`** sets the model for the assistant, managers, tasks and
   reviews ([Models](#models)).
-- **Template overrides.** A file under `~/.plete/templates/{root,manager,worker}/`
+- **Template overrides.** A file under `~/.plete/templates/{root,worker}/`
   replaces the template plete ships for new homes and task skills
   ([Template overrides](#template-overrides)).
 
@@ -2848,7 +2879,7 @@ To add a harness, see [docs/harnesses.md](docs/harnesses.md).
 ```toml
 [models]
 assistant = "opus"
-manager = "sonnet"
+manager = "sonnet"   # planner tasks, unless their profile sets a model
 task = "sonnet"
 review = "sonnet"
 ```
@@ -2877,11 +2908,11 @@ The most specific setting wins: `plete task new --pr <mode>`, then the
 project's `[tasks] pr` in its `project.toml`, then the global one. The
 task is told the mode in one line as each session starts. On Claude Code
 its settings also allow `gh pr create` under `auto` and `draft`, deny `gh
-pr ready` under `draft`, and deny `gh pr create` under `ask`. A manager
-passes `--pr` on to its workers when its brief says how PRs should be
+pr ready` under `draft`, and deny `gh pr create` under `ask`. A planner
+passes `--pr` on to its tasks when its brief says how PRs should be
 opened.
 
-### Quiet messages for the assistant and managers
+### Quiet messages for the assistant and parent tasks
 
 ```toml
 [messages]
@@ -2891,7 +2922,7 @@ reask_mins = 15                                       # default: 15; 0 never
 escalate_mins = 60                                    # default: 60; 0 never
 ```
 
-What is queued for the assistant, and for every manager, is posted by class, from the kind of each
+What is queued for the assistant, and for every planner task, is posted by class, from the kind of each
 item, never from who sent it. A one-line header comes first
 (`plete: 1 question, 2 updates (plete show <ref> for any)`), then:
 
@@ -2904,15 +2935,15 @@ item, never from who sent it. A one-line header comes first
   else is held for `digest_mins`; a full or line item sends it with it.
 
 The nonce stays last, and a Stop's 2 KB cap applies to the rendered post.
-Work tasks always get the full text, as does the assistant with
-`assistant = "full"` and every manager with `managers = "full"` (one key for
-all managers). What a manager's parent or you send it stays whole. Typing into
+Other tasks always get the full text, as does the assistant with
+`assistant = "full"` and every planner task with `managers = "full"` (one key for
+all of them). What a task's parent or you send it stays whole. Typing into
 an idle pane stays full text.
 
 No question is lost: `plete watch` looks at each open ask (a `question` or
 `blocked` report not answered, and its task's latest) on every poll. After
 `reask_mins` from when it was asked, it posts the ask again, whole, to the
-manager holding it then, once
+task holding it then, once
 (one the assistant holds, or has passed to you, is not: you were told when
 it reached the assistant). After `escalate_mins` it notifies you, once,
 whoever holds it, with the ask's id. The quiet flag does not hold that back;
@@ -2967,7 +2998,7 @@ one did before when no session of the assistant's could take it.
 
 ### Letting a task interrupt the assistant
 
-The inbox stays the default. A task or manager you choose may push a
+The inbox stays the default. A task you choose may push a
 message straight into the assistant's session instead, when it holds
 `assistant.interrupt` and asks for it per message:
 
@@ -2985,8 +3016,8 @@ plete task new fix-x --allow worktree.add,assistant.interrupt
 plete task grant backend task.create,worktree.add,assistant.interrupt
 ```
 
-It can also go in `[managers] worker_default` or `manager_default`, if you
-want every new task to have it. A manager can pass it down only if it holds
+It can also go in `[tasks] default_allow`, if you
+want every new task to have it. A task can pass it down only if it holds
 it.
 
 An interrupt goes through the wake channel of the assistant's session. At an
@@ -2995,7 +3026,7 @@ turn ends; it never cuts the turn short, because only you interrupt the
 assistant. With no session running, it is kept for `plete brief` like
 anything else, and no session is started for it. It is fenced like any report or message,
 marked `interrupt="true"`, and still `untrusted="true"`. A report's
-`--interrupt` counts only for a report to the assistant; a manager gets its
+`--interrupt` counts only for a report to the assistant; a task with tasks under it gets its
 reports pushed already.
 
 Each use is written to the sender's `actions.log`, or to the assistant's
@@ -3040,7 +3071,7 @@ stuck_ci_failures = 2     # the default; failed CI runs in a row on a PR that ar
 
 [[notify.rules]]    # the first that matches decides; none matching, it is sent
 kind = ["review"]   # question, blocked, review, startup-prompt, action, grant, message, a GitHub event's kind…
-level = ["review"]  # assistant, manager, task or review
+level = ["review"]  # assistant, task or review
 task = []           # task slugs
 action = "ignore"   # or "notify"
 ```
@@ -3211,8 +3242,7 @@ The capabilities: `task.create`, `task.open`, `task.send`, `task.archive`,
 `review.start`, `project.read`, `project.create`, `project.delete`,
 `project.write` (the project's shared docs), `repo.clone`, `repo.import`, `repo.sync`, `shell.install`, `watch.install`,
 `pr.comment`, `pr.review`, `pr.merge` (`plete pr merge`), `task.grant`
-(`plete task grant` and `budget`), `manager.create` (`plete manager new`)
-`task.stop` (`plete task pause`, `resume` and `stop`) and
+(`plete task grant` and `budget`), `task.stop` (`plete task pause`, `resume` and `stop`) and
 `assistant.interrupt` (`--interrupt` on `plete report` and `plete task send
 assistant`, for the tasks under the assistant; see [Letting a task
 interrupt the assistant](#letting-a-task-interrupt-the-assistant)). Nothing is
@@ -3223,13 +3253,13 @@ review`), so allowed actions do not prompt. Every action it takes, and every one
 `~/.plete/assistant/actions.log`.
 
 A task with a parent (one the assistant made, or one made with `--parent
-assistant`; `--parent` also takes a manager by its exact name) is bounded by
+assistant`; `--parent` also takes any task under the assistant by its exact name) is bounded by
 the chain above it. It is granted every capability but `assistant.interrupt` when made, held ones
-included (`[managers] worker_default`, or what `--allow` names, narrows
+included (`[tasks] default_allow`, or what `--allow` names, narrows
 that), and may use what its grant names only while every list above it,
 ending at `[assistant] allow`, holds it too: a task can never do what the
 assistant may not. Granting a held capability by name (`pr.merge`,
-`pr.comment`, `pr.review`, `task.delete` and `[managers] held`) is written to
+`pr.comment`, `pr.review`, `task.delete` and `[tasks] held`) is written to
 `actions.log` and announced, whatever `[assistant] notify` says, unless you
 grant it yourself. It reaches only itself: it acts only on itself and the
 tasks below it, reads included, and `plete task ls` lists only those. The
@@ -3239,17 +3269,15 @@ projects ls`) stay refused, whatever the assistant holds; the refusal
 tells it to ask with `plete report`. A task made before this keeps the grant
 it was made with: change it with `plete task grant`.
 
-A manager (`plete manager new`) is bounded the same way, by its own grant
-(`--allow`, or `[managers] manager_default`) cut by every list above it,
-but it reaches its subtree rather than only itself: it makes tasks and
-managers under itself (`--parent` names itself or a manager below it), and
-the `plete task` and `plete manager` commands its grant allows act on tasks
-below it, never on its parent, a sibling or another subtree. `plete manager
-stop --all` is yours alone. Its settings pre-approve the `plete` commands of
-what it holds, read at each start, since nobody sits at its pane. Its
-worktrees are read-only, and under `[permissions] guards` it is also denied
-`git commit`, `git push`, `git checkout -b` and `git switch -c`: it hands
-code changes to a worker. When the assistant reads what a task
+A task with tasks under it (a planner, say) is bounded the same way, by its own
+grant (`--allow`, or `[tasks] default_allow`) cut by every list above it,
+but it reaches its subtree rather than only itself: it makes tasks under
+itself (`--parent` names itself or a task below it), and the `plete task`
+commands its grant allows act on tasks below it, never on its parent, a
+sibling or another subtree. `plete task stop --all` is yours alone. Its
+settings pre-approve the `plete` commands of what it holds, read at each
+start, since nobody sits at its pane. It commits and pushes like any task:
+under `[permissions] guards` it is denied what every task is, and no more. When the assistant reads what a task
 said with `plete task last`, it gets it fenced as untrusted, as it gets
 reports, and the status beside it (which the task's agent can write) unable
 to close or open a fence. The assistant's own
@@ -3275,7 +3303,7 @@ as unconfirmed. So a shell you open inside such a task's or the assistant's
 tmux session is refused for commands that need a capability or name a
 task (`plete task last`, `plete worktree ls` and the like); use one outside
 it. This stops mistakes and casual forging, not an agent that sets
-out to escape. Every agent, managers below the assistant included, runs
+out to escape. Every agent, tasks with tasks under them included, runs
 locally in tmux as you, cooperative and unconfined: nothing sandboxes it.
 
 **Upgrading to this version:** agents started by an older plete were never
@@ -3309,7 +3337,7 @@ comment`, `gh issue comment` and `gh pr review` unless it holds
 `pr.comment`/`pr.review` (only those commands: the same through `gh api`
 still reaches your prompt); the assistant holding them runs them without a
 prompt. Top-level tasks get no capability rules.
-Tasks, managers and the assistant may run `gh pr view`, `gh pr checks`,
+Tasks and the assistant may run `gh pr view`, `gh pr checks`,
 `gh pr diff`, `gh run view` and `gh run list` without a prompt. The rules match the start of a
 command only (`git -C . push -f` or `sh -c '…'` get past them), and a push
 whose destination is implied (`git push origin HEAD` while on `main`), a
@@ -3337,7 +3365,7 @@ guards = true               # default false: deny force-pushes, merges, default-
 [permissions.task]          # Claude Code rules, added as written
 allow = ["Bash(cargo test:*)"]
 deny  = []
-[permissions.manager]
+[permissions.manager]       # kept for one release: applies only to old-style manager rows, which are no longer made
 allow = []
 deny  = []
 [permissions.review]
@@ -3352,8 +3380,7 @@ deny  = []
   `git push origin …`, `git push -u origin …`, `git push --set-upstream
   origin …` and `git push --force-with-lease …`. Pushes to a default branch
   and plain force-pushes stay denied, and pushes to other remotes still
-  prompt. With `guards`, managers are still denied `git push`; so are reviews
-under `[review] read_only`. Under `"ask"`
+  prompt. With `guards`, reviews are still denied `git push`, under `[review] read_only`. Under `"ask"`
   pushes are left to Claude Code, which asks or, in auto mode, classifies
   them.
 - **`classifier_context = true`** gives Claude Code's auto-mode classifier
@@ -3363,34 +3390,33 @@ under `[review] read_only`. Under `"ask"`
 - **`guards = true`** puts back the rules plete used to write for every agent:
   `ALWAYS_DENY` (force-pushes, merges outside `plete pr merge`, `gh repo edit`,
   `gh secret`, `gh api` DELETE) and pushes to default branches, for the
-  assistant, every task, every review and the setup agent; and `git commit`,
-  `git push`, `git checkout -b` and `git switch -c` for managers.
+  assistant, every task, every review and the setup agent.
 - **`[permissions.task]`, `[permissions.manager]`, `[permissions.review]`,
   `[permissions.assistant]`**: extra `allow` and `deny` rules in Claude Code's
-  syntax, appended for work tasks, managers, reviews' agents and the assistant.
+  syntax, appended for work tasks, reviews' agents and the assistant.
+  `[permissions.manager]` matters only for old-style manager rows, which are
+  no longer made; it is kept for one release.
 
 #### Restrictions are opt-in
 
-By default tasks, managers and reviews get no restrictions beyond the bound
+By default tasks and reviews get no restrictions beyond the bound
 of `[assistant] allow` (a child never does what the chain above it may not)
 and their subtree, and no command is denied to any agent. The one exception
 is the PR policy: `[tasks] pr = "draft"` denies `gh pr ready` and `"ask"`
 denies `gh pr create`, as that is your policy, not a default restriction. To
 restrict:
 
-- `[tasks] default_allow` and `[managers] manager_default`, or `--allow` on `plete
-  task new` / `plete manager new` and `plete task grant`, narrow what a new
-  task or manager may do (for example `["worktree.add"]`).
+- `[tasks] default_allow`, or `--allow` on `plete task new` and `plete task
+  grant`, narrow what a new task may do (for example `["worktree.add"]`).
 - `[permissions] guards = true` denies force-pushes, merges outside `plete pr
-  merge`, default-branch pushes and the like to every agent, and commits and
-  pushes to managers.
+  merge`, default-branch pushes and the like to every agent.
 - `[review] read_only = true` limits reviews to reading, and denies them every
   push.
-- `[permissions.task]`, `[permissions.manager]`, `[permissions.review]` or
+- `[permissions.task]`, `[permissions.review]` or
   `[permissions.assistant]` `deny = [...]` adds your own rules for one role.
 
 An existing task keeps the grant it was made with; change it with `plete
-manager grant`.
+task grant`.
 
 Allow rules match each part of a compound command on its own, so run a
 plete command bare: `for t in a b; do plete task archive $t --force; done` or
@@ -3402,14 +3428,14 @@ plete command bare: `for t in a b; do plete task archive $t --force; done` or
 idle_report_mins = 10   # tell a task's parent when it sits idle this long
 max_depth = 5           # unset: no limit; set, a task sits at most this far below the assistant
 max_children = 6        # active tasks under one task (the assistant has no limit)
-default_budget = "4h"   # for a manager, or a task under a task, when `--budget` names none
+default_budget = "4h"   # for a task under a task (a planner too), when `--budget` names none
 max_live = 8            # tasks under the assistant running at once, reviews apart; a start past it waits
 # Unset, it defaults to every capability but assistant.interrupt. Setting it restricts, e.g.:
 default_allow = ["worktree.add"]    # a new task's grant when `--allow` names none
 held = []               # added to pr.merge, pr.comment, pr.review, task.delete: logged and notified when a grant names them
 
 [managers]
-manager_default = ["task.create"]   # a new manager's grant
+manager_default = ["task.create"]   # old-style manager rows only; kept for one release
 ```
 
 These keys lived in `[managers]` before (`default_allow` as
@@ -3419,7 +3445,7 @@ set.
 The tree's settings are checked when they are used, not when config.toml
 is read: a mistake in them (an unknown capability, a limit of 0, a `$` budget) refuses making tasks under the
 assistant, starting one, `plete task grant` and unarchiving a task under
-a manager, and nothing else.
+another task, and nothing else.
 
 ### Searching documents
 
@@ -3438,19 +3464,17 @@ matches.
 ### Template overrides
 
 New homes start from the templates plete ships: the assistant's `AGENTS.md`,
-skills, worklog and todo list, a manager's, and the `plete` skill every task
+skills, worklog and todo list, and the `plete` skill every task
 gets. A file of yours under `~/.plete/templates/` is used in its place:
 
 ```
 ~/.plete/templates/root/AGENTS.md                              # the assistant's home, laid out as it is
 ~/.plete/templates/root/.claude/skills/plete-assistant/SKILL.md
-~/.plete/templates/manager/AGENTS.md                           # each new manager's home
-~/.plete/templates/manager/.claude/skills/plete-manager/SKILL.md
 ~/.plete/templates/worker/SKILL.md                             # .claude/skills/plete/SKILL.md in each task
 ```
 
 An override applies only where plete writes a template: a file missing from
-the assistant's or a new manager's home (existing files are never written
+the assistant's home (existing files are never written
 over), and a task's `plete` skill, which is written when the task is made
 and on `plete projects resync`. `CLAUDE.md`, the import of `AGENTS.md`, is
 always plete's, and so are reviews' homes. A path that is not a file is
@@ -3499,9 +3523,8 @@ export PLETE_HOME=/tmp/plete-test
       .plete/wait/                    # its wake channel's lock and the batch in flight
       .claude/skills/plete/SKILL.md   # how an agent adds worktrees
       widget/  widget-2/             # its worktrees, added on demand
-    backend/                         # a manager: AGENTS.md, notes/, todo.md,
-      BRIEF.md                       #   its brief, read-only, written by plete
-      .claude/skills/plete-manager/   #   the plete commands it uses
+    backend/                         # a planner: a task, with notes/worklog.md
+      todo.md                        #   and todo.md that its profile has it keep
   projects/<name>/                   # templates: AGENTS.md and skills/ copied into new tasks
     project.toml                     # its repositories and agent arguments
     AGENTS.md                        # instructions for the agent
@@ -3511,7 +3534,7 @@ export PLETE_HOME=/tmp/plete-test
     AGENTS.md                        # its role; yours to edit
     CLAUDE.md                        # `@AGENTS.md`
     .claude/skills/plete-assistant/   # the plete commands it uses
-    .claude/skills/plete-managers/    # how it hands an area of work to a manager
+    .claude/skills/plete-planners/    # how it hands an area of work to a planner
     notes/worklog.md                 # its running memory
     todo.md                          # the todo list (`plete todo`)
     actions.log                      # what it did, one JSON object per line

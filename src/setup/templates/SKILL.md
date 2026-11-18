@@ -41,7 +41,7 @@ The target ids apply accepts, and nothing else:
 |---|---|
 | `config.toml` | `$PLETE_HOME/config.toml` |
 | `assistant/AGENTS.md` | the assistant's instructions |
-| `assistant/.claude/skills/<name>/SKILL.md` | the assistant's skills (`plete-assistant`, `plete-managers`) |
+| `assistant/.claude/skills/<name>/SKILL.md` | the assistant's skills (`plete-assistant`, `plete-planners`) |
 | `templates/root/…`, `templates/manager/…` (`.md` only) | overrides for new assistant and manager homes, laid out as the home is |
 | `templates/worker/SKILL.md` | override for the skill every new task gets |
 

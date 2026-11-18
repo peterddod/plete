@@ -868,10 +868,21 @@ fn owning_review(app: &App, event: &Event) -> Result<Option<ReviewRecord>> {
 /// alone: a task's name is no key here, since a manager writes the names
 /// of the tasks it makes.
 fn watched_manager(app: &App, slug: &str) -> Result<Option<TaskRecord>> {
-    Ok(app
+    let Some(task) = app
         .db
         .get_task_by_slug(slug)?
-        .filter(|t| t.kind == TaskKind::Manager && t.state == TaskState::Active))
+        .filter(|t| t.state == TaskState::Active)
+    else {
+        return Ok(None);
+    };
+    // A manager now is a task started as the planner, as every one was made.
+    let planner =
+        || -> Result<bool> { Ok(app.db.task_agent(&task.id)?.as_deref() == Some("planner")) };
+    Ok(match task.kind {
+        TaskKind::Manager => Some(task),
+        TaskKind::Work if planner()? => Some(task),
+        _ => None,
+    })
 }
 
 /// Whether the index's repo id (`github.com/acme/api`) is `repo`
@@ -2785,6 +2796,9 @@ mod tests {
         assert_eq!(found("api").as_deref(), Some("api"));
         assert_eq!(found("old"), None);
         assert_eq!(found("w"), None);
+        // A planner task is what a manager is now.
+        app.db.set_task_agent("id-w", "planner").unwrap();
+        assert_eq!(found("w").as_deref(), Some("w"));
         assert_eq!(found("fe"), None);
         assert_eq!(found("id-api"), None);
         assert_eq!(found("API"), None);

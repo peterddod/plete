@@ -573,6 +573,17 @@ const MIGRATIONS: &[&str] = &[
         agent TEXT NOT NULL
     );
     ",
+    // v16: managers become tasks started as the planner profile, which plan
+    // and delegate as they did. Their grants, budgets, fan-out limits and
+    // children stay; their worktrees are no longer held read-only. The kind
+    // stays in the CHECK, so `tasks` is not rebuilt.
+    "
+    INSERT OR IGNORE INTO task_agents (task_id, agent)
+        SELECT id, 'planner' FROM tasks WHERE kind = 'manager';
+    UPDATE task_worktrees SET read_only = 0
+        WHERE task_id IN (SELECT id FROM tasks WHERE kind = 'manager');
+    UPDATE tasks SET kind = 'work' WHERE kind = 'manager';
+    ",
 ];
 
 /// A repository in the index. Its trunk is in the store, except for one
@@ -1088,6 +1099,54 @@ mod tests {
         assert_eq!(db.list_repos(None).unwrap().len(), 1);
     }
 
+    /// v16: a manager becomes a work task started as the planner, keeping
+    /// its place, grant and budget; its worktrees are no longer read-only.
+    #[test]
+    fn a_manager_becomes_a_planner_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let before = MIGRATIONS.len() - 1;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(BASELINE).unwrap();
+            for m in &MIGRATIONS[..before] {
+                conn.execute_batch(m).unwrap();
+            }
+            conn.execute_batch(&format!(
+                "PRAGMA user_version = {before};
+                 INSERT INTO repos (id, trunk_path, remote_url, default_branch)
+                     VALUES ('github.com/acme/api', '/t', 'u', 'main');
+                 INSERT INTO tasks (id, slug, name, kind, created_at, last_activity)
+                     VALUES ('a', 'assistant', 'assistant', 'assistant', 1, 1);
+                 INSERT INTO tasks (id, slug, name, kind, created_at, last_activity, parent_id,
+                                    max_children)
+                     VALUES ('m', 'api', 'api', 'manager', 1, 1, 'a', 3);
+                 INSERT INTO tasks (id, slug, name, kind, created_at, last_activity, parent_id)
+                     VALUES ('w', 'fix', 'fix', 'work', 1, 1, 'm');
+                 INSERT INTO task_grants (task_id, capability) VALUES ('m', 'manager.grant');
+                 INSERT INTO task_worktrees (task_id, repo_id, dir_name, created_at, read_only)
+                     VALUES ('m', 'github.com/acme/api', 'api', 1, 1);"
+            ))
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let m = db.get_task("m").unwrap().unwrap();
+        assert_eq!(m.kind, tasks::TaskKind::Work);
+        assert_eq!(
+            (m.parent_id.as_deref(), m.max_children),
+            (Some("a"), Some(3))
+        );
+        assert_eq!(db.task_agent("m").unwrap().as_deref(), Some("planner"));
+        assert_eq!(db.task_agent("w").unwrap(), None);
+        assert_eq!(db.grants("m").unwrap(), ["manager.grant"]);
+        assert!(!db.list_task_worktrees("m").unwrap()[0].read_only);
+        assert_eq!(
+            db.get_task("w").unwrap().unwrap().parent_id.as_deref(),
+            Some("m")
+        );
+    }
+
     #[test]
     fn rebuilding_tasks_for_the_assistant_keeps_every_row_that_points_at_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -1282,7 +1341,8 @@ mod tests {
         assert_eq!(review.branch.as_deref(), Some("pr/7"));
         // A task with PRs of its own, but no PR checked out, is no review.
         assert_eq!(kind("w"), tasks::TaskKind::Work);
-        assert_eq!(kind("m"), tasks::TaskKind::Manager);
+        // A manager then is a planner task now (v16).
+        assert_eq!(kind("m"), tasks::TaskKind::Work);
     }
 
     #[test]

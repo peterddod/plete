@@ -154,7 +154,10 @@ fn profile_project(app: &App, caller: &Caller, args: &NewTaskArgs) -> Option<Str
 
 /// `d` with what `profile` sets wherever the command line left it unset:
 /// the grant and the budget; and the profile's fan-out limit.
-fn with_profile(d: &Delegation, profile: Option<&Profile>) -> Result<(Delegation, Option<u32>)> {
+pub(crate) fn with_profile(
+    d: &Delegation,
+    profile: Option<&Profile>,
+) -> Result<(Delegation, Option<u32>)> {
     let mut d = d.clone();
     let Some(profile) = profile else {
         return Ok((d, None));
@@ -164,7 +167,9 @@ fn with_profile(d: &Delegation, profile: Option<&Profile>) -> Result<(Delegation
         d.allow = s.allow.clone();
     }
     if d.budget.is_empty() {
-        if let Some(budget) = &s.budget {
+        if s.budget.as_deref() == Some(profiles::DEFAULT_BUDGET) {
+            d.default_budget = true;
+        } else if let Some(budget) = &s.budget {
             d.budget = budget
                 .split(',')
                 .map(|part| crate::manager::budget::parse_part(part.trim()))
