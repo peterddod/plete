@@ -2424,7 +2424,7 @@ mod tests {
     }
 
     /// A folder removed from under the tree drops out on the next reload,
-    /// even when its parent's listing was cached while it was open.
+    /// its children with it.
     #[test]
     fn a_removed_open_folder_drops_out() {
         let dir = tree();

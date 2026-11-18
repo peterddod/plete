@@ -496,11 +496,11 @@ fn handle_mouse(terminal: &mut Tui, explorer: &mut Explorer, mouse: MouseEvent) 
                 // and canonicalising here would refuse to let you climb out.
                 // The cursor lands on that folder's row, so a crumb click can be
                 // undone by pressing → straight back.
-                let before = explorer.cursor_row().zip(Some(explorer.cwd.clone()));
+                let before = (explorer.cwd.clone(), explorer.cursor_row());
                 explorer.go_to_folder(&dir)?;
                 // Only a click that moved us arms the double-click guard; the
                 // root crumb clicked at the root changes nothing.
-                if explorer.cursor_row().zip(Some(explorer.cwd.clone())) != before {
+                if (explorer.cwd.clone(), explorer.cursor_row()) != before {
                     explorer.note_navigating_click(mouse.column, mouse.row);
                     explorer.set_status("");
                 }
