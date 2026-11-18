@@ -590,7 +590,7 @@ fn path_from(output: &std::process::Output) -> std::path::PathBuf {
 /// bare repo. Commands run against it with only `PLETE_HOME` set, so the
 /// trunk's own config refuses the network outright should anything try.
 /// What a child is granted unless something narrows it, by name.
-const EVERY_CAPABILITY: [&str; 24] = [
+const EVERY_CAPABILITY: [&str; 25] = [
     "manager.create",
     "pr.comment",
     "pr.merge",
@@ -598,6 +598,7 @@ const EVERY_CAPABILITY: [&str; 24] = [
     "project.create",
     "project.delete",
     "project.read",
+    "project.write",
     "repo.clone",
     "repo.import",
     "repo.sync",
@@ -2498,6 +2499,107 @@ fn fake_editor(
 
 #[cfg(unix)]
 #[test]
+fn agent_profiles_are_made_listed_shown_and_edited() {
+    let lab = StoreLab::new();
+    let home = lab.home();
+
+    // The built-ins, with nothing written.
+    let output = lab.plete_at(&["agents"], &home, &[]);
+    succeeded(&output);
+    let listed = stdout_of(&output);
+    assert!(
+        listed.contains("default") && listed.contains("planner"),
+        "{listed}"
+    );
+
+    // A starter, which reads, and a copy of the planner that shadows it.
+    let output = lab.plete_at(&["agents", "new", "docs"], &home, &[]);
+    succeeded(&output);
+    assert_eq!(path_from(&output), home.join("agents/docs.md"));
+    let output = lab.plete_at(
+        &["agents", "new", "planner", "--from", "planner"],
+        &home,
+        &[],
+    );
+    succeeded(&output);
+    assert!(stderr_of(&output).contains("shadows the built-in"));
+    let output = lab.plete_at(&["agents", "new", "docs"], &home, &[]);
+    assert!(
+        stderr_of(&output).contains("exists already"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    // A broken one is listed as broken; the rest still are.
+    std::fs::write(home.join("agents/bad.md"), "+++\nmodle = \"x\"\n+++\n").unwrap();
+    let output = lab.plete_at(&["agents", "ls", "--json"], &home, &[]);
+    succeeded(&output);
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let row = |name: &str| rows.iter().find(|r| r["name"] == name).unwrap().clone();
+    assert_eq!(row("planner")["source"], "user");
+    assert_eq!(row("planner")["shadows_builtin"], true);
+    assert_eq!(row("default")["source"], "built-in");
+    assert!(row("bad")["error"]
+        .as_str()
+        .unwrap()
+        .contains("unknown field"));
+
+    let output = lab.plete_at(&["agents", "show", "docs"], &home, &[]);
+    succeeded(&output);
+    assert!(stdout_of(&output).starts_with("+++\n"));
+    // What may be secret is not shown, to an agent or anyone.
+    std::fs::write(
+        home.join("agents/tok.md"),
+        "+++\nenv = { TOKEN = \"s3cret\" }\n+++\nUse it.\n",
+    )
+    .unwrap();
+    let output = lab.plete_at(&["agents", "show", "tok"], &home, &[]);
+    succeeded(&output);
+    assert!(
+        !stdout_of(&output).contains("s3cret"),
+        "{}",
+        stdout_of(&output)
+    );
+    assert!(stdout_of(&output).contains("TOKEN"));
+    // A broken one is still opened to be fixed.
+    let output = lab.plete_at(
+        &["agents", "edit", "bad"],
+        &home,
+        &[("PLETE_EDITOR", "true")],
+    );
+    succeeded(&output);
+    assert!(
+        stderr_of(&output).contains("does not read"),
+        "{}",
+        stderr_of(&output)
+    );
+    let output = lab.plete_at(&["agents", "show", "default"], &home, &[]);
+    succeeded(&output);
+    assert!(stderr_of(&output).contains("built-in"));
+
+    // Edit opens the file in the editor; a built-in is not edited in place.
+    let output = lab.plete_at(
+        &["agents", "edit", "docs"],
+        &home,
+        &[("PLETE_EDITOR", "true")],
+    );
+    succeeded(&output);
+    let output = lab.plete_at(
+        &["agents", "edit", "default"],
+        &home,
+        &[("PLETE_EDITOR", "true")],
+    );
+    assert!(
+        stderr_of(&output).contains("is built in"),
+        "{}",
+        stderr_of(&output)
+    );
+    let output = lab.plete_at(&["agents", "new", "Bad Name"], &home, &[]);
+    assert!(stderr_of(&output).contains("no profile name"));
+}
+
+#[cfg(unix)]
+#[test]
 fn projects_are_made_listed_edited_and_removed() {
     let lab = StoreLab::new();
     let home = lab.home();
@@ -4128,6 +4230,69 @@ fn a_project_task_agent_gets_the_projects_arguments() {
     let argv = calls_of(&tmux, "new-session").pop().unwrap();
     let dash = argv.iter().position(|a| a == "--").unwrap();
     assert_eq!(argv[dash + 1..], ["aider", "--yes", "--verbose"]);
+}
+
+/// A task in a project reaches the project's shared docs: its agent is
+/// given the folder, and may edit it while it holds `project.write`.
+#[test]
+fn a_project_task_reaches_the_projects_shared_docs() {
+    let lab = StoreLab::new();
+    let home = lab.home();
+    std::fs::write(
+        home.join("config.toml"),
+        "scan_roots = []\n[assistant]\nallow = [\"worktree.add\", \"project.write\"]\n",
+    )
+    .unwrap();
+    let output = lab.plete_at(&["projects", "new", "web"], &home, &[]);
+    succeeded(&output);
+    let docs = path_from(&output).join("docs");
+    assert!(std::fs::read_to_string(docs.join("index.md"))
+        .unwrap()
+        .starts_with("# web: shared docs"));
+    succeeded(&lab.plete_at(&["task", "new", "Site", "--project", "web"], &home, &[]));
+    succeeded(&lab.plete_at(
+        &[
+            "task",
+            "new",
+            "Reader",
+            "--project",
+            "web",
+            "--parent",
+            "assistant",
+            "--allow",
+            "worktree.add",
+        ],
+        &home,
+        &[],
+    ));
+
+    let launch = |slug: &str| {
+        let scratch = TempDir::new().unwrap();
+        let tmux = stub_tmux(scratch.path());
+        let tmux_env = tmux.to_string_lossy().to_string();
+        let env = [("PLETE_TMUX", tmux_env.as_str()), ("PLETE_AGENT", "claude")];
+        succeeded(&lab.plete_at(&["task", "open", slug], &home, &env));
+        let argv = calls_of(&tmux, "new-session").pop().unwrap();
+        let after = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+        let settings = std::fs::read_to_string(after("--settings")).unwrap();
+        (after("--add-dir"), settings)
+    };
+    let rule = format!("Edit(/{}/**)", docs.display());
+    // The user's own task may write them.
+    let (dir, settings) = launch("site");
+    assert_eq!(std::path::PathBuf::from(dir), docs);
+    assert!(settings.contains(&rule), "{settings}");
+    // One under the assistant without `project.write` reads them only: its
+    // edits there are denied.
+    let (dir, settings) = launch("reader");
+    assert_eq!(std::path::PathBuf::from(dir), docs);
+    let json: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    let has = |list: &str| {
+        json["permissions"][list]
+            .as_array()
+            .is_some_and(|rules| rules.iter().any(|r| r == &serde_json::json!(rule)))
+    };
+    assert!(!has("allow") && has("deny"), "{settings}");
 }
 
 // ---------------------------------------------------------------------------
@@ -10150,13 +10315,15 @@ fn a_root_worker_is_granted_and_budgeted_within_what_the_assistant_holds() {
     let v = lab.new_task_with("v", &parent);
     assert_eq!(lab.grants_of(&v), EVERY_CAPABILITY);
     assert_eq!(lab.budget_of(&v), None);
-    let output = lab.plete_at(&["task", "new", "x", "--parent", "w"], &lab.home(), &[]);
-    assert!(!output.status.success());
-    assert!(
-        stderr_of(&output).contains("not a manager"),
-        "{}",
-        stderr_of(&output)
+    // A worker has tasks under it too, with its budget's default.
+    let output = lab.plete_at(
+        &["task", "new", "under-w", "--parent", "w"],
+        &lab.home(),
+        &[],
     );
+    succeeded(&output);
+    let under_w = task_id(&path_from(&output));
+    assert_eq!(lab.parent_of(&under_w), Some(w.clone()));
     lab.new_task_with("top", &[]);
 
     // The user's held grant is logged as theirs, and not announced.
@@ -10328,7 +10495,7 @@ fn a_root_worker_is_granted_and_budgeted_within_what_the_assistant_holds() {
     succeeded(&output);
     let listed: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
     let slugs: Vec<&str> = listed.iter().map(|r| r["task"].as_str().unwrap()).collect();
-    assert_eq!(slugs, ["r", "v", "w", "y", "z"]);
+    assert_eq!(slugs, ["r", "v", "w", "under-w", "y", "z"]);
 }
 
 /// A repository the store lacks is cloned by `worktree add` or `task new
@@ -10730,7 +10897,6 @@ fn a_manager_makes_and_reaches_only_its_own_subtree() {
             &["task", "new", "x", "--parent", "assistant"],
             "may not run `plete task new` on \"assistant\"",
         ),
-        (&["task", "new", "x", "--parent", "w"], "only a manager"),
         // Cut by the assistant's list above it.
         (&["task", "new", "x", "--allow", "task.send"], "`task.send`"),
         (&["task", "new", "x", "--budget", "2h"], "more than is left"),
@@ -11043,11 +11209,7 @@ fn a_root_worker_reaches_only_itself_reads_included() {
     let mut wp_agent = lab.task_pane("wp");
 
     for (args, says) in [
-        (
-            &["task", "new", "x"][..],
-            "a task with a parent cannot make tasks",
-        ),
-        (&["manager", "new", "x"], "may not run `plete manager new`"),
+        (&["manager", "new", "x"][..], "may not make managers"),
         (&["task", "send", "sib", "hi"], "never message each other"),
         (
             &["manager", "grant", "sib", "task.send"],
@@ -11385,7 +11547,10 @@ fn manager_new_is_refused_on_a_harness_a_manager_cannot_run_on() {
     let output = lab.plete_at(&["task", "open", "mgr"], &lab.home(), &env);
     assert!(!output.status.success());
     let said = stderr_of(&output);
-    assert!(said.contains("a manager needs what"), "{said}");
+    assert!(
+        said.contains("a task with tasks under it needs what"),
+        "{said}"
+    );
     assert!(said.contains("hook events"), "{said}");
     assert!(calls_of(&tmux, "new-session").is_empty());
 
@@ -11659,8 +11824,8 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         "{w_start:?}"
     );
 
-    // A sub-manager below it, while it holds `manager.create`, and none
-    // deeper than `max_depth` lets a manager sit.
+    // A sub-manager below it, while it holds `manager.create` (the depth
+    // limit, off by default, is the unit tests').
     let mut sub_agent = PaneShell::spawn(&lab, &[("PLETE_TMUX", &tmux_env)]);
     sub_agent.as_session_pane(&tmux, "plete-sub");
     let output = mp.plete(
@@ -11685,18 +11850,6 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
     assert_eq!(shown["path"], "assistant/api/sub");
     assert_eq!(shown["kind"], "manager");
     assert!(stub.join("alive/plete-sub").exists());
-    let output = mp.plete(
-        &["manager", "new", "deep", "--parent", "sub", "--goal", "g"],
-        &api_dir,
-        &env,
-    );
-    assert!(!output.status.success());
-    assert!(
-        stderr_of(&output).contains("`[managers] max_depth` is 3"),
-        "{}",
-        stderr_of(&output)
-    );
-    assert_eq!(slugs("deep"), 0);
 
     // Every reach outside its subtree is refused, and leaves things as
     // they were.
@@ -11927,6 +12080,7 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         "plete manager ls",
         "plete manager show",
         "plete notify",
+        "plete search",
         "plete task new",
         "plete task open",
         "plete task send",
@@ -17807,6 +17961,137 @@ action = "assistant"
     assert_eq!(told(), line);
     let all = stdout_of(&lab.plete_at(&["brief", "--all"], &lab.home(), &[]));
     assert!(all.contains("- r1 question from task x"), "{all}");
+}
+
+/// `text` written to `path`, making its directory.
+fn write_doc(path: &std::path::Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// A document of 150 words about `topic`, long enough to stand alone as a
+/// passage.
+fn doc_about(topic: &str) -> String {
+    format!("# Notes on {topic}\n\n{}\n", vec![topic; 150].join(" "))
+}
+
+#[test]
+fn search_finds_the_assistants_notes_for_the_user_and_lists_them_in_status() {
+    let lab = StoreLab::new();
+    write_doc(
+        &lab.home().join("assistant/notes/x.md"),
+        &doc_about("zeppelin"),
+    );
+    write_doc(
+        &lab.home().join("assistant/CLAUDE.md"),
+        &doc_about("zeppelin"),
+    );
+
+    let output = lab.plete_at(&["search", "what", "about", "zeppelin?"], &lab.home(), &[]);
+    succeeded(&output);
+    let out = stdout_of(&output);
+    assert!(out.starts_with("1. Notes on zeppelin  (1.00)  "), "{out}");
+    assert!(out.contains("notes/x.md"), "{out}");
+    // The generated CLAUDE.md is not a document.
+    assert!(!out.contains("CLAUDE.md"), "{out}");
+    assert!(
+        out.contains("(top)") || out.contains("Notes on zeppelin   L"),
+        "{out}"
+    );
+
+    let output = lab.plete_at(&["search", "zeppelin", "--json"], &lab.home(), &[]);
+    succeeded(&output);
+    let hits: serde_json::Value = serde_json::from_str(&stdout_of(&output)).unwrap();
+    assert_eq!(hits.as_array().unwrap().len(), 1);
+    assert_eq!(hits[0]["source"], "assistant");
+    assert_eq!(hits[0]["title"], "Notes on zeppelin");
+    assert_eq!(hits[0]["passages"][0]["start_line"], 1);
+
+    let output = lab.plete_at(&["search", "--status"], &lab.home(), &[]);
+    succeeded(&output);
+    let out = stdout_of(&output);
+    assert!(out.lines().any(|l| l.starts_with("assistant ")), "{out}");
+    assert!(out.contains("1 docs, 1 passages; index "), "{out}");
+
+    let output = lab.plete_at(&["search", "no-such-word-anywhere"], &lab.home(), &[]);
+    succeeded(&output);
+    assert_eq!(stdout_of(&output), "No documents match.\n");
+
+    // Narrowing by kind never adds: no repos are cloned.
+    let output = lab.plete_at(&["search", "zeppelin", "--in", "repos"], &lab.home(), &[]);
+    succeeded(&output);
+    assert!(stdout_of(&output).starts_with("No documents match.\n"));
+
+    // Reset empties the index; the next search builds it again.
+    succeeded(&lab.plete_at(&["search", "--reset"], &lab.home(), &[]));
+    let output = lab.plete_at(&["search", "zeppelin"], &lab.home(), &[]);
+    assert!(stdout_of(&output).starts_with("1. "));
+}
+
+#[test]
+fn search_finds_a_repos_readme_under_in_repos() {
+    let lab = StoreLab::new();
+    lab.origin("widget");
+    let seed = lab.seed("widget");
+    write_doc(&seed.join("README.md"), &doc_about("gearbox"));
+    write_doc(&seed.join("src/main.rs"), "fn gearbox() {}\n");
+    git(&["add", "."], &seed);
+    git(&["commit", "-q", "-m", "docs"], &seed);
+    git(&["push", "-q", "origin", "main"], &seed);
+    let output = lab.clone_with_interval("widget", "0");
+    succeeded(&output);
+
+    let output = lab.plete_at(
+        &["search", "gearbox", "--in", "repos", "--json"],
+        &lab.home(),
+        &[],
+    );
+    succeeded(&output);
+    let hits: serde_json::Value = serde_json::from_str(&stdout_of(&output)).unwrap();
+    let hits = hits.as_array().unwrap();
+    assert_eq!(hits.len(), 1, "code is not searched: {hits:?}");
+    assert_eq!(hits[0]["source"], "repo:github.com/acme/widget");
+    assert!(hits[0]["path"]
+        .as_str()
+        .unwrap()
+        .ends_with("widget/README.md"));
+
+    // Asking for the assistant alone leaves the repo out.
+    let output = lab.plete_at(
+        &["search", "gearbox", "--in", "assistant"],
+        &lab.home(),
+        &[],
+    );
+    assert_eq!(stdout_of(&output), "No documents match.\n");
+}
+
+#[test]
+fn a_task_searches_its_own_folder_and_not_the_assistant_or_another_task() {
+    let lab = StoreLab::new();
+    write_doc(
+        &lab.home().join("assistant/notes/secret.md"),
+        &doc_about("walrus"),
+    );
+    // A task with a parent is held to its subtree; a top-level one runs as
+    // the user.
+    let id = lab.new_task_with("mine", &["--parent", "assistant"]);
+    let mine = lab.home().join("tasks/mine");
+    let other = lab.new_task("other");
+    write_doc(&mine.join("REPORT.md"), &doc_about("walrus"));
+    write_doc(&other.join("REPORT.md"), &doc_about("walrus"));
+    let mut pane = lab.task_pane("mine");
+
+    let output = pane.plete(&["search", "walrus", "--json"], &mine, &[]);
+    succeeded(&output);
+    let hits: serde_json::Value = serde_json::from_str(&stdout_of(&output)).unwrap();
+    let hits = hits.as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0]["source"], format!("task:{id}"));
+
+    // It may not wipe the index shared by all.
+    let output = pane.plete(&["search", "--reset"], &mine, &[]);
+    assert!(!output.status.success());
+    assert!(lab.home().join("search/index.db").is_file());
 }
 
 /// The binary, linked as `name` in a new directory (as the packages do for

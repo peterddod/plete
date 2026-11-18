@@ -7,53 +7,13 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::state::{human_size, DiffCount, DiffMap, Explorer, Overlay, PendingAction, PrLookup};
+use super::keys::{self, Hint};
+use super::state::{
+    human_size, DiffCount, DiffMap, Explorer, Overlay, PendingAction, PrLookup, Row,
+};
 use crate::github::{PendingReview, PullRequest, Verdict};
 use crate::review::JobState;
 use crate::worktrees::WorktreeStatus;
-
-/// The hint row, as segments. It is one non-wrapping line, so what does not
-/// fit is not shortened but cut off — and the two that would go first are the
-/// ones that replaced keys people knew. So the head and the tail always stay,
-/// and the middle is dropped from the right until the rest fits.
-const HINT_HEAD: &str = "type to filter";
-const HINT_MIDDLE: [&str; 11] = [
-    "⇥ complete",
-    ": command",
-    "/ enter",
-    "↑↓ move",
-    "⏎ open",
-    "^f diff",
-    "^p PR",
-    "^o PRs",
-    "^w worktrees",
-    "^a agent",
-    "^d hidden",
-];
-const HINT_TAIL: [&str; 2] = ["F1 help", "^q quit"];
-
-/// The most hints that fit `width`. Below the width of even the head and the
-/// tail it keeps giving up ground, down to the way out on its own: a hint row
-/// clipped mid-word tells the user nothing, and `q` no longer quits.
-fn hints(width: u16) -> String {
-    let width = width as usize;
-    let with_middle = |keep: usize| {
-        std::iter::once(HINT_HEAD)
-            .chain(HINT_MIDDLE[..keep].iter().copied())
-            .chain(HINT_TAIL)
-            .collect::<Vec<_>>()
-            .join("  ")
-    };
-    let last = HINT_TAIL[HINT_TAIL.len() - 1];
-    (0..=HINT_MIDDLE.len())
-        .rev()
-        .map(with_middle)
-        .chain([HINT_TAIL.join("  "), last.to_string()])
-        .find(|line| line.width() <= width)
-        // Narrower than even that: say as much of it as there is room for
-        // rather than let the terminal cut it off wherever it lands.
-        .unwrap_or_else(|| truncate(last, width))
-}
 
 /// Column the header's value column starts at: one for the border, plus the
 /// width of the widest label. Clicks on the breadcrumb are measured from here.
@@ -98,27 +58,27 @@ pub fn draw(frame: &mut Frame, explorer: &mut Explorer) {
         let needle = explorer.needle();
         // Split the borrow: the list widget needs its scroll state mutably
         // while the entries it renders are borrowed immutably.
+        let cursor = explorer.cursor_row();
         let Explorer {
             entries,
             hidden,
             matches,
-            selected,
+            rows,
             list,
             diffs,
             root,
             ..
         } = &mut *explorer;
-        let rows: Vec<&super::state::FsEntry> =
-            matches.iter().filter_map(|&i| entries.get(i)).collect();
         draw_listing(
             frame,
             chunks[1],
             Listing {
-                rows: &rows,
+                rows,
+                shown: matches.len(),
                 total: entries.len(),
                 hidden: *hidden,
                 filter: &needle,
-                selected: *selected,
+                cursor,
                 diffs,
                 root,
             },
@@ -134,7 +94,7 @@ pub fn draw(frame: &mut Frame, explorer: &mut Explorer) {
     frame.render_widget(status, chunks[2]);
 
     let hints = Paragraph::new(Line::from(Span::styled(
-        hints(chunks[3].width),
+        keys::hint_line(&keys::explorer_hints(explorer), chunks[3].width as usize),
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(hints, chunks[3]);
@@ -394,13 +354,17 @@ pub fn status_span(status: &WorktreeStatus) -> Span<'static> {
 /// What the file list needs in order to draw itself, gathered up rather than
 /// spread across half a dozen positional arguments.
 struct Listing<'a> {
-    rows: &'a [&'a super::state::FsEntry],
-    /// Everything in the directory, so a filtered listing can say "3 of 9".
+    /// The whole tree, as flattened.
+    rows: &'a [Row],
+    /// The cursor level's matches and its whole listing, so a filtered level
+    /// can say "3 of 9" — the count is for that folder, not the tree.
+    shown: usize,
     total: usize,
     /// Dotfiles left out, so an empty-looking pane can say which kind it is.
     hidden: usize,
     filter: &'a str,
-    selected: usize,
+    /// Index into `rows`; none when the filter left the level with nothing.
+    cursor: Option<usize>,
     diffs: &'a DiffMap,
     root: &'a std::path::Path,
 }
@@ -445,20 +409,21 @@ fn diff_spans(count: Option<DiffCount>, width: usize) -> Vec<Span<'static>> {
 
 fn draw_listing(frame: &mut Frame, area: Rect, listing: Listing, list_state: &mut ListState) {
     let Listing {
-        rows: entries,
+        rows,
+        shown,
         total,
         hidden,
         filter,
-        selected,
+        cursor,
         diffs,
         root,
     } = listing;
     let width = area.width.saturating_sub(4) as usize;
     // Sizes and diffs both line up in columns, so each is as wide as its widest
     // entry on screen; a directory with no changes has no diff column at all.
-    let counts: Vec<Option<DiffCount>> = entries
+    let counts: Vec<Option<DiffCount>> = rows
         .iter()
-        .map(|entry| diffs.get(root, &entry.path))
+        .map(|row| diffs.get(root, &row.entry.path))
         .collect();
     let diff_width = counts
         .iter()
@@ -466,20 +431,24 @@ fn draw_listing(frame: &mut Frame, area: Rect, listing: Listing, list_state: &mu
         .map(|c| diff_label(*c).width())
         .max()
         .unwrap_or(0);
-    let size_width = entries
+    let size_width = rows
         .iter()
-        .filter(|e| !e.is_dir)
-        .map(|e| human_size(e.size).width())
+        .filter(|row| !row.entry.is_dir)
+        .map(|row| human_size(row.entry.size).width())
         .max()
         .unwrap_or(0);
-    let items: Vec<ListItem> = entries
+    let items: Vec<ListItem> = rows
         .iter()
         .zip(counts)
-        .map(|(entry, count)| {
-            let (marker, style) = if entry.is_dir {
-                ("▸ ", Style::default().fg(Color::Cyan))
-            } else {
-                ("  ", Style::default())
+        .map(|(row, count)| {
+            let entry = &row.entry;
+            // Two columns a level, then the fold marker, which files keep the
+            // room for so names line up within a level.
+            let indent = "  ".repeat(row.depth);
+            let (marker, style) = match (entry.is_dir, row.open) {
+                (true, true) => ("▾ ", Style::default().fg(Color::Cyan)),
+                (true, false) => ("▸ ", Style::default().fg(Color::Cyan)),
+                (false, _) => ("  ", Style::default()),
             };
             let name = entry.display_name();
             let size = if entry.is_dir {
@@ -491,9 +460,10 @@ fn draw_listing(frame: &mut Frame, area: Rect, listing: Listing, list_state: &mu
             // per character and padding it by count pushes the size off the
             // right edge of the pane.
             let diff_col = if diff_width > 0 { diff_width + 2 } else { 0 };
-            let used = marker.width() + name.width() + diff_col + size_width;
+            let used = indent.width() + marker.width() + name.width() + diff_col + size_width;
             let pad = width.saturating_sub(used).max(1);
             let mut spans = vec![
+                Span::raw(indent),
                 Span::styled(marker, style),
                 Span::styled(name, style),
                 Span::raw(" ".repeat(pad)),
@@ -510,13 +480,9 @@ fn draw_listing(frame: &mut Frame, area: Rect, listing: Listing, list_state: &mu
         })
         .collect();
 
-    let title = listing_title(entries.len(), total, hidden, filter, area.width);
+    let title = listing_title(shown, total, hidden, filter, area.width);
 
-    list_state.select(if entries.is_empty() {
-        None
-    } else {
-        Some(selected.min(entries.len() - 1))
-    });
+    list_state.select(cursor);
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -611,8 +577,10 @@ fn draw_overlay(frame: &mut Frame, explorer: &Explorer, overlay: &Overlay) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" worktrees · ⏎ switch  o open PR  r refresh ")
-                        .title_style(Style::default().fg(Color::Green)),
+                        .title(" worktrees ")
+                        .title_style(Style::default().fg(Color::Green))
+                        // Below, where a narrow panel has the room the title lacks.
+                        .title_bottom(" ↑↓ move  ⏎ switch  o open PR  r refresh  esc close "),
                 )
                 .highlight_style(
                     Style::default()
@@ -636,7 +604,7 @@ fn draw_overlay(frame: &mut Frame, explorer: &Explorer, overlay: &Overlay) {
                 .collect();
             body.push(Line::from(""));
             let keys = match action {
-                PendingAction::Command(_) => "y remove · n cancel",
+                PendingAction::Command(_) => "y remove · n or esc cancel",
             };
             body.push(Line::from(Span::styled(
                 keys,
@@ -655,7 +623,8 @@ fn draw_overlay(frame: &mut Frame, explorer: &Explorer, overlay: &Overlay) {
             );
         }
         Overlay::Help { scroll } => {
-            let (area, max_scroll) = help_geometry(frame.area());
+            let here = keys::explorer_hints(explorer);
+            let (area, max_scroll) = help_geometry(frame.area(), &here);
             frame.render_widget(Clear, area);
             let title = if max_scroll > 0 {
                 " keys · ↑↓ scroll · esc close "
@@ -663,7 +632,7 @@ fn draw_overlay(frame: &mut Frame, explorer: &Explorer, overlay: &Overlay) {
                 " keys · esc close "
             };
             frame.render_widget(
-                Paragraph::new(help_body(area.width.saturating_sub(2)))
+                Paragraph::new(help_body(area.width.saturating_sub(2), &here))
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
@@ -854,11 +823,9 @@ fn draw_overlay(frame: &mut Frame, explorer: &Explorer, overlay: &Overlay) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!(
-                            " {} open pull requests · ⏎ check out and switch  o browser  r refresh ",
-                            rows.len()
-                        ))
-                        .title_style(Style::default().fg(Color::Green)),
+                        .title(format!(" {} open pull requests ", rows.len()))
+                        .title_style(Style::default().fg(Color::Green))
+                        .title_bottom(" ↑↓ move  ⏎ check out  o browser  r refresh  esc close "),
                 )
                 .highlight_style(
                     Style::default()
@@ -980,18 +947,24 @@ const HELP: [(&str, &str); 26] = [
         "type to filter this level (live, no key needed)",
     ),
     ("⇥", "complete the filter, as far as the matches agree"),
-    ("/ or \\", "enter the highlighted folder, filtering afresh"),
+    (
+        "/ or \\",
+        "open the highlighted folder and go in, filtering afresh",
+    ),
     ("⌫ / ctrl-u", "delete a character / clear the filter"),
     (":", "command: mv, cp [-r], mkdir [-p], rm [-r], touch"),
     ("", ""),
     ("↑ ↓", "move up and down · PgUp/PgDn ten rows"),
-    ("→", "expand: enter the highlighted folder"),
+    ("→", "open a closed folder · on an open one, go in"),
     (
         "← / ⌫",
-        "back: leave the folder (⌫ once the filter is empty)",
+        "close an open folder, else go out (⌫ once the filter is empty)",
     ),
-    ("⏎", "folder: enter · file: open in your editor"),
-    ("click", "a row to enter or select it, a path crumb to jump"),
+    ("⏎", "folder: open or close it · file: open in your editor"),
+    (
+        "click",
+        "a folder to open or close it, a path crumb to jump",
+    ),
     ("shift-drag", "select text — plete has the mouse otherwise"),
     ("Home / End", "jump to the top / bottom"),
     ("", ""),
@@ -1013,10 +986,32 @@ const HELP: [(&str, &str); 26] = [
     ("ctrl-d", "toggle hidden dotfiles"),
     ("ctrl-r", "refresh the listing and counters"),
     ("ctrl-q", "quit, leaving the shell in this directory"),
-    ("F1 / ctrl-g", "this list"),
+    (
+        "F1 / ctrl-g",
+        "this list; the bottom line says F1 +N more when keys are left out",
+    ),
     ("esc", "clear the filter, or quit without moving the shell"),
     ("", ""),
 ];
+
+/// What the panel lists: the keys that work in the explorer right now, then
+/// the whole reference. Both the layout and the geometry start from this, so
+/// they cannot count different rows.
+///
+/// The keys that work now go in one row, wrapped like any description, so
+/// they cost a few lines rather than one each on top of the reference. Each
+/// hint's own spaces are non-breaking: a line may end between hints, never
+/// between a key and what it does.
+fn help_rows(here: &[Hint]) -> Vec<(String, String)> {
+    let now = here
+        .iter()
+        .map(|h| format!("{} {}", h.key, h.label).replace(' ', "\u{a0}"))
+        .collect::<Vec<_>>()
+        .join("  ");
+    let mut rows = vec![("now".to_string(), now), (String::new(), String::new())];
+    rows.extend(HELP.iter().map(|(k, d)| (k.to_string(), d.to_string())));
+    rows
+}
 
 /// The key list laid out for a panel `width` columns wide inside its border.
 ///
@@ -1025,7 +1020,7 @@ const HELP: [(&str, &str); 26] = [
 /// different idea of where the lines break leaves the last rows unreachable.
 /// It also lets a continuation line hang under the description rather than
 /// restarting in the key column.
-pub fn help_body(width: u16) -> Vec<Line<'static>> {
+pub fn help_body(width: u16, here: &[Hint]) -> Vec<Line<'static>> {
     let width = (width as usize).max(1);
     // Below this there is no room for a description beside its key, so the key
     // takes a line of its own and the description follows, indented.
@@ -1033,7 +1028,8 @@ pub fn help_body(width: u16) -> Vec<Line<'static>> {
     // Never so far in that there is no room left to indent anything onto.
     let indent = if two_column { KEY_WIDTH } else { 2 }.min(width.saturating_sub(1));
     let mut lines = Vec::new();
-    for (key, description) in HELP {
+    for (key, description) in help_rows(here) {
+        let (key, description) = (key.as_str(), description.as_str());
         if key.is_empty() && description.is_empty() {
             lines.push(Line::from(""));
             continue;
@@ -1137,16 +1133,17 @@ fn split_word(word: &str, width: usize) -> Vec<String> {
 /// clips its own descriptions explains nothing. When even that will not fit
 /// the rows wrap, which makes the list longer than the box — hence the scroll,
 /// so a small terminal loses nothing, only shows it a screen at a time.
-pub fn help_geometry(frame: Rect) -> (Rect, u16) {
-    let widest = HELP
+pub fn help_geometry(frame: Rect, here: &[Hint]) -> (Rect, u16) {
+    let rows = help_rows(here);
+    let widest = rows
         .iter()
         .map(|(_, description)| KEY_WIDTH + description.width())
         .max()
         .unwrap_or(0);
-    let area = fitted_rect(widest, HELP.len(), frame);
+    let area = fitted_rect(widest, rows.len(), frame);
     // Counted from the very lines that will be drawn, so the limit cannot
     // disagree with them and strand the last row.
-    let lines = help_body(area.width.saturating_sub(2)).len();
+    let lines = help_body(area.width.saturating_sub(2), here).len();
     let inner_height = area.height.saturating_sub(2) as usize;
     (area, lines.saturating_sub(inner_height) as u16)
 }
@@ -1271,32 +1268,18 @@ mod tests {
         assert_eq!(status_span(&WorktreeStatus::default()).content, "clean");
     }
 
-    /// The hint row does not wrap, so what does not fit is lost — and the two
-    /// that would go first are the ones that replaced keys people knew.
-    #[test]
-    fn hints_shrink_to_fit_the_terminal() {
-        // No width overflows, however narrow — not even one too small for the
-        // last hint standing.
-        for width in 1u16..=200 {
-            let hint = hints(width);
-            assert!(hint.width() <= width as usize, "{width}: {hint:?}");
-        }
-        // And every width with room for it keeps the way out: `q` does not
-        // quit any more, so `^q quit` is the last thing to go.
-        for width in 7u16..=200 {
-            assert!(hints(width).contains("^q quit"), "{width}");
-        }
-        for width in [200u16, 118, 100, 90, 80, 70, 40, 32] {
-            let hint = hints(width);
-            assert!(hint.starts_with(HINT_HEAD), "{width}: {hint}");
-            assert!(hint.contains("F1 help"), "{width}: {hint}");
-        }
-        // Room for everything means everything is shown.
-        let full = hints(200);
-        assert!(HINT_MIDDLE.iter().all(|h| full.contains(h)), "{full}");
-        // Widening the terminal never shows fewer hints.
-        let widths: Vec<usize> = (30..=130).map(|w| hints(w).width()).collect();
-        assert!(widths.windows(2).all(|w| w[0] <= w[1]), "{widths:?}");
+    /// A few of the keys the explorer shows, for the panel's "here" section.
+    fn here() -> Vec<Hint> {
+        vec![
+            Hint {
+                key: "⏎",
+                label: "open",
+            },
+            Hint {
+                key: "^q",
+                label: "quit",
+            },
+        ]
     }
 
     /// Render the help panel at `scroll` and give back what is on screen.
@@ -1307,9 +1290,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                let (area, max_scroll) = help_geometry(frame.area());
+                let (area, max_scroll) = help_geometry(frame.area(), &here());
                 frame.render_widget(
-                    Paragraph::new(help_body(area.width.saturating_sub(2)))
+                    Paragraph::new(help_body(area.width.saturating_sub(2), &here()))
                         .block(Block::default().borders(Borders::ALL))
                         .scroll((scroll.min(max_scroll), 0)),
                     area,
@@ -1348,7 +1331,7 @@ mod tests {
         );
         for width in [20u16, 22, 27, 28, 40, 60, 80, 120] {
             for height in [10u16, 16, 24, 40] {
-                let (_, max_scroll) = help_geometry(Rect::new(0, 0, width, height));
+                let (_, max_scroll) = help_geometry(Rect::new(0, 0, width, height), &here());
                 let screen = render_help(width, height, max_scroll);
                 assert!(
                     screen.contains(key) && screen.contains(tail),
@@ -1378,7 +1361,7 @@ mod tests {
             .unwrap();
         assert!(key.is_empty(), "the continuation row has no key of its own");
         for width in [40u16, 60, 80, 120] {
-            let line = help_body(width)
+            let line = help_body(width, &here())
                 .into_iter()
                 .find(|l| l.spans.iter().any(|s| s.content.contains("in the panel")))
                 .unwrap_or_else(|| panic!("width {width}: row missing"));
@@ -1455,7 +1438,7 @@ mod tests {
     #[test]
     fn the_help_panel_never_overflows_its_width() {
         for width in 1u16..100 {
-            for line in help_body(width) {
+            for line in help_body(width, &here()) {
                 let drawn: usize = line.spans.iter().map(|s| s.content.width()).sum();
                 assert!(drawn <= width as usize, "width {width}: {drawn} columns");
             }
@@ -1475,10 +1458,10 @@ mod tests {
             (30, 10),
         ] {
             let frame = Rect::new(0, 0, w, h);
-            let (area, max_scroll) = help_geometry(frame);
+            let (area, max_scroll) = help_geometry(frame, &here());
             assert!(area.width <= w && area.height <= h, "{w}x{h}: {area:?}");
 
-            let lines = help_body(area.width.saturating_sub(2)).len();
+            let lines = help_body(area.width.saturating_sub(2), &here()).len();
             let shown = area.height.saturating_sub(2) as usize + max_scroll as usize;
             assert!(
                 shown >= lines,
@@ -1490,7 +1473,7 @@ mod tests {
     /// Where there is room for the table, it is not scrollable and not clipped.
     #[test]
     fn the_help_panel_fits_a_normal_terminal_outright() {
-        let (area, max_scroll) = help_geometry(Rect::new(0, 0, 80, 30));
+        let (area, max_scroll) = help_geometry(Rect::new(0, 0, 80, 40), &here());
         assert_eq!(max_scroll, 0);
         let widest = HELP
             .iter()
@@ -1498,7 +1481,10 @@ mod tests {
             .max()
             .unwrap();
         assert!(area.width as usize >= widest + 2, "{area:?} clips {widest}");
-        assert!(area.height as usize >= HELP.len() + 2, "{area:?}");
+        assert!(
+            area.height as usize >= help_rows(&here()).len() + 2,
+            "{area:?}"
+        );
     }
 
     /// The PR number is clickable exactly where it was drawn, and not at all
@@ -1590,6 +1576,44 @@ mod tests {
         assert!(screen.contains("[task canvas]"), "{screen}");
         assert!(!screen.contains(" vs "), "{screen}");
         assert!(screen.contains("notes/"), "{screen}");
+    }
+
+    /// Open folders draw `▾`, closed ones `▸`, and children sit two columns in
+    /// beneath the folder they belong to.
+    #[test]
+    fn the_tree_is_indented_under_open_folders() {
+        use super::super::state::Explorer;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/inner")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("tests")).unwrap();
+        let mut explorer = Explorer::new(
+            None,
+            dir.path().to_path_buf(),
+            "t".into(),
+            "task canvas".into(),
+            WorktreeStatus::default(),
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        explorer.toggle_selected().unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut explorer)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen: Vec<String> = (0..14)
+            .map(|y| {
+                (0..60)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let row = |text: &str| screen.iter().find(|l| l.contains(text)).unwrap().clone();
+        assert!(row("src/").contains("│▾ src/"), "{screen:#?}");
+        assert!(row("inner/").contains("│  ▸ inner/"), "{screen:#?}");
+        assert!(row("lib.rs").contains("│    lib.rs"), "{screen:#?}");
+        assert!(row("tests/").contains("│▸ tests/"), "{screen:#?}");
     }
 
     /// A command line is labelled as one, shown without its colon, and the

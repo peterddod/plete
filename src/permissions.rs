@@ -32,8 +32,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{
-    AliasCommands, Commands, ManagerCommands, PrCommands, ProjectCommands, ReviewCommands,
-    SetupCommands, TaskCommands, TreeCommands, WatchCommands, WorktreeArgs, WorktreeCommands,
+    AgentsCommands, AliasCommands, Commands, ManagerCommands, PrCommands, ProjectCommands,
+    ReviewCommands, SetupCommands, TaskCommands, TreeCommands, WatchCommands, WorktreeArgs,
+    WorktreeCommands,
 };
 use crate::config::NotifyLevel;
 use crate::config::{self, ManagerPolicy};
@@ -113,6 +114,9 @@ pub const CAPABILITIES: &[Capability] = &[
     cap("project.read", "list projects", &["plete projects ls"]),
     cap("project.create", "make projects", &["plete projects new"]),
     cap("project.delete", "delete projects", &["plete projects rm"]),
+    // Its files, not a command: the launch adds the project's docs folder
+    // with edit rules for it ([`crate::projects::docs_line`]).
+    cap("project.write", "write project docs", &[]),
     cap(
         "repo.clone",
         "clone repositories into the store",
@@ -316,6 +320,7 @@ pub const READ_ONLY: &[&str] = &[
     "plete manager ls",
     "plete manager show",
     "plete notify",
+    "plete search",
 ];
 
 /// The assistant's own files, which it keeps through plete: pre-approved
@@ -459,13 +464,15 @@ fn known<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'static str> {
 }
 
 /// What `node` holds itself, before its ancestors cut it: the root's list
-/// for the assistant, its grant for a manager, and nothing for a worker,
-/// which passes nothing on.
+/// for the assistant, and its grant for any other task, which passes it on
+/// to the tasks under it.
 fn own_list(app: &App, node: &TaskRecord) -> Result<Vec<&'static str>> {
     Ok(match node.kind {
         TaskKind::Assistant => root_list(app),
-        TaskKind::Manager => known(app.db.grants(&node.id)?.iter().map(String::as_str)),
-        TaskKind::Work | TaskKind::Setup => Vec::new(),
+        TaskKind::Manager | TaskKind::Work => {
+            known(app.db.grants(&node.id)?.iter().map(String::as_str))
+        }
+        TaskKind::Setup => Vec::new(),
     })
 }
 
@@ -698,6 +705,8 @@ pub fn gate(command: Option<&Commands>, terminal: bool) -> Gate {
         | Commands::Brief { .. }
         // Reads only, and cuts itself to what the caller reaches.
         | Commands::Show { .. }
+        // Reads only, and cuts itself to what the caller may see.
+        | Commands::Search { .. }
         // Reads only.
         | Commands::Doctor { .. }
         // Started by plete itself, under the command that was checked.
@@ -709,6 +718,12 @@ pub fn gate(command: Option<&Commands>, terminal: bool) -> Gate {
         Commands::Tasks | Commands::Explore | Commands::Exec { .. } | Commands::Chat { .. } => {
             Gate::Interactive
         }
+        // Reads only.
+        Commands::Agents {
+            command: None | Some(AgentsCommands::Ls { .. } | AgentsCommands::Show { .. }),
+        } => Gate::Free,
+        // A profile is trusted instructions and a grant: the user's to write.
+        Commands::Agents { .. } => Gate::Interactive,
         // The sender reads tokens no agent may, and installing it changes
         // what runs on the user's machine: the user's, at a terminal.
         Commands::Notify {
@@ -1640,7 +1655,7 @@ pub enum Reach {
     OwnOrBelow,
     /// A task below it.
     Below,
-    /// The parent of a new task: itself or a task below it, a manager.
+    /// The parent of a new task: itself or a task below it.
     Parent,
     /// A task below it; and for anyone, a task under the assistant.
     Tree,
@@ -1750,6 +1765,9 @@ fn node_scope(command: Option<&Commands>) -> Option<Scope> {
         | Commands::Path { .. }
         | Commands::Prs { .. }
         | Commands::Notify { command: None, .. }
+        | Commands::Agents {
+            command: None | Some(AgentsCommands::Ls { .. } | AgentsCommands::Show { .. }),
+        }
         | Commands::Report { .. }
         | Commands::Todo { .. }
         | Commands::Brief { .. }
@@ -1773,6 +1791,8 @@ fn node_scope(command: Option<&Commands>) -> Option<Scope> {
         // Cuts itself to the reports and messages of the caller and the
         // tasks below it.
         Commands::Show { .. } => Some(Scope::Listed),
+        // Cuts itself to the sources the caller may see.
+        Commands::Search { .. } => Some(Scope::Listed),
         // Setup is the user's: a task with a parent only reads what is
         // staged.
         Commands::Setup { command, .. } => match command {
@@ -1876,19 +1896,6 @@ pub fn in_scope(app: &App, caller: &Caller, verb: Verb, target: &TaskRecord) -> 
         Reach::Own => own,
         Reach::OwnOrBelow => own || below,
         Reach::Below | Reach::Tree => below,
-        Reach::Parent if own && target.kind != TaskKind::Manager => bail!(
-            "task {} may not run `plete {}`: a task with a parent cannot make tasks \
-             unless it is a manager; {ASK}",
-            node.slug,
-            verb.name()
-        ),
-        Reach::Parent if below && target.kind != TaskKind::Manager => bail!(
-            "task {} may not run `plete {}` under task {}: only a manager has tasks \
-             under it; {ASK}",
-            node.slug,
-            verb.name(),
-            target.slug
-        ),
         Reach::Parent => own || below,
     };
     match reached {
@@ -1907,7 +1914,7 @@ fn out_of_reach(slug: &str, verb: Verb, what: &str) -> String {
         Reach::Own => "itself",
         Reach::OwnOrBelow => "itself and the tasks below it",
         Reach::Below | Reach::Tree => "the tasks below it",
-        Reach::Parent => "itself and the managers below it",
+        Reach::Parent => "itself and the tasks below it",
     };
     let sideways = match verb {
         Verb::TaskSend | Verb::TaskInterrupt => "; tasks never message each other otherwise",
@@ -2569,12 +2576,13 @@ mod tests {
             .unwrap();
         assert_eq!(effective(&app, &m1).unwrap(), ["task.create"]);
 
-        // A worker passes nothing on, whatever it was granted.
-        let w = add(&app, "wk", TaskKind::Work, Some(&root), &every());
+        // A worker passes on what it holds, as a manager does.
+        let w = add(&app, "wk", TaskKind::Work, Some(&root), &["task.send"]);
         let under = add(&app, "under", TaskKind::Work, Some(&w), &every());
-        assert!(effective(&app, &under).unwrap().is_empty());
+        assert_eq!(effective(&app, &under).unwrap(), ["task.send"]);
+        assert_eq!(cut_by(&app, &under, "task.send").unwrap(), None);
         assert_eq!(
-            cut_by(&app, &under, "task.send").unwrap().as_deref(),
+            cut_by(&app, &under, "task.create").unwrap().as_deref(),
             Some("task wk")
         );
         // Nor is a task outside the tree anything.
@@ -2842,7 +2850,6 @@ mod tests {
             "s" => target == "fix-b",
             _ => false,
         };
-        let manager = |slug: &str| ["m", "m2", "s"].contains(&slug);
         // `fix` is the start of `fix-a` and `fix-b`, one in each subtree.
         let targets = [
             "m",
@@ -2885,7 +2892,7 @@ mod tests {
                 | Verb::ManagerPause
                 | Verb::ManagerResume
                 | Verb::ManagerStop => below,
-                Verb::TaskNew | Verb::ManagerNew => (own || below) && manager(target),
+                Verb::TaskNew | Verb::ManagerNew => own || below,
             }
         };
         for caller in ["m", "wk", "s"] {
@@ -2924,12 +2931,8 @@ mod tests {
         // Sideways messages say why.
         let e = node_of(&app, &row("wk"), &["task", "send", "fix-b", "hi"], false).unwrap_err();
         assert!(e.to_string().contains("never message each other"), "{e}");
-        let e = node_of(&app, &row("wk"), &["task", "new", "x"], false).unwrap_err();
-        assert!(
-            e.to_string()
-                .contains("a task with a parent cannot make tasks"),
-            "{e}"
-        );
+        // A worker makes tasks under itself, as a manager does.
+        node_of(&app, &row("wk"), &["task", "new", "x"], false).unwrap();
         node_of(&app, &row("m"), &["task", "new", "x"], false).unwrap();
 
         // The user and the assistant reach any task, but the `plete manager`
@@ -3101,7 +3104,7 @@ mod tests {
             &["task", "prs", "sib"],
             &["worktree", "ls", "--task", "sib"],
             &["worktree", "path", "r", "--task", "sib"],
-            &["task", "new", "x"],
+            &["task", "new", "x", "--parent", "sib"],
             &["sync"],
             &["review", "42"],
             &["projects", "new", "p"],
@@ -3216,6 +3219,11 @@ mod tests {
             (&["task", "prs"], true),
             (&["task", "last", "x"], true),
             (&["task", "resync", "x"], true),
+            (&["agents"], true),
+            (&["agents", "ls"], true),
+            (&["agents", "show", "planner"], true),
+            (&["agents", "new", "x"], false),
+            (&["agents", "edit", "x"], false),
             (&["manager", "new", "x"], true),
             (&["manager", "ls"], true),
             (&["task", "tree"], true),
@@ -3281,6 +3289,7 @@ mod tests {
             (&["report", "escalate", "4"], true),
             (&["report", "ls"], true),
             (&["show", "r1"], true),
+            (&["search", "retries"], true),
             (&["brief"], true),
             (&["init-shell"], true),
             (&["install-shell"], false),

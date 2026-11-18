@@ -22,6 +22,7 @@ mod paths;
 mod permissions;
 mod placement;
 mod pr_history;
+mod profiles;
 mod projects;
 mod remote;
 mod render;
@@ -29,6 +30,7 @@ mod reports;
 mod resolve;
 mod review;
 mod runtime;
+mod search;
 mod setup;
 mod startup;
 mod status;
@@ -47,9 +49,9 @@ use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 
 use cli::{
-    Cli, Commands, DoctorCommands, InboxCommands, ManagerCommands, PrCommands, ProjectCommands,
-    ReviewCommands, SetupCommands, TaskCommands, TodoCommands, WatchCommands, WorktreeArgs,
-    WorktreeCommands,
+    AgentsCommands, Cli, Commands, DoctorCommands, InboxCommands, ManagerCommands, PrCommands,
+    ProjectCommands, ReviewCommands, SetupCommands, TaskCommands, TodoCommands, WatchCommands,
+    WorktreeArgs, WorktreeCommands,
 };
 
 fn main() -> Result<()> {
@@ -169,6 +171,17 @@ fn run(command: Option<Commands>, wake: Option<waiter::WakeEnv>) -> Result<()> {
             let app = context::App::open()?;
             commands::show::run(&app, &reference)?
         }
+        Commands::Search {
+            query,
+            kinds,
+            limit,
+            json,
+            status,
+            reset,
+        } => {
+            let app = context::App::open()?;
+            commands::search::run(&app, &query, &kinds, limit, json, status, reset)?
+        }
         Commands::Brief { all } => {
             let app = context::App::open()?;
             assistant::brief::run(&app, all)?
@@ -231,6 +244,28 @@ fn run(command: Option<Commands>, wake: Option<waiter::WakeEnv>) -> Result<()> {
                 Some(SetupCommands::Apply) => setup::apply::apply(&app)?,
                 Some(SetupCommands::Status) => setup::apply::status(&app)?,
                 Some(SetupCommands::Discard) => setup::apply::discard(&app)?,
+            }
+        }
+        Commands::Agents { command } => {
+            let app = context::App::open()?;
+            match command.unwrap_or(AgentsCommands::Ls {
+                project: None,
+                json: false,
+            }) {
+                AgentsCommands::Ls { project, json } => {
+                    commands::agents::ls(&app, project.as_deref(), json)?
+                }
+                AgentsCommands::Show { name, project } => {
+                    commands::agents::show(&app, &name, project.as_deref())?
+                }
+                AgentsCommands::New {
+                    name,
+                    from,
+                    project,
+                } => commands::agents::new(&app, &name, from.as_deref(), project.as_deref())?,
+                AgentsCommands::Edit { name, project } => {
+                    commands::agents::edit(&app, &name, project.as_deref())?
+                }
             }
         }
         Commands::Todo { command } => {
