@@ -589,7 +589,6 @@ fn check_out(
         stash_ref: None,
         pr_number: Some(pr.number),
         created_at: now_secs(),
-        read_only: false,
     };
     let recorded = app.db.set_review_worktree(&review.id, Some(&record));
     if !matches!(recorded, Ok(true)) {
@@ -2091,7 +2090,6 @@ fn migrate_held(app: &App) -> Result<()> {
             stash_ref: old.stash_ref.clone(),
             pr_number: old.pr_number,
             created_at: 0,
-            read_only: false,
         };
         let save = |_: &TaskWorktreeRecord| Ok(());
         match tasks::archive_worktree(app, &old.task_id, &dir, &mut row, &save) {

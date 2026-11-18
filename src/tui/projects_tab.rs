@@ -1,4 +1,4 @@
-//! The projects view of the tasks list: the active tasks and managers
+//! The projects view of the tasks list: the active tasks
 //! grouped by the plete project they were started from (`plete task new
 //! --project`, `TaskRecord.project`) — the projects this tab manages — or,
 //! toggled, the projects with no active work. Pure, so the grouping is unit
@@ -18,7 +18,6 @@ use crate::db::tasks::{TaskKind, TaskState};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectGroup {
     pub name: String,
-    pub managers: usize,
     pub tasks: usize,
     /// The newest activity of any member; 0 with none.
     pub last_activity: i64,
@@ -49,7 +48,6 @@ impl Groups {
             if !held.contains(name.as_str()) && !archived.iter().any(listed) {
                 archived.push(ProjectGroup {
                     name: name.clone(),
-                    managers: 0,
                     tasks: 0,
                     last_activity: 0,
                     members: Vec::new(),
@@ -104,17 +102,15 @@ fn sort(lines: &mut [ProjectGroup]) {
     });
 }
 
-/// The projects of the tasks and managers in `state`, sorted.
+/// The projects of the tasks in `state`, sorted.
 fn groups(rows: &[TaskRow], state: TaskState) -> Vec<ProjectGroup> {
-    let in_scope = |row: &TaskRow| {
-        row.task.state == state && matches!(row.task.kind, TaskKind::Work | TaskKind::Manager)
-    };
+    let in_scope = |row: &TaskRow| row.task.state == state && row.task.kind == TaskKind::Work;
     let at: HashMap<&str, usize> = rows
         .iter()
         .enumerate()
         .map(|(i, row)| (row.task.id.as_str(), i))
         .collect();
-    // What each is in by itself; a manager's below-it comes next.
+    // What each is in by itself; the tasks below a task come next.
     let mut names: Vec<Vec<&str>> = rows
         .iter()
         .map(|row| match (in_scope(row), row.task.project.as_deref()) {
@@ -133,9 +129,7 @@ fn groups(rows: &[TaskRow], state: TaskState) -> Vec<ProjectGroup> {
             if !in_scope(up) || !seen.insert(up.task.id.as_str()) {
                 break;
             }
-            if up.task.kind == TaskKind::Manager {
-                added[parent].extend(theirs.iter().copied());
-            }
+            added[parent].extend(theirs.iter().copied());
             up_from = up.task.parent_id.as_deref();
         }
     }
@@ -154,7 +148,6 @@ fn groups(rows: &[TaskRow], state: TaskState) -> Vec<ProjectGroup> {
                 None => {
                     out.push(ProjectGroup {
                         name: name.to_string(),
-                        managers: 0,
                         tasks: 0,
                         last_activity: 0,
                         members: Vec::new(),
@@ -164,10 +157,7 @@ fn groups(rows: &[TaskRow], state: TaskState) -> Vec<ProjectGroup> {
                 }
             };
             let line = &mut out[slot];
-            match row.task.kind {
-                TaskKind::Manager => line.managers += 1,
-                _ => line.tasks += 1,
-            }
+            line.tasks += 1;
             line.last_activity = line.last_activity.max(row.last_activity);
             line.members.push(i);
         }
@@ -259,18 +249,15 @@ mod tests {
                 ("web".into(), vec!["a".into(), "c".into()]),
             ]
         );
-        assert_eq!(
-            (got[1].managers, got[1].tasks, got[1].last_activity),
-            (0, 2, 20)
-        );
+        assert_eq!((got[1].tasks, got[1].last_activity), (2, 20));
     }
 
     #[test]
-    fn a_manager_is_in_the_projects_of_the_tasks_below_it() {
+    fn a_task_is_in_the_projects_of_the_tasks_below_it() {
         let active = TaskState::Active;
         let rows = vec![
-            row("ops", TaskKind::Manager, active, None, None, 5),
-            row("deploy", TaskKind::Manager, active, Some("ops"), None, 6),
+            row("ops", TaskKind::Work, active, None, None, 5),
+            row("deploy", TaskKind::Work, active, Some("ops"), None, 6),
             row(
                 "ship",
                 TaskKind::Work,
@@ -279,7 +266,7 @@ mod tests {
                 Some("web"),
                 7,
             ),
-            // Under a task, not a manager: the managers above still count it.
+            // Under a task with a project of its own: every task above counts it.
             row("sub", TaskKind::Work, active, Some("ship"), Some("docs"), 8),
             row("lone", TaskKind::Work, active, Some("ops"), None, 9),
         ];
@@ -289,7 +276,7 @@ mod tests {
             [
                 (
                     "docs".into(),
-                    vec!["ops".into(), "deploy".into(), "sub".into()]
+                    vec!["ops".into(), "deploy".into(), "ship".into(), "sub".into()]
                 ),
                 (
                     "web".into(),
@@ -298,17 +285,17 @@ mod tests {
             ]
         );
         let web = &lines(&rows, &[], false, "")[1];
-        assert_eq!((web.managers, web.tasks), (2, 1));
+        assert_eq!(web.tasks, 3);
     }
 
     #[test]
-    fn a_manager_with_its_own_project_is_in_it_and_in_those_below() {
+    fn a_task_with_its_own_project_is_in_it_and_in_those_below() {
         let active = TaskState::Active;
         let rows = vec![
-            row("ops", TaskKind::Manager, active, None, Some("infra"), 5),
+            row("ops", TaskKind::Work, active, None, Some("infra"), 5),
             row("ship", TaskKind::Work, active, Some("ops"), Some("web"), 6),
-            // A manager with nothing below it and no project is in none.
-            row("idle", TaskKind::Manager, active, None, None, 7),
+            // A task with nothing below it and no project is in none.
+            row("idle", TaskKind::Work, active, None, None, 7),
         ];
         let got = summary(&lines(&rows, &[], false, ""), &rows);
         assert_eq!(
@@ -327,7 +314,7 @@ mod tests {
             work("live", Some("api"), 10),
             row("gone-api", TaskKind::Work, gone, None, Some("api"), 50),
             row("gone-web", TaskKind::Work, gone, None, Some("web"), 40),
-            row("gone-mgr", TaskKind::Manager, gone, None, None, 30),
+            row("gone-mgr", TaskKind::Work, gone, None, None, 30),
         ];
         let got = lines(&rows, &["api", "empty", "web", "zero"], true, "");
         assert_eq!(
@@ -347,7 +334,7 @@ mod tests {
     fn an_archived_manager_is_in_the_project_of_its_archived_descendant() {
         let gone = TaskState::Archived;
         let rows = vec![
-            row("ops", TaskKind::Manager, gone, None, None, 5),
+            row("ops", TaskKind::Work, gone, None, None, 5),
             row("old", TaskKind::Work, gone, Some("ops"), Some("web"), 6),
         ];
         let got = summary(&lines(&rows, &[], true, ""), &rows);
@@ -384,8 +371,8 @@ mod tests {
     fn a_cycle_of_parents_ends() {
         let active = TaskState::Active;
         let rows = vec![
-            row("a", TaskKind::Manager, active, Some("b"), Some("x"), 1),
-            row("b", TaskKind::Manager, active, Some("a"), Some("y"), 2),
+            row("a", TaskKind::Work, active, Some("b"), Some("x"), 1),
+            row("b", TaskKind::Work, active, Some("a"), Some("y"), 2),
         ];
         assert_eq!(lines(&rows, &[], false, "").len(), 2);
     }

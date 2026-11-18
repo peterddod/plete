@@ -2037,7 +2037,8 @@ mod tests {
 
     #[test]
     fn a_quiet_manager_is_posted_by_class_and_holds_a_digest_like_the_assistant() {
-        let (lab, listener) = quiet_lab_of(TaskKind::Manager);
+        let (lab, listener) = quiet_lab_of(TaskKind::Work);
+        lab.app.db.set_task_agent("w", "planner").unwrap();
         let mut w = lab.watcher();
         let hold = lab.app.config.digest_secs();
         lab.send_as(Class::Digest, "progress", "task a", "halfway");
@@ -2073,7 +2074,7 @@ mod tests {
 
     #[test]
     fn a_manager_set_full_and_a_work_task_are_posted_as_ever() {
-        for (kind, full) in [(TaskKind::Manager, true), (TaskKind::Work, false)] {
+        for (kind, full) in [(TaskKind::Work, true), (TaskKind::Work, false)] {
             let mut lab = Lab::of(kind);
             if full {
                 lab.app.config =

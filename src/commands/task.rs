@@ -930,13 +930,8 @@ fn sender(app: &App) -> String {
 }
 
 pub fn ls(app: &App, archived: bool) -> Result<()> {
-    match tasks::reconcile(app) {
-        Ok(warnings) => {
-            for warning in warnings {
-                eprintln!("plete: warning: {warning}");
-            }
-        }
-        Err(e) => eprintln!("plete: warning: could not reconcile worktrees: {e:#}"),
+    if let Err(e) = tasks::reconcile(app) {
+        eprintln!("plete: warning: could not reconcile worktrees: {e:#}");
     }
     let state = if archived {
         TaskState::Archived
@@ -983,12 +978,7 @@ pub fn ls(app: &App, archived: bool) -> Result<()> {
             status.push_str(" (unanchored)");
             unanchored.push(task.slug.clone());
         }
-        // A manager is said to be one (M29).
-        let mut kind = match task.kind {
-            TaskKind::Manager => " (manager)",
-            _ => "",
-        }
-        .to_string();
+        let mut kind = String::new();
         if app.db.task_notify_flags(&task.id)?.quiet {
             kind.push_str(" (quiet)");
         }
@@ -1813,7 +1803,7 @@ mod tests {
             slug: "m".into(),
             name: "m".into(),
             project: None,
-            kind: TaskKind::Manager,
+            kind: TaskKind::Work,
             state: TaskState::Active,
             created_at: 0,
             last_activity: 0,
@@ -1864,7 +1854,7 @@ mod tests {
             app.db.insert_task(&task).unwrap();
             task
         };
-        let api = add("api", TaskKind::Manager, &root);
+        let api = add("api", TaskKind::Work, &root);
         let w = add("w", TaskKind::Work, &api);
         let from = |caller: &Caller, task: &TaskRecord| fence_for(&app, caller, task).unwrap();
         assert_eq!(from(&Caller::User, &w), None);
@@ -1878,7 +1868,7 @@ mod tests {
         );
         assert_eq!(
             from(&Caller::Root, &api).as_deref(),
-            Some("manager assistant/api")
+            Some("task assistant/api")
         );
     }
 
@@ -1917,9 +1907,9 @@ mod tests {
             task
         };
         let top = add("top", TaskKind::Work, None);
-        let api = add("api", TaskKind::Manager, Some(&root));
+        let api = add("api", TaskKind::Work, Some(&root));
         let w = add("w", TaskKind::Work, Some(&api));
-        let sub = add("sub", TaskKind::Manager, Some(&api));
+        let sub = add("sub", TaskKind::Work, Some(&api));
         let x = add("x", TaskKind::Work, Some(&sub));
         let shown = |caller: &Caller, task: &TaskRecord| {
             let ids = names_for(&app, caller).unwrap();

@@ -43,7 +43,7 @@ use crate::config::{
 };
 use crate::context::App;
 use crate::db::reviews::ReviewRecord;
-use crate::db::tasks::{TaskKind, TaskRecord, TaskState};
+use crate::db::tasks::{Role, TaskKind, TaskRecord, TaskState};
 use crate::github::{self, MyPr, Notification, Notifications, PullState};
 use crate::manager::run;
 use crate::messages::{self, Delivered, Sender, TmuxAgent};
@@ -824,7 +824,7 @@ fn task_message(event: &Event) -> String {
 
 /// The active task with the pull request `event` is about, by the PRs plete
 /// has recorded for each; the most recently updated when several have it.
-/// Never a manager: one may have a worker's PR recorded from reading its
+/// Never a planner: one may have a worker's PR recorded from reading its
 /// head, and is not where that PR's news belongs.
 fn owning_task(app: &App, event: &Event) -> Result<Option<TaskRecord>> {
     let Some(number) = event.number else {
@@ -832,7 +832,7 @@ fn owning_task(app: &App, event: &Event) -> Result<Option<TaskRecord>> {
     };
     let mut best: Option<(String, TaskRecord)> = None;
     for task in app.db.list_tasks(Some(TaskState::Active))? {
-        if task.kind == TaskKind::Manager {
+        if tasks::role(app, &task) == Role::Planner {
             continue;
         }
         let found = app
@@ -876,13 +876,9 @@ fn watched_manager(app: &App, slug: &str) -> Result<Option<TaskRecord>> {
         return Ok(None);
     };
     // A manager now is a task started as the planner, as every one was made.
-    let planner =
-        || -> Result<bool> { Ok(app.db.task_agent(&task.id)?.as_deref() == Some("planner")) };
-    Ok(match task.kind {
-        TaskKind::Manager => Some(task),
-        TaskKind::Work if planner()? => Some(task),
-        _ => None,
-    })
+    let planner = task.kind == TaskKind::Work
+        && app.db.task_agent(&task.id)?.as_deref() == Some(crate::commands::manager::PLANNER);
+    Ok(planner.then_some(task))
 }
 
 /// Whether the index's repo id (`github.com/acme/api`) is `repo`
@@ -1013,7 +1009,7 @@ pub fn dispatch(app: &App, rules: &[Rule], events: &[Event]) -> Vec<Sent> {
         for (text, carried) in batched(MANAGER_HEAD, theirs) {
             let meta = watch_meta(events, &carried);
             // Rendered quietly, a batch is a line, kept whole for `plete show`.
-            let meta = messages::number_if_quiet(app, TaskKind::Manager, &dir, Some(meta), &text)
+            let meta = messages::number_if_quiet(app, Role::Planner, &dir, Some(meta), &text)
                 .unwrap_or(None);
             match messages::deliver(&dir, &agent, &text, Sender::Agent, meta) {
                 Ok(delivered) => {
@@ -2677,7 +2673,7 @@ mod tests {
     /// out its head to read it) is never sent that PR's news: its summary
     /// takes text in no fence as its parent's, and GitHub's is no one's.
     #[test]
-    fn a_prs_news_never_goes_to_a_manager() {
+    fn a_prs_news_never_goes_to_a_planner() {
         use crate::db::tasks::{RunState, TaskPrRecord};
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().canonicalize().unwrap();
@@ -2704,9 +2700,8 @@ mod tests {
         };
         // The manager is listed first, and holds the PR as newly as the
         // worker: before, it won the tie.
-        app.db
-            .insert_task(&task("m", TaskKind::Manager, 2))
-            .unwrap();
+        app.db.insert_task(&task("m", TaskKind::Work, 2)).unwrap();
+        app.db.set_task_agent("m", "planner").unwrap();
         app.db.insert_task(&task("w", TaskKind::Work, 1)).unwrap();
         for id in ["m", "w"] {
             app.db
@@ -2782,16 +2777,17 @@ mod tests {
             max_children: None,
         };
         for t in [
-            task("api", "api", TaskKind::Manager),
-            task("old", "old", TaskKind::Manager),
+            task("api", "api", TaskKind::Work),
+            task("old", "old", TaskKind::Work),
             task("w", "w", TaskKind::Work),
-            task("squat", "fe", TaskKind::Manager),
+            task("squat", "fe", TaskKind::Work),
         ] {
             app.db.insert_task(&t).unwrap();
         }
         app.db
             .set_task_state("id-old", TaskState::Archived)
             .unwrap();
+        app.db.set_task_agent("id-api", "planner").unwrap();
         let found = |slug: &str| watched_manager(&app, slug).unwrap().map(|t| t.slug);
         assert_eq!(found("api").as_deref(), Some("api"));
         assert_eq!(found("old"), None);

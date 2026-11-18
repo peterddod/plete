@@ -17,7 +17,7 @@ use super::state::rank_matches;
 use super::tasks::TaskRow;
 use crate::assistant::Session;
 use crate::context::App;
-use crate::db::tasks::{BudgetRow, ReportKind, RunState, Setter, TaskKind, TaskRecord, TaskState};
+use crate::db::tasks::{BudgetRow, ReportKind, RunState, Setter, TaskRecord, TaskState};
 use crate::manager::{self, budget, run};
 use crate::messages;
 use crate::status::Activity;
@@ -407,10 +407,9 @@ pub fn lines(
     // Whatever has tasks under it folds, as a manager did.
     let is_manager = |at: At| {
         at != At::Root
-            && (task(at).kind == TaskKind::Manager
-                || rows
-                    .iter()
-                    .any(|r| r.task.parent_id.as_deref() == Some(task(at).id.as_str())))
+            && rows
+                .iter()
+                .any(|r| r.task.parent_id.as_deref() == Some(task(at).id.as_str()))
     };
     let keep: Vec<bool> = match filter.is_empty() {
         true => {
@@ -517,6 +516,7 @@ mod tests {
 
     use super::*;
     use crate::config;
+    use crate::db::tasks::TaskKind;
     use crate::db::Database;
     use crate::messages::Inbox;
     use crate::placement::Placement;
@@ -570,11 +570,11 @@ mod tests {
         gone.task.state = TaskState::Archived;
         let rows = vec![
             row("w2", TaskKind::Work, Some("api"), running()),
-            row("fe", TaskKind::Manager, Some("root"), None),
+            row("fe", TaskKind::Work, Some("root"), None),
             row("top", TaskKind::Work, None, waiting()),
             row("w1", TaskKind::Work, Some("api"), waiting()),
             gone,
-            row("api", TaskKind::Manager, Some("root"), running()),
+            row("api", TaskKind::Work, Some("root"), running()),
             row("w3", TaskKind::Work, Some("fe"), None),
         ];
         (root, rows)
@@ -915,10 +915,6 @@ mod tests {
             drawn(&lines, &root, &rows),
             ["root", "├─ ▸ api", "└─ ▾ fe", "   └─ w3"]
         );
-        // A manager with nothing under it still shows it is one.
-        let lone = vec![row("m", TaskKind::Manager, Some("root"), None)];
-        let lines = super::lines(Some(&root), &lone, &HashSet::new(), "");
-        assert_eq!(drawn(&lines, &root, &lone), ["root", "└─ ▾ m"]);
     }
 
     #[test]
@@ -982,7 +978,7 @@ mod tests {
         let active = TaskState::Active;
         for task in [
             record("root", TaskKind::Assistant, None, active),
-            record("api", TaskKind::Manager, Some("root"), active),
+            record("api", TaskKind::Work, Some("root"), active),
             record("w1", TaskKind::Work, Some("api"), active),
             record("w2", TaskKind::Work, Some("api"), active),
             record("old", TaskKind::Work, Some("api"), TaskState::Archived),

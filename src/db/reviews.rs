@@ -159,7 +159,6 @@ impl ReviewRecord {
             stash_ref: self.stash_ref.clone(),
             pr_number: Some(self.pr_number),
             created_at: self.worktree_created_at.unwrap_or(self.created_at),
-            read_only: false,
         })
     }
 
@@ -889,7 +888,6 @@ mod tests {
             stash_ref: None,
             pr_number: Some(7),
             created_at: 11,
-            read_only: false,
         };
         assert!(db.set_review_worktree("r", Some(&wt)).unwrap());
         db.set_review_session("r", "s1").unwrap();

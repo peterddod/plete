@@ -276,13 +276,6 @@ manager: it works in git worktrees of its own under the task's directory. Pushin
 non-default branch, opening pull requests as its PR policy says, and running the manager's CLI \
 to report or add worktrees are routine.";
 
-/// What a manager is denied besides: making commits and branches to push,
-/// as its worktrees are read-only (`tasks::add_worktree`). Not `git branch`:
-/// a prefix rule would deny `git branch -a` and `--show-current` too, which
-/// a manager reads with, and a branch made in a detached worktree carries
-/// nothing without `git commit`. A lint, as [`ALWAYS_DENY`] is.
-const MANAGER_DENY: &[&str] = &["git commit", "git push", "git checkout -b", "git switch -c"];
-
 /// What a review's agent is denied besides what a worker without a grant is:
 /// pushing, and commenting on or reviewing a pull request through the API.
 const REVIEW_DENY: &[&str] = &[
@@ -475,9 +468,7 @@ fn known<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'static str> {
 fn own_list(app: &App, node: &TaskRecord) -> Result<Vec<&'static str>> {
     Ok(match node.kind {
         TaskKind::Assistant => root_list(app),
-        TaskKind::Manager | TaskKind::Work => {
-            known(app.db.grants(&node.id)?.iter().map(String::as_str))
-        }
+        TaskKind::Work => known(app.db.grants(&node.id)?.iter().map(String::as_str)),
         TaskKind::Setup => Vec::new(),
     })
 }
@@ -540,33 +531,31 @@ pub struct Grant {
     pub held: Vec<&'static str>,
 }
 
-/// What a new child of `kind` gets when nobody names its grant:
-/// `[managers] worker_default` or `manager_default`. Not cut here: its
-/// ancestors cut it at every check ([`effective`]).
-pub fn default_grant(kind: TaskKind, policy: &ManagerPolicy) -> Result<Vec<&'static str>> {
-    Ok(match kind {
-        TaskKind::Work => policy.worker_default.clone(),
-        TaskKind::Manager => policy.manager_default.clone(),
-        TaskKind::Assistant => bail!("the assistant is no task to grant anything to"),
-        TaskKind::Setup => bail!("the setup agent is no task to grant anything to"),
-    })
+/// What a new child gets when nobody names its grant: `[managers]
+/// worker_default`, or `manager_default` for a planner (`manager_grant`).
+/// Not cut here: its ancestors cut it at every check ([`effective`]).
+pub fn default_grant(manager_grant: bool, policy: &ManagerPolicy) -> Vec<&'static str> {
+    match manager_grant {
+        true => policy.manager_default.clone(),
+        false => policy.worker_default.clone(),
+    }
 }
 
-/// The grant `by` may give a new child of `kind` under `parent`: what it
-/// asks for (`requested`), else the kind's default. Each name it asks for
+/// The grant `by` may give a new child under `parent`: what it asks for
+/// (`requested`), else the default (`manager_grant`: a planner's). Each name it asks for
 /// must be a capability `parent` holds, and, for a task with a parent
 /// asking, one it holds itself. Changes nothing.
 pub fn check_grant(
     app: &App,
     by: &Caller,
     parent: &TaskRecord,
-    kind: TaskKind,
+    manager_grant: bool,
     requested: Option<&[String]>,
     policy: &ManagerPolicy,
 ) -> Result<Grant> {
     let Some(requested) = requested else {
         return Ok(Grant {
-            caps: default_grant(kind, policy)?,
+            caps: default_grant(manager_grant, policy),
             held: Vec::new(),
         });
     };
@@ -1203,8 +1192,7 @@ fn withheld_externals<'a>(held: &'a [&str]) -> impl Iterator<Item = &'static str
 }
 
 /// What `task`'s agent is denied: with `[permissions] guards`,
-/// [`denied_commands`], and for a manager [`MANAGER_DENY`] too. A task with a
-/// parent is also denied the commands outside plete of every capability it
+/// [`denied_commands`]. A task with a parent is also denied the commands outside plete of every capability it
 /// does not hold, guards or not: the harness's half of [`effective`].
 pub fn task_deny(app: &App, task: &TaskRecord) -> Result<Vec<String>> {
     let guards = app.config.permissions.guards();
@@ -1215,13 +1203,6 @@ pub fn task_deny(app: &App, task: &TaskRecord) -> Result<Vec<String>> {
     };
     if task.parent_id.is_some() {
         add_withheld(&mut deny, &effective(app, task)?);
-    }
-    if guards && task.kind == TaskKind::Manager {
-        for command in MANAGER_DENY {
-            if !deny.iter().any(|d| d == command) {
-                deny.push(command.to_string());
-            }
-        }
     }
     Ok(deny)
 }
@@ -2502,12 +2483,12 @@ mod tests {
     fn the_default_grant_is_every_capability_yet_cut_by_the_assistants_allow() {
         let (_dir, mut app, _w) = tree();
         let policy = app.config.manager_policy().unwrap();
-        for kind in [TaskKind::Work, TaskKind::Manager] {
-            assert_eq!(default_grant(kind, &policy).unwrap(), defaults());
+        for manager_grant in [false, true] {
+            assert_eq!(default_grant(manager_grant, &policy), defaults());
         }
         app.config.assistant.allow = vec!["task.create".into(), "pr.merge".into()];
         let root = crate::assistant::ensure(&app).unwrap();
-        let m = add(&app, "m", TaskKind::Manager, Some(&root), &every());
+        let m = add(&app, "m", TaskKind::Work, Some(&root), &every());
         let k = add(&app, "k", TaskKind::Work, Some(&m), &every());
         assert_eq!(
             sorted(effective(&app, &m).unwrap()),
@@ -2535,7 +2516,7 @@ mod tests {
                 let m = add(
                     &app,
                     &format!("m{depth}"),
-                    TaskKind::Manager,
+                    TaskKind::Work,
                     Some(&parent),
                     &every(),
                 );
@@ -2551,15 +2532,15 @@ mod tests {
         let (_dir, mut app, _w) = tree();
         app.config.assistant.allow = vec!["task.create".into(), "task.send".into()];
         let root = crate::assistant::ensure(&app).unwrap();
-        let m1 = add(&app, "m1", TaskKind::Manager, Some(&root), &every());
+        let m1 = add(&app, "m1", TaskKind::Work, Some(&root), &every());
         let m2 = add(
             &app,
             "m2",
-            TaskKind::Manager,
+            TaskKind::Work,
             Some(&m1),
             &["task.create", "task.delete"],
         );
-        let m3 = add(&app, "m3", TaskKind::Manager, Some(&m2), &every());
+        let m3 = add(&app, "m3", TaskKind::Work, Some(&m2), &every());
         assert_eq!(effective(&app, &m3).unwrap(), ["task.create"]);
         assert_eq!(
             crate::manager::tree_path(&app, &m3).unwrap(),
@@ -2569,7 +2550,7 @@ mod tests {
         // assistant's list; not granted, or held, not cut at all.
         assert_eq!(
             cut_by(&app, &m3, "task.send").unwrap().as_deref(),
-            Some("manager m2")
+            Some("task m2")
         );
         let cut = cut_by(&app, &m3, "task.delete").unwrap().unwrap();
         assert!(cut.contains("[assistant] allow"), "{cut}");
@@ -2623,7 +2604,7 @@ mod tests {
         let m = add(
             &app,
             "m",
-            TaskKind::Manager,
+            TaskKind::Work,
             Some(&root),
             &["task.create", "pr.merge"],
         );
@@ -2632,15 +2613,22 @@ mod tests {
             app: &App,
             by: &Caller,
             parent: &TaskRecord,
-            kind: TaskKind,
+            manager_grant: bool,
             asked: Option<&[&str]>,
         ) -> Result<Grant> {
             let asked: Option<Vec<String>> =
                 asked.map(|list| list.iter().map(|c| c.to_string()).collect());
-            check_grant(app, by, parent, kind, asked.as_deref(), &policy(app))
+            check_grant(
+                app,
+                by,
+                parent,
+                manager_grant,
+                asked.as_deref(),
+                &policy(app),
+            )
         }
         let refused = |by: &Caller, parent: &TaskRecord, asked: &[&str]| {
-            grant(&app, by, parent, TaskKind::Work, Some(asked))
+            grant(&app, by, parent, false, Some(asked))
                 .unwrap_err()
                 .to_string()
         };
@@ -2652,43 +2640,35 @@ mod tests {
         assert!(message.contains("[assistant] allow"), "{message}");
         let message = refused(&Caller::User, &m, &["task.send"]);
         assert!(
-            message.contains("`task.send`") && message.contains("its parent, manager m,"),
+            message.contains("`task.send`") && message.contains("its parent, task m,"),
             "{message}"
         );
         // A task with a parent grants nothing above its own list.
         let message = refused(&Caller::Node(w.clone()), &m, &["task.create"]);
         assert!(message.contains("task wk does not hold it"), "{message}");
 
-        // Nothing asked: the kind's default, uncut, which its ancestors cut
+        // Nothing asked: the default, uncut, which its ancestors cut
         // at every check.
-        let default = grant(&app, &Caller::Root, &root, TaskKind::Work, None).unwrap();
+        let default = grant(&app, &Caller::Root, &root, false, None).unwrap();
         assert_eq!(default.caps, defaults());
         assert!(default.held.is_empty());
-        let default = grant(&app, &Caller::Root, &root, TaskKind::Manager, None).unwrap();
+        let default = grant(&app, &Caller::Root, &root, false, None).unwrap();
         assert_eq!(default.caps, defaults());
         app.config.managers = Some(config::ManagersConfig {
             manager_default: Some(vec!["task.create".into()]),
             ..Default::default()
         });
-        let default = grant(&app, &Caller::Node(m.clone()), &m, TaskKind::Manager, None).unwrap();
+        let default = grant(&app, &Caller::Node(m.clone()), &m, true, None).unwrap();
         assert_eq!(default.caps, ["task.create"]);
-        assert!(grant(&app, &Caller::Root, &root, TaskKind::Assistant, None).is_err());
 
         // Held only when named, and then said to be.
-        let given = grant(
-            &app,
-            &Caller::Root,
-            &root,
-            TaskKind::Work,
-            Some(&["task.send"]),
-        )
-        .unwrap();
+        let given = grant(&app, &Caller::Root, &root, false, Some(&["task.send"])).unwrap();
         assert_eq!((given.caps, given.held), (vec!["task.send"], vec![]));
         let given = grant(
             &app,
             &Caller::Node(m.clone()),
             &m,
-            TaskKind::Work,
+            false,
             Some(&["pr.merge", " task.create", "pr.merge"]),
         )
         .unwrap();
@@ -2699,14 +2679,7 @@ mod tests {
             held: Some(vec!["task.send".into()]),
             ..Default::default()
         });
-        let given = grant(
-            &app,
-            &Caller::Root,
-            &root,
-            TaskKind::Work,
-            Some(&["task.send"]),
-        )
-        .unwrap();
+        let given = grant(&app, &Caller::Root, &root, false, Some(&["task.send"])).unwrap();
         assert_eq!(
             (given.caps, given.held),
             (vec!["task.send"], vec!["task.send"])
@@ -2720,7 +2693,7 @@ mod tests {
         // which only the root's own actions follow (M9).
         app.config.assistant.notify = Some(false);
         let root = crate::assistant::ensure(&app).unwrap();
-        let m = add(&app, "m", TaskKind::Manager, Some(&root), &[]);
+        let m = add(&app, "m", TaskKind::Work, Some(&root), &[]);
         let read = |log: &Path| -> Vec<ActionRecord> {
             std::fs::read_to_string(log)
                 .unwrap_or_default()
@@ -2770,11 +2743,11 @@ mod tests {
         let (dir, mut app, _w) = tree();
         app.config.assistant.allow = every().iter().map(|c| c.to_string()).collect();
         let root = crate::assistant::ensure(&app).unwrap();
-        let m = add(&app, "m", TaskKind::Manager, Some(&root), &every());
+        let m = add(&app, "m", TaskKind::Work, Some(&root), &every());
         add(&app, "wk", TaskKind::Work, Some(&m), &every());
-        let m2 = add(&app, "m2", TaskKind::Manager, Some(&m), &every());
+        let m2 = add(&app, "m2", TaskKind::Work, Some(&m), &every());
         add(&app, "fix-a", TaskKind::Work, Some(&m2), &every());
-        let s = add(&app, "s", TaskKind::Manager, Some(&root), &every());
+        let s = add(&app, "s", TaskKind::Work, Some(&root), &every());
         add(&app, "fix-b", TaskKind::Work, Some(&s), &every());
         (dir, app)
     }
@@ -3009,7 +2982,7 @@ mod tests {
         let m = add(
             &app,
             "m",
-            TaskKind::Manager,
+            TaskKind::Work,
             Some(&root),
             &["task.send", "task.archive"],
         );
@@ -3454,9 +3427,7 @@ mod tests {
         let every: Vec<String> = CAPABILITIES.iter().map(|c| c.name.to_string()).collect();
         let mut allowed = allowed_commands(&every);
         allowed.extend(GH_READ_ONLY.iter().map(|c| c.to_string()));
-        let mut denied = denied_commands(&main_master());
-        // A manager's too: it is pre-approved what it holds (M37).
-        denied.extend(MANAGER_DENY.iter().map(|d| d.to_string()));
+        let denied = denied_commands(&main_master());
         for a in &allowed {
             assert!(!denied.contains(a), "{a}");
             assert!(
@@ -3532,7 +3503,7 @@ mod tests {
         // Nothing for a top-level task, or a manager holding everything.
         app.config.assistant.allow = every().iter().map(|c| c.to_string()).collect();
         let root = crate::assistant::ensure(&app).unwrap();
-        let m2 = add(&app, "m2", TaskKind::Manager, Some(&root), &every());
+        let m2 = add(&app, "m2", TaskKind::Work, Some(&root), &every());
         for task in [&top, &m2] {
             assert_eq!(task_deny(&app, task).unwrap(), Vec::<String>::new());
         }
@@ -3574,7 +3545,7 @@ mod tests {
         let (_dir, mut app, _w) = tree();
         app.config.assistant.allow = vec!["pr.comment".into()];
         let root = crate::assistant::ensure(&app).unwrap();
-        let m = add(&app, "m", TaskKind::Manager, Some(&root), &["pr.comment"]);
+        let m = add(&app, "m", TaskKind::Work, Some(&root), &["pr.comment"]);
         let w = add(&app, "w2", TaskKind::Work, Some(&m), &["pr.comment"]);
         let comment = "gh pr comment".to_string();
         assert!(!task_deny(&app, &w).unwrap().contains(&comment));
@@ -3585,62 +3556,6 @@ mod tests {
         app.db.set_grants(&m.id, &["pr.comment"]).unwrap();
         app.config.assistant.allow = Vec::new();
         assert!(task_deny(&app, &w).unwrap().contains(&comment));
-    }
-
-    #[test]
-    fn a_manager_is_denied_commits_and_new_branches_but_may_read_branches() {
-        let (_dir, mut app, w) = tree();
-        app.config.permissions.guards = Some(true);
-        let m = TaskRecord {
-            id: "m-id".into(),
-            slug: "m".into(),
-            name: "m".into(),
-            kind: TaskKind::Manager,
-            ..w.clone()
-        };
-        app.db.insert_task(&m).unwrap();
-        // Only under `guards`.
-        app.config.permissions.guards = None;
-        let plain = task_deny(&app, &m).unwrap();
-        assert!(!plain.iter().any(|d| d == "git commit"), "{plain:?}");
-        app.config.permissions.guards = Some(true);
-        let deny = task_deny(&app, &m).unwrap();
-        for denied in MANAGER_DENY {
-            assert!(deny.contains(&denied.to_string()), "{denied}: {deny:?}");
-        }
-        assert!(
-            !deny.iter().any(|d| d.starts_with("git branch")),
-            "{deny:?}"
-        );
-        let mut unique = deny.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(unique.len(), deny.len(), "{deny:?}");
-        let denied = |command: &str| deny.iter().any(|d| claude_match(d, command));
-        for command in [
-            "git commit -m x",
-            "git commit",
-            "git push -u origin HEAD",
-            "git checkout -b x",
-            "git switch -c x",
-        ] {
-            assert!(denied(command), "not denied: {command}");
-        }
-        for command in [
-            "git branch -a",
-            "git branch --show-current",
-            "git log main",
-            "git checkout main",
-            "git switch --detach origin/main",
-        ] {
-            assert!(!denied(command), "denied: {command}");
-        }
-        // A worker still commits and pushes its own branch.
-        let deny = task_deny(&app, &w).unwrap();
-        assert!(!deny.iter().any(|d| claude_match(d, "git commit -m x")));
-        assert!(!deny
-            .iter()
-            .any(|d| claude_match(d, "git push -u origin HEAD")));
     }
 
     /// A model of how Claude Code (2.1) matches the `Bash(…)` deny rules
@@ -4029,7 +3944,7 @@ mod tests {
         let m = add(
             &app,
             "mi",
-            TaskKind::Manager,
+            TaskKind::Work,
             Some(&root),
             &["assistant.interrupt"],
         );

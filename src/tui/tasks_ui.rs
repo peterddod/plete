@@ -363,7 +363,7 @@ fn row_hints(ui: &TasksUi) -> Vec<&'static str> {
                     hints.push("z/Z pause/resume");
                 }
                 hints.push("x stop");
-                if matches!(kind, Some(TaskKind::Assistant | TaskKind::Manager)) {
+                if matches!(kind, Some(TaskKind::Assistant)) {
                     hints.push("n new under");
                 }
             }
@@ -780,9 +780,7 @@ fn draw_projects(frame: &mut Frame, area: Rect, ui: &mut TasksUi) {
         .title_style(Style::default().fg(Color::Green));
     if ui.projects.is_empty() {
         let hint = match (ui.filter.is_empty(), archived) {
-            (true, false) => {
-                "no projects: no task or manager in one is active. A shows the others."
-            }
+            (true, false) => "no projects: no task in one is active. A shows the others.",
             (true, true) => "no other projects. A goes back to the active ones.",
             _ => "⌫ or esc widens the filter",
         };
@@ -822,12 +820,10 @@ fn project_lines(ui: &TasksUi, line: &ProjectGroup) -> Vec<Line<'static>> {
         _ => ("▪".to_string(), Color::DarkGray),
     };
     let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
-    let counts = [(line.managers, "manager"), (line.tasks, "task")]
-        .into_iter()
-        .filter(|&(n, _)| n > 0)
-        .map(|(n, word)| plural(n, word))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let counts = match line.tasks {
+        0 => String::new(),
+        n => plural(n, "task"),
+    };
     vec![
         Line::from(vec![
             Span::styled(
@@ -1110,18 +1106,15 @@ fn project_text(row: &TaskRow, width: usize) -> String {
     }
 }
 
-/// The tag column: wide enough for `manager` with a space either side.
+/// The tag column.
 pub const TAG: usize = 9;
 
 /// A task's tag, centred in the tag column, and its colour: 256-colour
-/// orange for a manager and periwinkle for a task, hues nothing else in a
-/// row uses (the 16 named colours are all taken by names, statuses and
-/// columns). Foreground only: the cursor's highlight replaces backgrounds.
-pub fn tag(kind: TaskKind) -> (String, Color) {
-    let (word, color) = match kind {
-        TaskKind::Manager => ("manager", Color::Indexed(208)),
-        TaskKind::Work | TaskKind::Assistant | TaskKind::Setup => ("task", Color::Indexed(147)),
-    };
+/// periwinkle, a hue nothing else in a row uses (the 16 named colours are all
+/// taken by names, statuses and columns). Foreground only: the cursor's
+/// highlight replaces backgrounds.
+pub fn tag() -> (String, Color) {
+    let (word, color) = ("task", Color::Indexed(147));
     let left = (TAG - word.width()) / 2;
     let right = TAG - word.width() - left;
     (
@@ -1261,7 +1254,7 @@ fn row_lines(
     rolled: Option<(Urgency, u32)>,
     columns: &Columns,
 ) -> Vec<Line<'static>> {
-    let (tag, tag_color) = tag(row.task.kind);
+    let (tag, tag_color) = tag();
     let (status, color) = row_status(row, rolled);
     let mut first = vec![
         Span::styled(tag, Style::default().fg(tag_color)),
@@ -2660,7 +2653,6 @@ mod tests {
                 stash_ref: None,
                 pr_number: None,
                 created_at: 0,
-                read_only: false,
             }],
             activity,
             last_activity: crate::worktrees::now_secs() - 120,
@@ -2825,34 +2817,27 @@ mod tests {
 
     #[test]
     fn tags_are_centred_in_their_column_and_the_names_line_up() {
-        assert_eq!(tag(TaskKind::Manager).0, " manager ");
-        assert_eq!(tag(TaskKind::Work).0, "  task   ");
-        assert_eq!(tag(TaskKind::Assistant).0.width(), TAG);
-        // Colours nothing else in a row uses, and the two differ.
-        let (manager, task) = (tag(TaskKind::Manager).1, tag(TaskKind::Work).1);
-        assert_ne!(manager, task);
-        for color in [manager, task] {
-            assert!(matches!(color, Color::Indexed(_)), "{color:?}");
-        }
+        assert_eq!(tag().0, "  task   ");
+        assert_eq!(tag().0.width(), TAG);
+        // A colour nothing else in a row uses.
+        let color = tag().1;
+        assert!(matches!(color, Color::Indexed(_)), "{color:?}");
         let mut api = row("api", Some(Activity::Idle { since: 0 }));
-        api.task.kind = TaskKind::Manager;
         api.task.parent_id = Some("assistant-id".into());
         let mut ui = TasksUi::new(vec![api, row("fix-login", None)]);
         let screen = render(&mut ui, 120, 14);
         let line = |what: &str| screen.iter().find(|l| l.contains(what)).unwrap().clone();
         let (api, fix) = (line(" api "), line("fix-login"));
         assert_eq!(column(&api, "api"), column(&fix, "fix-login"));
-        assert_eq!(column(&api, "manager"), column(&fix, "task") - 1);
-        // No `(manager)` suffix, and no parent column.
+        assert_eq!(column(&api, "task"), column(&fix, "task"));
+        // No parent column.
         let all = screen.join("\n");
-        assert!(!all.contains("(manager)"), "{all}");
         assert!(!all.contains('↳'), "{all}");
     }
 
     #[test]
     fn a_manager_shows_whats_running_below_it() {
-        let mut ops = row("ops", Some(Activity::Idle { since: 0 }));
-        ops.task.kind = TaskKind::Manager;
+        let ops = row("ops", Some(Activity::Idle { since: 0 }));
         let mut ship = row("ship", Some(Activity::Running { detail: None }));
         ship.task.parent_id = Some("ops".into());
         let mut ui = TasksUi::new(vec![ops, ship]);
@@ -2864,8 +2849,7 @@ mod tests {
 
     #[test]
     fn the_breadcrumb_says_where_the_list_is() {
-        let mut ops = row("ops", Some(Activity::Idle { since: 0 }));
-        ops.task.kind = TaskKind::Manager;
+        let ops = row("ops", Some(Activity::Idle { since: 0 }));
         let mut ship = row("ship", None);
         ship.task.parent_id = Some("ops".into());
         let mut ui = TasksUi::new(vec![ops, ship]);
@@ -3699,7 +3683,7 @@ mod tests {
         let rows = vec![
             node(
                 "backend",
-                TaskKind::Manager,
+                TaskKind::Work,
                 "assistant",
                 Some(Activity::Running { detail: None }),
             ),
@@ -3721,7 +3705,7 @@ mod tests {
             ),
             node(
                 "frontend",
-                TaskKind::Manager,
+                TaskKind::Work,
                 "assistant",
                 Some(Activity::Idle { since: 0 }),
             ),
@@ -4127,9 +4111,10 @@ mod tests {
 
     #[test]
     fn the_task_hints_follow_the_row() {
-        let mut manager = row("backend", None);
-        manager.task.kind = TaskKind::Manager;
-        let mut ui = TasksUi::new(vec![row("fix login", None), manager]);
+        let manager = row("backend", None);
+        let mut child = row("child", None);
+        child.task.parent_id = Some("backend".into());
+        let mut ui = TasksUi::new(vec![row("fix login", None), manager, child]);
         let bar_on = |ui: &mut TasksUi, name: &str| {
             ui.selected = ui
                 .visible
@@ -4155,7 +4140,6 @@ mod tests {
             inside.contains("← up") && !inside.contains("→ into"),
             "{inside}"
         );
-        assert!(!inside.contains("⏎ open"), "empty: {inside}");
     }
 
     #[test]

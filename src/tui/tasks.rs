@@ -1511,11 +1511,9 @@ impl TasksUi {
                     && self.level_parent(r) == Some(row.task.id.as_str())
             });
         }
-        row.task.kind == TaskKind::Manager
-            || self.rows.iter().any(|r| {
-                r.task.state == TaskState::Active
-                    && r.task.parent_id.as_deref() == Some(&row.task.id)
-            })
+        self.rows.iter().any(|r| {
+            r.task.state == TaskState::Active && r.task.parent_id.as_deref() == Some(&row.task.id)
+        })
     }
 
     /// The managers above active task `id`, outermost first: the path that
@@ -2423,7 +2421,7 @@ impl TasksUi {
                         None
                     }
                     (true, Some(node))
-                        if matches!(node.kind, TaskKind::Assistant | TaskKind::Manager)
+                        if matches!(node.kind, TaskKind::Assistant)
                             || (node.kind == TaskKind::Work && node.parent_id.is_some()) =>
                     {
                         Some(Action::NewChildForm { parent_id: node.id })
@@ -6288,10 +6286,10 @@ mod tests {
             row
         };
         TasksUi::new(vec![
-            under("ops", TaskKind::Manager, Some("assistant-id"), 50),
+            under("ops", TaskKind::Work, Some("assistant-id"), 50),
             under("docs", TaskKind::Work, Some("assistant-id"), 40),
             under("loose", TaskKind::Work, None, 30),
-            under("deploy", TaskKind::Manager, Some("ops"), 20),
+            under("deploy", TaskKind::Work, Some("ops"), 20),
             under("fix", TaskKind::Work, Some("ops"), 10),
             under("ship", TaskKind::Work, Some("deploy"), 5),
         ])
@@ -6395,25 +6393,6 @@ mod tests {
             press(&mut ui, KeyCode::Char('a')),
             Some(Action::Archive { .. })
         ));
-    }
-
-    #[test]
-    fn an_empty_manager_is_entered_and_says_so() {
-        let mut ui = nested();
-        ui.select("ship");
-        press(&mut ui, KeyCode::Left);
-        press(&mut ui, KeyCode::Down);
-        assert_eq!(ui.selected_id(), Some("fix"));
-        // A manager with nothing under it is still a level.
-        let mut rows = ui.rows.clone();
-        rows.retain(|r| r.task.id != "ship");
-        ui.set_rows(rows);
-        ui.selected = 0;
-        assert_eq!(ui.selected_id(), Some("deploy"));
-        press(&mut ui, KeyCode::Right);
-        assert!(ui.visible.is_empty());
-        assert_eq!(ui.breadcrumb(), ["assistant", "ops", "deploy"]);
-        assert!(ui.status_line.contains("← back up"), "{}", ui.status_line);
     }
 
     #[test]
@@ -6632,10 +6611,10 @@ mod tests {
         ui
     }
 
-    fn projects(ui: &TasksUi) -> Vec<(&str, usize, usize)> {
+    fn projects(ui: &TasksUi) -> Vec<(&str, usize)> {
         ui.projects
             .iter()
-            .map(|p| (p.name.as_str(), p.managers, p.tasks))
+            .map(|p| (p.name.as_str(), p.tasks))
             .collect()
     }
 
@@ -6729,7 +6708,7 @@ mod tests {
     #[test]
     fn the_projects_view_groups_by_project() {
         let ui = by_project();
-        assert_eq!(projects(&ui), [("api", 1, 1), ("web", 2, 2)]);
+        assert_eq!(projects(&ui), [("api", 2), ("web", 4)]);
         assert_eq!(ui.count(View::Projects), 2);
         // The top level has no task under the cursor.
         assert_eq!(ui.selected_row().map(|r| r.task.id.as_str()), None);
@@ -6801,7 +6780,7 @@ mod tests {
         let mut ui = by_project();
         press(&mut ui, KeyCode::Char('A'));
         assert!(ui.archived_projects);
-        assert_eq!(projects(&ui), [("gone", 0, 1), ("idle", 0, 0)]);
+        assert_eq!(projects(&ui), [("gone", 1), ("idle", 0)]);
         assert!(ui.status_line.contains("other"), "{}", ui.status_line);
         // Inside, the archived tasks, flat; ⏎ explains, a brings back.
         press(&mut ui, KeyCode::Enter);
@@ -6823,7 +6802,7 @@ mod tests {
     }
 
     #[test]
-    fn a_manager_reaching_a_project_through_other_projects_tasks_is_walked_to_its_member() {
+    fn a_task_reaching_a_project_through_other_projects_tasks_is_walked_to_its_member() {
         let mut ui = by_project();
         let mut rows = ui.rows.clone();
         let mut sub = task("sub", "sub", TaskState::Active, 1);
@@ -6831,11 +6810,8 @@ mod tests {
         sub.task.project = Some("docs".into());
         rows.push(sub);
         ui.set_rows(rows);
-        // docs: ops and deploy (managers above sub) and sub; ship is web's.
-        assert_eq!(
-            projects(&ui),
-            [("api", 1, 1), ("docs", 2, 1), ("web", 2, 2)]
-        );
+        // docs: ops, deploy and ship (above sub) and sub.
+        assert_eq!(projects(&ui), [("api", 2), ("docs", 4), ("web", 4)]);
         ui.selected = 1;
         press(&mut ui, KeyCode::Enter);
         assert_eq!(ui.breadcrumb(), ["projects", "docs"]);
@@ -6844,12 +6820,12 @@ mod tests {
         assert_eq!(shown(&ui), ["deploy"]);
         press(&mut ui, KeyCode::Right);
         assert_eq!(ui.breadcrumb(), ["projects", "docs", "ops", "deploy"]);
+        assert_eq!(shown(&ui), ["ship"]);
+        press(&mut ui, KeyCode::Right);
         assert_eq!(shown(&ui), ["sub"]);
         // sub has nothing of docs below it.
         let sub = ui.row("sub").unwrap().clone();
         assert!(!ui.enterable(&sub));
-        let ship = ui.row("ship").unwrap().clone();
-        assert!(!ui.enterable(&ship));
     }
 
     #[test]
@@ -6865,7 +6841,7 @@ mod tests {
         assert_eq!(projects(&ui)[ui.selected].0, "idle");
         // A project made meanwhile is listed; one deleted goes.
         ui.set_known_projects(["api", "fresh", "gone", "web"].map(String::from).to_vec());
-        assert_eq!(projects(&ui), [("gone", 0, 1), ("fresh", 0, 0)]);
+        assert_eq!(projects(&ui), [("gone", 1), ("fresh", 0)]);
     }
 
     #[test]
@@ -6873,7 +6849,7 @@ mod tests {
         let mut ui = by_project();
         press(&mut ui, KeyCode::Char('/'));
         type_text(&mut ui, "we");
-        assert_eq!(projects(&ui), [("web", 2, 2)]);
+        assert_eq!(projects(&ui), [("web", 4)]);
         press(&mut ui, KeyCode::Enter);
         press(&mut ui, KeyCode::Right);
         assert!(ui.filter.is_empty());
@@ -7920,7 +7896,6 @@ mod tests {
             stash_ref: None,
             pr_number: None,
             created_at: 0,
-            read_only: false,
         };
         let canvas = places(dir.path(), &[]);
         assert_eq!(only_place(&canvas).unwrap().repo_id, None);
@@ -8115,7 +8090,7 @@ mod tests {
         let mut root = task("root", "assistant", TaskState::Active, 0);
         root.task.kind = TaskKind::Assistant;
         let mut m = task("m", "m", TaskState::Active, 0);
-        m.task.kind = TaskKind::Manager;
+        m.task.kind = TaskKind::Work;
         m.task.parent_id = Some("root".into());
         let mut w = task("w", "w", TaskState::Active, 0);
         w.task.parent_id = Some("m".into());
@@ -8916,7 +8891,7 @@ mod tests {
             row.task
         };
         let root = record("root", TaskKind::Assistant, None);
-        let api = record("api", TaskKind::Manager, Some("root"));
+        let api = record("api", TaskKind::Work, Some("root"));
         let w = record("w", TaskKind::Work, Some("api"));
         app.db
             .insert_report(
@@ -8947,15 +8922,15 @@ mod tests {
         let text = lines.join("\n");
         assert!(!prs);
         assert!(
-            text.starts_with(format!("open ask\n  #{asked} question to manager api").as_str()),
+            text.starts_with(format!("open ask\n  #{asked} question to task api").as_str()),
             "{text}"
         );
         assert!(text.contains("    keep v1?\n    [2Jsay"), "{text}");
         assert!(text.contains("inbox · 1 queued"), "{text}");
         assert!(text.contains("    from api"), "{text}");
         // Newest first, and no fence: the TUI is the user.
-        let newest = text.find(format!("#{asked} question · task w → manager api").as_str());
-        let older = text.find("progress · task w → manager api");
+        let newest = text.find(format!("#{asked} question · task w → task api").as_str());
+        let older = text.find("progress · task w → task api");
         assert!(
             newest.is_some() && older.is_some() && newest < older,
             "{text}"
@@ -8966,7 +8941,7 @@ mod tests {
         let (lines, _) = report_lines(&app, &api, &tasks::task_dir(&app, &api)).unwrap();
         let text = lines.join("\n");
         assert!(text.starts_with("open ask\n  none"), "{text}");
-        assert!(text.contains("question · task w → manager api"), "{text}");
+        assert!(text.contains("question · task w → task api"), "{text}");
 
         let text = brief_lines(&app, &w).unwrap().join("\n");
         assert!(text.contains("task root/api/w"), "{text}");
@@ -8976,7 +8951,7 @@ mod tests {
         );
         // The CLI's `manager show` refuses the assistant; `b` reads it.
         let text = brief_lines(&app, &root).unwrap().join("\n");
-        assert!(text.contains("- api (manager, active)"), "{text}");
+        assert!(text.contains("- api (work, active)"), "{text}");
 
         // Where an ask stands: with the user, then answered, with the
         // answer, which is kept whether or not it reached the asker.
@@ -9014,7 +8989,7 @@ mod tests {
         app.db.answer_report(next, Some("api"), "x", "api").unwrap();
         let (lines, _) = report_lines(&app, &w, &w_dir).unwrap();
         assert!(
-            lines.join("\n").contains("answered by manager api"),
+            lines.join("\n").contains("answered by task api"),
             "{lines:?}"
         );
     }
@@ -9436,7 +9411,6 @@ mod tests {
                 stash_ref: None,
                 pr_number: None,
                 created_at: 0,
-                read_only: false,
             },
             path: PathBuf::from("/t/api"),
             present: true,

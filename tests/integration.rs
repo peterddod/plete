@@ -16470,7 +16470,7 @@ fn a_brief_under_a_paused_manager_starts_once_it_is_resumed() {
     );
     succeeded(&output);
     assert!(
-        stderr_of(&output).contains("not started: task kid is paused under manager m"),
+        stderr_of(&output).contains("not started: task kid is paused under task m"),
         "{}",
         stderr_of(&output)
     );

@@ -2606,14 +2606,13 @@ agents](docs/design/agent-hierarchy.md).
 
 - **`plete manager new`** makes a manager, an agent that takes an area of
   work, plans it and hands it to tasks (and managers) of its own under it,
-  which report to it as tasks report to the assistant. It gets a home with
-  its role, a read-only `BRIEF.md`, a worklog and a todo list, and starts at
-  once. `plete task new --parent <manager>`, `--allow` and `--budget` place
+  which report to it as tasks report to the assistant. It is a task
+  started as the `planner` profile, and starts at once. `plete task new --parent <manager>`, `--allow` and `--budget` place
   and limit a task; `plete manager ls`, `show`, `grant` and `budget` read
   and steer the tree ([Reporting to the parent](#reporting-to-the-parent)).
 - **Managers run locally in tmux, as you, unconfined**, as every task
   does. Their limits (what they may reach, what they are granted, their
-  budgets, `max_live`, read-only worktrees and the git denies) are
+  budgets and `max_live`) are
   cooperative: they stop honest mistakes, not an agent that sets out to get
   around plete. A confined placement may come later.
 - **Budgets, pause and stop** for every task under the assistant: a budget

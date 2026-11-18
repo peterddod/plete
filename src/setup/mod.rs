@@ -104,7 +104,7 @@ pub fn current_hash(path: &Path) -> Result<Option<String>> {
 
 /// The real path of target `id`, for the targets apply may write: the
 /// config, the assistant's `AGENTS.md` and skills, and the Markdown
-/// template overrides under `templates/{root,manager,worker}/`. Anything
+/// template overrides under `templates/{root,worker}/`. Anything
 /// else is refused.
 pub fn target_path(home: &Path, id: &str) -> Result<PathBuf> {
     let parts: Vec<&str> = id.split('/').collect();
@@ -119,7 +119,7 @@ pub fn target_path(home: &Path, id: &str) -> Result<PathBuf> {
         ["assistant", "AGENTS.md"] => true,
         ["assistant", ".claude", "skills", _, "SKILL.md"] => true,
         // Instructions only: no settings, hooks or scripts for new homes.
-        ["templates", "root" | "manager" | "worker", rest @ ..] => {
+        ["templates", "root" | "worker", rest @ ..] => {
             rest.last().is_some_and(|f| f.ends_with(".md"))
         }
         _ => false,
@@ -127,7 +127,7 @@ pub fn target_path(home: &Path, id: &str) -> Result<PathBuf> {
     if !allowed {
         bail!(
             "{id:?} is not a target {PRODUCT} setup applies: config.toml, assistant/AGENTS.md, \
-             assistant/.claude/skills/<name>/SKILL.md, templates/{{root,manager,worker}}/…/*.md"
+             assistant/.claude/skills/<name>/SKILL.md, templates/{{root,worker}}/…/*.md"
         );
     }
     Ok(home.join(id))
@@ -208,7 +208,6 @@ mod tests {
             "assistant/.claude/skills/plete-assistant/SKILL.md",
             "templates/root/AGENTS.md",
             "templates/worker/SKILL.md",
-            "templates/manager/.claude/skills/x/SKILL.md",
         ] {
             assert_eq!(target_path(home, ok).unwrap(), home.join(ok), "{ok}");
         }
@@ -224,6 +223,7 @@ mod tests {
             "assistant/.claude/skills/x/run.sh",
             "templates/root",
             "templates/other/AGENTS.md",
+            "templates/manager/.claude/skills/x/SKILL.md",
             "templates/worker/.claude/settings.json",
             "templates/root/hook.sh",
             "tasks/x/AGENTS.md",

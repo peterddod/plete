@@ -419,18 +419,9 @@ fn handle_hook(
             } else if harness.session_context_output("").is_some() {
                 let parented = task.parent_id.is_some() && attributed(launched_for, &task.id, app);
                 // What its parent asked of it, each time a session starts,
-                // /clear included; for a manager, with the state of its area.
+                // /clear included.
                 let brief = match (parented, task.kind) {
                     (false, _) => Ok(None),
-                    (true, TaskKind::Manager) => {
-                        // Written again as each session starts, so what
-                        // changed while it was archived, or in config, is
-                        // in it before it is read.
-                        if let Err(e) = manager::write_brief(app, task) {
-                            eprintln!("plete task-hook {event}: {e:#}");
-                        }
-                        manager::context::session_context(app, task, session_id, now).map(Some)
-                    }
                     // A work task with tasks under it hears how they go.
                     (true, TaskKind::Work) => reports::brief_context(app, task).and_then(|brief| {
                         let below = manager::context::work_sections(app, task)?;
@@ -1265,9 +1256,7 @@ pub(crate) fn idle_agent<'a>(
         TaskKind::Assistant => {
             Box::new(assistant::SessionAgent::for_session(app, task, session_id))
         }
-        TaskKind::Work | TaskKind::Manager | TaskKind::Setup => {
-            Box::new(messages::TmuxAgent::new(app, task))
-        }
+        TaskKind::Work | TaskKind::Setup => Box::new(messages::TmuxAgent::new(app, task)),
     }
 }
 
@@ -1370,7 +1359,7 @@ fn record_session(
         last_activity: now,
     })?;
     // A work task or manager has the one session: this one, from now on.
-    if matches!(task.kind, TaskKind::Work | TaskKind::Manager) {
+    if matches!(task.kind, TaskKind::Work) {
         if let Err(e) = app.db.set_task_session(task_id, session_id) {
             eprintln!("plete task-hook SessionStart: {e:#}");
         }
@@ -2124,11 +2113,11 @@ mod tests {
     fn a_quiet_manager_stop_takes_by_class_within_the_cap_and_holds_a_young_digest() {
         use crate::render::Class;
         let (_home, app) = lab();
-        let manager = TaskRecord {
-            kind: TaskKind::Manager,
-            ..app.db.get_task("w").unwrap().unwrap()
-        };
-        assert!(app.config.quiet_for(manager.kind));
+        let w = app.db.get_task("w").unwrap().unwrap();
+        assert!(!messages::quiet_for(&app, &w));
+        app.db.set_task_agent("w", "planner").unwrap();
+        let manager = w.clone();
+        assert!(messages::quiet_for(&app, &manager));
         let dir = busy_w(&app);
         let big = "q".repeat(900);
         let inbox = messages::Inbox::lock(&dir).unwrap();
@@ -2140,7 +2129,7 @@ mod tests {
                 classed(4, Class::Full, "question", "task e", &format!("3{big}")),
             ])
             .unwrap();
-        let quiet = app.config.quiet_for(manager.kind);
+        let quiet = messages::quiet_for(&app, &manager);
         let (taken, rendered) = take_at_stop(&inbox, &dir, "s", &app, quiet, 400).unwrap();
         assert!(rendered);
         assert!(crate::render::post_text(&taken).len() <= messages::STOP_CAP);
@@ -2156,13 +2145,8 @@ mod tests {
         // takes the queue as ever (posting is tested in the waiter).
         let mut full = app_at(&app.home);
         full.config = toml::from_str("[messages]\nrender = { managers = \"full\" }\n").unwrap();
-        assert!(!full.config.quiet_for(TaskKind::Manager));
-        assert!(!app.config.quiet_for(TaskKind::Work));
-        // A planner task is quiet as a manager was; another work task is not.
-        let w = app.db.get_task("w").unwrap().unwrap();
-        assert!(!messages::quiet_for(&app, &w));
-        app.db.set_task_agent("w", "planner").unwrap();
-        assert!(messages::quiet_for(&app, &w));
+        assert!(!full.config.quiet_for(crate::db::tasks::Role::Planner));
+        assert!(!app.config.quiet_for(crate::db::tasks::Role::Work));
         assert!(!messages::quiet_for(&full, &w));
     }
 
