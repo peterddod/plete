@@ -39,6 +39,11 @@ says everything else on stderr.
   and `--done` give it a definition of done, shown to its agent each time a
   session starts. A `--repo` plete does
   not have yet is cloned only if `repo.clone` is in `[assistant] allow`.
+- `--agent <profile>` starts it as an agent profile (`plete agents ls`
+  lists them; `plete agents show <name>` prints one): its instructions
+  follow the brief, and its settings (model, grant, budget, skills…) are the
+  task's. `--agent planner` makes a task that plans an area of work and
+  delegates it to tasks under it, as a manager does.
 - When the user asks you for a task, add `--for-user`: like one they make
   themselves, its done and questions notify them at any depth. When they
   ask you to keep a task quiet, `--quiet`, or `plete task quiet <task>
@@ -73,7 +78,7 @@ own when the agent waits on a prompt only the user can answer, sits idle a
 while, or ends without reporting done. Reports reach you fenced in
 `<plete-report>`, and your session context lists each task's last one. Such
 a task may do what you may (it is never given more) on itself and the tasks
-below it, unless you narrow it with `--allow` or `plete manager grant`; your
+below it, unless you narrow it with `--allow` or `plete task grant`; your
 todo list stays yours. A review is held to what whoever asked for it may do.
 Answer it with `plete task send <task> "<message>"`; a `question` or
 `blocked` report, with `plete report answer <id> "…"`, or pass that to the

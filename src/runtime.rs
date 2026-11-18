@@ -26,6 +26,7 @@ use crate::manager::run::{self, StartGate, StartGuard};
 use crate::messages::{self, Delivered, Inbox, TmuxAgent};
 use crate::permissions;
 use crate::placement::{self, NodeRuntime};
+use crate::profiles;
 use crate::projects;
 use crate::startup;
 use crate::status::{self, Activity};
@@ -271,12 +272,48 @@ fn start_tmux(
         },
         _ => None,
     };
-    // After the project's arguments, so a `--model` there wins too.
-    let spec = spec.with_model(app.config.models.for_kind(task.kind));
     let dir = tasks::task_dir(app, task);
     if !dir.is_dir() {
         bail!("the task directory {} is missing", dir.display());
     }
+    // Read at each start, so an edit takes effect; one gone or broken since
+    // stops the start rather than run the agent without it.
+    let profile = profiles::of_task(app, task)?;
+    if let Some(profile) = &profile {
+        let inline = settings_dir(&app.home, &task.id).join("mcp.json");
+        if let Some(file) = profiles::mcp_file(profile, &inline)? {
+            match spec.harness.mcp_args(&file) {
+                Some(args) => spec.argv.extend(args),
+                None => bail!(
+                    "profile {} names MCP servers, which {} cannot be given",
+                    profile.name,
+                    spec.harness.name()
+                ),
+            }
+        }
+        let rules = &profile.settings.permissions;
+        let has_rules = !rules.allow.is_empty() || !rules.deny.is_empty();
+        if has_rules && !spec.supports_sessions() {
+            warnings.push(format!(
+                "profile {}'s [permissions] rules are not given: {} takes no hooks from plete",
+                profile.name,
+                spec.harness.name()
+            ));
+        }
+        warnings.extend(profiles::install_skills(
+            app,
+            profile,
+            task.project.as_deref(),
+            &dir,
+        ));
+    }
+    // After the project's arguments, so a `--model` there wins too; the
+    // profile's over `[models]`.
+    let model = profile
+        .as_ref()
+        .and_then(|p| p.settings.model.as_deref())
+        .or(app.config.models.for_kind(task.kind));
+    let spec = spec.with_model(model);
     // Refused before anything is read for the launch, as it always was.
     if prompt.is_some() && spec.harness.prompt_args("").is_none() {
         bail!(no_first_prompt(&spec, &task.slug));
@@ -296,6 +333,12 @@ fn start_tmux(
         true => {
             let exe = crate::paths::plete_exe()?;
             let mut hooks = task_hooks(app, task, spec.harness, exe)?;
+            // The profile's rules, after `[permissions.task]`'s.
+            if let Some(profile) = &profile {
+                let rules = &profile.settings.permissions;
+                hooks.extra_allow.extend(rules.allow.iter().cloned());
+                hooks.extra_deny.extend(rules.deny.iter().cloned());
+            }
             if let Some(docs) = docs.as_deref() {
                 let rules = spec.harness.edit_rules(docs);
                 match projects::may_write_docs(app, task) {
@@ -318,6 +361,9 @@ fn start_tmux(
         spec,
         hooks,
         warnings,
+        env: profile
+            .map(|p| p.settings.env.into_iter().collect())
+            .unwrap_or_default(),
     };
     let running = launch_tmux(
         app,
@@ -366,6 +412,9 @@ pub struct Launch {
     pub spec: AgentSpec,
     /// The sessions the index has recorded for it.
     pub known_sessions: Vec<TaskSessionRecord>,
+    /// Environment its agent starts with besides plete's own (its agent
+    /// profile's `env`).
+    pub env: Vec<(String, String)>,
     /// plete's hooks for it; none for a harness that keeps no sessions.
     pub hooks: Option<HookSetup>,
     /// Warn when the harness has no deny rules: it has a parent.
@@ -427,6 +476,8 @@ pub fn launch_tmux(
     if let Some(new_home) = &new_home {
         env.push((crate::env::NEW_HOME_VAR, new_home.as_ref()));
     }
+    // A profile may not set plete's own (checked as it is read).
+    env.extend(launch.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     let pane = tmux::new_session(&name, &launch.dir, &env, &argv)?;
     if let Err(e) = record_anchor(&pane) {
         warnings.push(identity::unidentified(&launch.slug, &e));

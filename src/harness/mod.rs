@@ -136,6 +136,12 @@ pub trait Harness: Sync {
         None
     }
 
+    /// Arguments that give this launch the MCP servers in the file at
+    /// `path`, `{"mcpServers": {…}}` (an agent profile's `mcp`).
+    fn mcp_args(&self, _path: &Path) -> Option<Vec<String>> {
+        None
+    }
+
     /// Arguments that let this launch's agent reach the directory `path`
     /// outside its own (a project's shared docs).
     fn add_dir_args(&self, _path: &Path) -> Option<Vec<String>> {

@@ -133,6 +133,11 @@ pub enum PendingAction {
 pub enum Overlay {
     /// Selection into [`Explorer::worktree_rows`].
     Worktrees { selected: usize },
+    /// ctrl-t: the places the explorer can jump to from here.
+    GoTo {
+        selected: usize,
+        targets: Vec<GoTarget>,
+    },
     Confirm {
         title: String,
         lines: Vec<String>,
@@ -173,6 +178,81 @@ pub enum Overlay {
         input: String,
         pending: Option<PendingReview>,
     },
+}
+
+/// Where a row of the ctrl-t menu leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoKind {
+    /// The worktree being browsed, or the one the explorer came from.
+    Root,
+    Task,
+    Project,
+    /// Not a place: the ctrl-w panel.
+    Worktrees,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoTarget {
+    pub key: char,
+    pub kind: GoKind,
+    pub name: String,
+    /// Where it goes; none for the worktrees panel.
+    pub path: Option<PathBuf>,
+}
+
+/// The ctrl-t menu for an explorer rooted at `root`, from the pieces that
+/// decide it: the task's directory, the project's name and directory, whether
+/// the explorer has a repository, and the worktree it left for the task or
+/// project (`away`). Only places that exist are listed.
+pub fn go_targets(
+    root: &Path,
+    task_dir: Option<&Path>,
+    project: Option<(&str, &Path)>,
+    has_repo: bool,
+    away: Option<&Path>,
+) -> Vec<GoTarget> {
+    let mut targets = Vec::new();
+    // With nowhere to return to, a folder that is no worktree is the task's
+    // or the project's own, and `r` would only be `t` or `p` again.
+    let root_target = match away {
+        Some(worktree) => Some(("worktree root", worktree)),
+        None if has_repo => Some(("worktree root", root)),
+        None if task_dir.is_some() || project.is_some() => None,
+        None => Some(("root", root)),
+    };
+    if let Some((name, path)) = root_target {
+        targets.push(GoTarget {
+            key: 'r',
+            kind: GoKind::Root,
+            name: name.into(),
+            path: Some(path.to_path_buf()),
+        });
+    }
+    if let Some(dir) = task_dir {
+        targets.push(GoTarget {
+            key: 't',
+            kind: GoKind::Task,
+            name: "task root".into(),
+            path: Some(dir.to_path_buf()),
+        });
+    }
+    if let Some((name, dir)) = project {
+        targets.push(GoTarget {
+            key: 'p',
+            kind: GoKind::Project,
+            name: format!("project {name}"),
+            path: Some(dir.to_path_buf()),
+        });
+    }
+    if has_repo {
+        targets.push(GoTarget {
+            key: 'w',
+            kind: GoKind::Worktrees,
+            name: "worktrees…".into(),
+            path: None,
+        });
+    }
+    targets
 }
 
 /// What `/` did, so the caller can explain a step that did not happen without
@@ -285,6 +365,14 @@ pub struct Explorer {
     pub review_job: Option<Job>,
     /// The screen esc returns to, when the explorer was opened from one.
     pub back: Option<String>,
+    /// The repository and worktree root the explorer left to browse the
+    /// task's or project's directory, which `r` in ctrl-t returns to.
+    pub away_from: Option<(RepoRecord, PathBuf)>,
+    /// A folder inside the task the explorer last left for somewhere outside
+    /// it (the project's settings folder), so the menu can still find the
+    /// task from there. The away worktree does this when there is one; a
+    /// canvas opened on its own has none.
+    pub left_task: Option<PathBuf>,
 }
 
 /// Two presses on the same cell inside this window are one double-click.
@@ -334,10 +422,15 @@ impl Explorer {
             pr_area: None,
             review_job: None,
             back: None,
+            away_from: None,
+            left_task: None,
         };
         explorer.set_root(explorer.root.clone())?;
-        if cwd != explorer.root {
-            explorer.show(cwd, None)?;
+        // A start that names the root's folders by another path (`/tmp` for
+        // `/private/tmp`, a symlinked cwd) is not lexically under it: browse
+        // from the root rather than refuse to open at all.
+        if cwd != explorer.root && explorer.show(cwd, None).is_err() {
+            explorer.set_root(explorer.root.clone())?;
         }
         Ok(explorer)
     }
@@ -368,10 +461,17 @@ impl Explorer {
         listings.insert(self.root.clone(), read_dir(&self.root, self.show_hidden)?);
         let mut open = BTreeSet::new();
         // A folder sorts after its parent, so one that was dropped has already
-        // kept its children from being read.
+        // kept its children from being read. Its parent must still list it as
+        // a folder, too: one that was hidden (ctrl-d), removed or replaced by a
+        // file would otherwise stay open with no row leading to it, and the
+        // cursor could sit in it unseen.
         for dir in &self.open {
-            let parent_kept = dir.parent().is_some_and(|p| listings.contains_key(p));
-            if !parent_kept {
+            let listed = dir.parent().and_then(|p| listings.get(p)).is_some_and(
+                |(entries, _): &(Vec<FsEntry>, usize)| {
+                    entries.iter().any(|e| e.is_dir && e.path == *dir)
+                },
+            );
+            if !listed {
                 continue;
             }
             if let Ok(listing) = read_dir(dir, self.show_hidden) {
@@ -1382,6 +1482,51 @@ mod tests {
         std::fs::write(dir.path().join("README.md"), "hi").unwrap();
         std::fs::write(dir.path().join("alpha.txt"), "x").unwrap();
         dir
+    }
+
+    fn keys_of(targets: &[GoTarget]) -> String {
+        targets.iter().map(|t| t.key).collect()
+    }
+
+    #[test]
+    fn go_to_menu_of_a_worktree_outside_any_task() {
+        let root = Path::new("/w/api");
+        let targets = go_targets(root, None, None, true, None);
+        assert_eq!(keys_of(&targets), "rw");
+        assert_eq!(targets[0].path.as_deref(), Some(root));
+        assert_eq!(targets[1].path, None);
+    }
+
+    #[test]
+    fn go_to_menu_of_a_task_canvas_with_a_project() {
+        let task = Path::new("/t/fix");
+        let project = Some(("web", Path::new("/p/web")));
+        // Opened on the canvas: nowhere to return to, so no `r`.
+        assert_eq!(
+            keys_of(&go_targets(task, Some(task), project, false, None)),
+            "tp"
+        );
+        // Having come from a worktree, `r` is that worktree.
+        let away = Path::new("/t/fix/api");
+        let targets = go_targets(task, Some(task), project, false, Some(away));
+        assert_eq!(keys_of(&targets), "rtp");
+        assert_eq!(targets[0].path.as_deref(), Some(away));
+        // In a worktree of the task: everything.
+        let inside = Path::new("/t/fix/api");
+        assert_eq!(
+            keys_of(&go_targets(inside, Some(task), project, true, None)),
+            "rtpw"
+        );
+    }
+
+    #[test]
+    fn go_to_menu_of_a_task_without_a_project_has_no_p() {
+        let task = Path::new("/t/fix");
+        let inside = Path::new("/t/fix/api");
+        assert_eq!(
+            keys_of(&go_targets(inside, Some(task), None, true, None)),
+            "rtw"
+        );
     }
 
     #[test]
@@ -2674,6 +2819,58 @@ mod tests {
         assert!(!explorer.select_row(99));
         assert!(explorer.select_row(3));
         assert_eq!(cursor(&explorer), "z");
+        assert_eq!(explorer.cwd, dir.path());
+    }
+
+    /// Hiding dotfiles with the cursor inside a dot-folder closes it: no
+    /// folder stays open, and no cursor stays in one, with no row leading there.
+    #[test]
+    fn hiding_the_folder_the_cursor_is_in_brings_it_back_up() {
+        let dir = tree();
+        std::fs::create_dir(dir.path().join(".github")).unwrap();
+        std::fs::write(dir.path().join(".github/ci.yml"), "c").unwrap();
+        let mut explorer = explorer_at(dir.path());
+        explorer.toggle_hidden(None).unwrap();
+        explorer.show(dir.path().join(".github"), None).unwrap();
+        assert_eq!(cursor(&explorer), "ci.yml");
+
+        explorer.toggle_hidden(None).unwrap();
+        assert_eq!(explorer.cwd, dir.path());
+        assert!(!explorer.is_open(&dir.path().join(".github")));
+        assert!(explorer.cursor_row().is_some(), "the cursor is on a row");
+        assert!(!names(&explorer).iter().any(|n| n.contains("ci.yml")));
+    }
+
+    /// A folder removed from under the tree drops out on the next reload,
+    /// its children with it.
+    #[test]
+    fn a_removed_open_folder_drops_out() {
+        let dir = tree();
+        let mut explorer = explorer_at(dir.path());
+        explorer.show(dir.path().join("a/b"), None).unwrap();
+        std::fs::remove_dir_all(dir.path().join("a/b")).unwrap();
+        explorer.show(dir.path().join("a"), None).unwrap();
+        explorer.reload(None).unwrap();
+        assert!(!explorer.is_open(&dir.path().join("a/b")));
+        assert!(!names(&explorer).iter().any(|n| n.trim() == "b"));
+        assert!(!names(&explorer).iter().any(|n| n.contains("deep.txt")));
+    }
+
+    /// A start directory that is not lexically under the root opens at the
+    /// root instead of refusing to open.
+    #[test]
+    fn a_start_outside_the_root_opens_at_the_root() {
+        let dir = tree();
+        let elsewhere = TempDir::new().unwrap();
+        let explorer = Explorer::new(
+            None,
+            dir.path().to_path_buf(),
+            "canvas".into(),
+            "task".into(),
+            WorktreeStatus::default(),
+            elsewhere.path().to_path_buf(),
+        )
+        .unwrap();
         assert_eq!(explorer.cwd, dir.path());
     }
 

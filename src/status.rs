@@ -44,6 +44,7 @@ use crate::manager;
 use crate::manager::budget::{self, Threshold};
 use crate::manager::run;
 use crate::messages;
+use crate::profiles;
 use crate::reports::{self, StatusEvent};
 use crate::runtime;
 use crate::tasks;
@@ -457,9 +458,20 @@ fn handle_hook(
                     }
                     _ => None,
                 };
-                // Its project's shared docs, on the same terms as the policy.
+                // Its agent profile's instructions, then its project's shared
+                // docs, after its brief, on the same terms as the policy line.
                 let own =
                     parented || (task.parent_id.is_none() && names_task(launched_for, &task.id));
+                let profile = match (own, task.kind) {
+                    (true, TaskKind::Work) => match profiles::of_task(app, task) {
+                        Ok(profile) => profile.as_ref().and_then(profiles::brief_section),
+                        Err(e) => {
+                            eprintln!("plete task-hook {event}: {e:#}");
+                            None
+                        }
+                    },
+                    _ => None,
+                };
                 let docs = match (&task.project, task.kind, own) {
                     (Some(project), TaskKind::Work, true) => {
                         match crate::projects::ensure_docs(app, project) {
@@ -477,7 +489,12 @@ fn handle_hook(
                     _ => None,
                 };
                 let context = brief.map(|brief| {
-                    let parts: Vec<String> = brief.into_iter().chain(policy).chain(docs).collect();
+                    let parts: Vec<String> = brief
+                        .into_iter()
+                        .chain(profile)
+                        .chain(policy)
+                        .chain(docs)
+                        .collect();
                     parts.join("\n\n")
                 });
                 match context {
@@ -1001,7 +1018,7 @@ fn auto_body(
 
 /// Tell the task's parent what this hook means for it, if anything.
 /// Nothing for a task plete stopped itself (archived or deleted, or stopped
-/// with `plete manager stop`, whose caller says so) and, as ever, nothing on
+/// with `plete task stop`, whose caller says so) and, as ever, nothing on
 /// stdout.
 fn report_step(
     hook: &HookEvent,
@@ -2266,7 +2283,7 @@ mod tests {
             hold: Some(RunState::Stopped),
             ..quiet_ctx(app)
         };
-        // `plete manager stop`, which ended it, said so to whoever asked.
+        // `plete task stop`, which ended it, said so to whoever asked.
         report_step(&ended, &ctx, Some("w"), 500).unwrap();
         assert!(ctx.app.db.last_status_report("w").unwrap().is_none());
         // Paused, or running, its end is news to its parent.

@@ -452,6 +452,11 @@ pub enum TaskCommands {
         /// `[tasks] pr`: auto (a ready PR), draft, or ask first
         #[arg(long, value_enum)]
         pr: Option<crate::config::PrMode>,
+        /// The agent profile to start it as (`plete agents ls`): its
+        /// instructions follow the brief, and its settings are the task's
+        /// defaults
+        #[arg(long, value_name = "PROFILE")]
+        agent: Option<String>,
         #[command(flatten)]
         delegation: Box<Delegation>,
     },
@@ -603,6 +608,16 @@ pub enum TaskCommands {
         #[arg(short, long)]
         force: bool,
     },
+
+    /// The tree under the assistant
+    Tree {
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(flatten)]
+    Subtree(TreeCommands),
 }
 
 /// Where a new task sits in the tree, and what it is asked and allowed.
@@ -672,6 +687,26 @@ pub enum ManagerCommands {
         json: bool,
     },
 
+    /// The tree verbs, as on `plete task`.
+    #[command(flatten)]
+    Subtree(TreeCommands),
+
+    /// Start what waits on `[tasks] max_live`, while there is room (run
+    /// by plete when a task's session ends)
+    #[command(hide = true)]
+    Drain {
+        /// The task whose session is ending: wait a few seconds for it to
+        /// go first, as its own slot is the one to fill
+        #[arg(long, value_name = "TASK_ID")]
+        after: Option<String>,
+    },
+}
+
+/// Looking at and steering a task under the assistant and what is below
+/// it: `plete task show|grant|budget|pause|resume|stop`, and the same under
+/// `plete manager`.
+#[derive(Subcommand)]
+pub enum TreeCommands {
     /// A task under the assistant: its brief, grant, budget and children
     Show {
         #[arg(add = ArgValueCandidates::new(manager_candidates))]
@@ -724,16 +759,6 @@ pub enum ManagerCommands {
         /// Every task under the assistant (only the user)
         #[arg(long)]
         all: bool,
-    },
-
-    /// Start what waits on `[tasks] max_live`, while there is room (run
-    /// by plete when a task's session ends)
-    #[command(hide = true)]
-    Drain {
-        /// The task whose session is ending: wait a few seconds for it to
-        /// go first, as its own slot is the one to fill
-        #[arg(long, value_name = "TASK_ID")]
-        after: Option<String>,
     },
 }
 

@@ -592,8 +592,6 @@ fn path_from(output: &std::process::Output) -> std::path::PathBuf {
 /// What a child is granted unless something narrows it, by name.
 const EVERY_CAPABILITY: [&str; 25] = [
     "manager.create",
-    "manager.grant",
-    "manager.stop",
     "pr.comment",
     "pr.merge",
     "pr.review",
@@ -609,9 +607,11 @@ const EVERY_CAPABILITY: [&str; 25] = [
     "task.archive",
     "task.create",
     "task.delete",
+    "task.grant",
     "task.open",
     "task.resync",
     "task.send",
+    "task.stop",
     "task.unarchive",
     "watch.install",
     "worktree.add",
@@ -4230,6 +4230,154 @@ fn a_project_task_agent_gets_the_projects_arguments() {
     let argv = calls_of(&tmux, "new-session").pop().unwrap();
     let dash = argv.iter().position(|a| a == "--").unwrap();
     assert_eq!(argv[dash + 1..], ["aider", "--yes", "--verbose"]);
+}
+
+/// A task started as a profile has its defaults as it is made, and its
+/// model, MCP servers, environment, harness rules and skills at each start.
+#[test]
+fn a_task_started_as_a_profile_gets_what_the_profile_sets() {
+    let lab = StoreLab::new();
+    let home = lab.home();
+    std::fs::write(
+        home.join("config.toml"),
+        "scan_roots = []\n[assistant]\nallow = [\"worktree.add\", \"task.send\"]\n",
+    )
+    .unwrap();
+    let profile = home.join("agents/docs");
+    std::fs::create_dir_all(profile.join("skills/style")).unwrap();
+    std::fs::write(
+        profile.join("skills/style/SKILL.md"),
+        "---\nname: style\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        profile.join("AGENT.md"),
+        "+++\nmodel = \"opus\"\npr = \"ask\"\nskills = [\"style\", \"plete-planner\"]\n\
+         env = { DOCS_MODE = \"strict\" }\n[permissions]\nallow = [\"Bash(mdbook:*)\"]\n\
+         [mcp.servers.docs]\ncommand = \"docs-mcp\"\n+++\nKeep the docs in step.\n",
+    )
+    .unwrap();
+    let output = lab.plete_at(&["task", "new", "Docs", "--agent", "docs"], &home, &[]);
+    succeeded(&output);
+    let id = task_id(&path_from(&output));
+    let agent: String = lab
+        .index()
+        .query_row(
+            "SELECT agent FROM task_agents WHERE task_id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(agent, "docs");
+    let pr: String = lab
+        .index()
+        .query_row("SELECT pr FROM tasks WHERE id = ?1", [&id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pr, "ask");
+    // Under a parent, its grant and budget are the task's defaults; what
+    // the command line names wins.
+    std::fs::write(
+        home.join("agents/narrow.md"),
+        "+++\nallow = [\"worktree.add\"]\nbudget = \"1h,10turns\"\nmax_children = 2\n+++\n",
+    )
+    .unwrap();
+    let output = lab.plete_at(
+        &[
+            "task",
+            "new",
+            "n1",
+            "--parent",
+            "assistant",
+            "--agent",
+            "narrow",
+        ],
+        &home,
+        &[],
+    );
+    succeeded(&output);
+    let n1 = task_id(&path_from(&output));
+    assert_eq!(lab.grants_of(&n1), ["worktree.add"]);
+    assert_eq!(lab.budget_of(&n1), Some((Some(3600), Some(10))));
+    let fan: Option<i64> = lab
+        .index()
+        .query_row("SELECT max_children FROM tasks WHERE id = ?1", [&n1], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(fan, Some(2));
+    let output = lab.plete_at(
+        &[
+            "task",
+            "new",
+            "n2",
+            "--parent",
+            "assistant",
+            "--agent",
+            "narrow",
+            "--allow",
+            "task.send",
+            "--budget",
+            "30m",
+        ],
+        &home,
+        &[],
+    );
+    succeeded(&output);
+    let n2 = task_id(&path_from(&output));
+    assert_eq!(lab.grants_of(&n2), ["task.send"]);
+    assert_eq!(lab.budget_of(&n2), Some((Some(1800), None)));
+    // A profile there is none of is refused, and makes nothing.
+    let output = lab.plete_at(&["task", "new", "X", "--agent", "nope"], &home, &[]);
+    assert!(
+        stderr_of(&output).contains("no profile named nope"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!home.join("tasks/x").exists());
+
+    let scratch = TempDir::new().unwrap();
+    let tmux = stub_tmux(scratch.path());
+    let tmux_env = tmux.to_string_lossy().to_string();
+    let env = [("PLETE_TMUX", tmux_env.as_str()), ("PLETE_AGENT", "claude")];
+    succeeded(&lab.plete_at(&["task", "open", "docs"], &home, &env));
+    let argv = calls_of(&tmux, "new-session").pop().unwrap();
+    let after = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+    assert_eq!(after("--model"), "opus");
+    let mcp = std::fs::read_to_string(after("--mcp-config")).unwrap();
+    assert!(
+        mcp.contains("\"mcpServers\"") && mcp.contains("docs-mcp"),
+        "{mcp}"
+    );
+    assert!(argv.iter().any(|a| a == "DOCS_MODE=strict"), "{argv:?}");
+    let settings = std::fs::read_to_string(after("--settings")).unwrap();
+    assert!(settings.contains("Bash(mdbook:*)"), "{settings}");
+    let dir = home.join("tasks/docs/.claude/skills");
+    assert!(dir.join("style/SKILL.md").is_file());
+    assert!(std::fs::read_to_string(dir.join("plete-planner/SKILL.md"))
+        .unwrap()
+        .contains("name: plete-planner"));
+
+    // Broken since, it stops the start rather than run without it.
+    std::fs::write(profile.join("AGENT.md"), "+++\nmodle = 1\n+++\n").unwrap();
+    succeeded(&lab.plete_at(&["task", "new", "Other"], &home, &[]));
+    lab.index()
+        .execute(
+            "INSERT INTO task_agents (task_id, agent) SELECT id, 'docs' FROM tasks WHERE slug = 'other'",
+            [],
+        )
+        .unwrap();
+    let scratch = TempDir::new().unwrap();
+    let tmux = stub_tmux(scratch.path());
+    let tmux_env = tmux.to_string_lossy().to_string();
+    let env = [("PLETE_TMUX", tmux_env.as_str()), ("PLETE_AGENT", "claude")];
+    let output = lab.plete_at(&["task", "open", "other"], &home, &env);
+    assert!(!output.status.success(), "{}", stderr_of(&output));
+    assert!(calls_of(&tmux, "new-session").is_empty());
+    assert!(
+        stderr_of(&output).contains("profile docs"),
+        "{}",
+        stderr_of(&output)
+    );
 }
 
 /// A task in a project reaches the project's shared docs: its agent is
@@ -10903,10 +11051,10 @@ fn a_manager_makes_and_reaches_only_its_own_subtree() {
         (&["task", "send", "sib", "hi"], "never message each other"),
         (&["task", "last", "sib"], "plete task last"),
         (&["task", "archive", "sib", "--force"], "plete task archive"),
-        (&["manager", "show", "sib"], "plete manager show"),
+        (&["manager", "show", "sib"], "plete task show"),
         (
             &["manager", "grant", "sib", "worktree.add"],
-            "plete manager grant",
+            "plete task grant",
         ),
         (&["manager", "grant", "w", "task.send"], "`task.send`"),
     ] {
@@ -11213,7 +11361,7 @@ fn a_root_worker_reaches_only_itself_reads_included() {
         (&["task", "send", "sib", "hi"], "never message each other"),
         (
             &["manager", "grant", "sib", "task.send"],
-            "plete manager grant",
+            "plete task grant",
         ),
         (&["task", "last", "sib"], "plete task last"),
         (&["task", "path", "top"], "plete task path"),
@@ -12073,10 +12221,14 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         "plete task path",
         "plete task prs",
         "plete task last",
+        "plete task tree",
+        "plete task show",
         "plete worktree ls",
         "plete worktree path",
         "plete manager ls",
         "plete manager show",
+        "plete agents ls",
+        "plete agents show",
         "plete notify",
         "plete search",
         "plete task new",
@@ -12090,8 +12242,13 @@ fn a_manager_runs_its_own_subtree_and_nothing_else() {
         "gh pr comment",
         "gh issue comment",
         "plete manager new",
+        "plete task grant",
+        "plete task budget",
         "plete manager grant",
         "plete manager budget",
+        "plete task pause",
+        "plete task resume",
+        "plete task stop",
         "plete manager pause",
         "plete manager resume",
         "plete manager stop",
@@ -12700,7 +12857,7 @@ fn a_managers_run_state_holds_its_whole_subtree() {
     let output = lab.plete_at(&["task", "open", "w"], &lab.home(), &env);
     assert!(!output.status.success());
     assert!(
-        stderr_of(&output).contains("`plete manager resume api` first"),
+        stderr_of(&output).contains("`plete task resume api` first"),
         "{}",
         stderr_of(&output)
     );
@@ -14933,7 +15090,7 @@ fn the_user_pauses_resumes_and_stops_workers_under_the_assistant() {
     assert!(lab.reports_of(&w).is_empty(), "{:?}", lab.reports_of(&w));
     refused(
         lab.plete_at(&["task", "open", "w"], &lab.home(), &env),
-        "`plete manager resume w` first",
+        "`plete task resume w` first",
     );
     // A message for it while stopped waits, and starts it once resumed.
     let said = plete(&["task", "send", "w", "after the stop"]);
@@ -15173,7 +15330,7 @@ fn agents_tab_stops_after_a_confirm() {
     screen.type_keys(b"j");
     std::thread::sleep(std::time::Duration::from_millis(300));
     screen.type_keys(b"\r");
-    screen.wait_for_words("task w is stopped under manager api; `plete manager resume api` first");
+    screen.wait_for_words("task w is stopped under manager api; `plete task resume api` first");
     assert!(!stub.join("alive/plete-w").exists());
 
     // Pausing a stopped manager keeps it stopped.
@@ -15222,7 +15379,7 @@ fn agents_tab_refuses_the_assistant_for_pause() {
     screen.type_keys(b"\t");
     screen.wait_for_text("└─ w");
     screen.type_keys(b"z");
-    screen.wait_for_words("`plete manager pause` is for a task under the assistant");
+    screen.wait_for_words("`plete task pause` is for a task under the assistant");
     assert_eq!(lab.run_state_of(&w), ("run".into(), None));
 
     screen.esc();
@@ -15701,7 +15858,7 @@ fn a_worker_that_uses_its_turns_up_is_paused_and_blocked_on_budget() {
     let output = lab.plete_at(&["manager", "resume", "w"], &lab.home(), &env);
     assert!(!output.status.success());
     assert!(
-        stderr_of(&output).contains("raise it with `plete manager budget` first"),
+        stderr_of(&output).contains("raise it with `plete task budget` first"),
         "{}",
         stderr_of(&output)
     );
