@@ -205,12 +205,12 @@ pub fn go_targets(
     away: Option<&Path>,
 ) -> Vec<GoTarget> {
     let mut targets = Vec::new();
-    // On the task's own directory with nowhere to return to, `r` would be `t`
-    // again.
+    // With nowhere to return to, a folder that is no worktree is the task's
+    // or the project's own, and `r` would only be `t` or `p` again.
     let root_target = match away {
         Some(worktree) => Some(("worktree root", worktree)),
-        None if task_dir == Some(root) => None,
         None if has_repo => Some(("worktree root", root)),
+        None if task_dir.is_some() || project.is_some() => None,
         None => Some(("root", root)),
     };
     if let Some((name, path)) = root_target {
@@ -356,6 +356,11 @@ pub struct Explorer {
     /// The repository and worktree root the explorer left to browse the
     /// task's or project's directory, which `r` in ctrl-t returns to.
     pub away_from: Option<(RepoRecord, PathBuf)>,
+    /// A folder inside the task the explorer last left for somewhere outside
+    /// it (the project's settings folder), so the menu can still find the
+    /// task from there. The away worktree does this when there is one; a
+    /// canvas opened on its own has none.
+    pub left_task: Option<PathBuf>,
 }
 
 /// Two presses on the same cell inside this window are one double-click.
@@ -404,6 +409,7 @@ impl Explorer {
             review_job: None,
             back: None,
             away_from: None,
+            left_task: None,
         };
         explorer.set_root(explorer.root.clone())?;
         if cwd != explorer.root {

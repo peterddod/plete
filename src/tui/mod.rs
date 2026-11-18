@@ -848,6 +848,10 @@ fn open_go_to(app: &App, explorer: &mut Explorer) {
         .or_else(|| {
             let (_, worktree) = explorer.away_from.as_ref()?;
             crate::tasks::task_at(app, worktree).ok().flatten()
+        })
+        .or_else(|| {
+            let left = explorer.left_task.as_ref()?;
+            crate::tasks::task_at(app, left).ok().flatten()
         });
     let task_dir = task
         .as_ref()
@@ -913,8 +917,18 @@ fn go_to_place(app: &App, explorer: &mut Explorer, target: &GoTarget) -> Result<
                 .repo
                 .clone()
                 .map(|repo| (repo, explorer.root.clone()));
+            // Leaving the task for its project: keep a way to find the task
+            // again, which the project's folder cannot give.
+            let in_task = crate::tasks::task_at(app, &explorer.root)
+                .ok()
+                .flatten()
+                .is_some();
+            let from = explorer.root.clone();
             let kind = (kind == GoKind::Project).then_some("project");
             reroot(app, explorer, path, None, kind)?;
+            if in_task {
+                explorer.left_task = Some(from);
+            }
             if left.is_some() {
                 explorer.away_from = left;
             }
@@ -1690,8 +1704,8 @@ mod tests {
         targets.iter().map(|t| t.key).collect()
     }
 
-    #[test]
-    fn going_to_the_task_root_the_project_and_back_to_the_worktree() {
+    /// A temp home holding task `fix`, with worktree `api` and project `web`.
+    fn task_home() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().canonicalize().unwrap();
         let app = App {
@@ -1724,6 +1738,13 @@ mod tests {
         let project_dir = crate::projects::dir(&app, "web").unwrap();
         std::fs::create_dir_all(&project_dir).unwrap();
 
+        (dir, app, task_dir, worktree)
+    }
+
+    #[test]
+    fn going_to_the_task_root_the_project_and_back_to_the_worktree() {
+        let (_dir, app, task_dir, worktree) = task_home();
+        let project_dir = crate::projects::dir(&app, "web").unwrap();
         let repo = RepoRecord {
             id: "github.com/acme/api".into(),
             trunk_path: worktree.to_string_lossy().to_string(),
@@ -1758,5 +1779,26 @@ mod tests {
         assert!(explorer.repo.is_some());
         assert_eq!((&explorer.root, &explorer.cwd), (&worktree, &worktree));
         assert!(explorer.away_from.is_none());
+    }
+
+    /// Opened on the task's canvas, with no worktree to remember, the menu
+    /// still finds the task from the project's folder.
+    #[test]
+    fn the_task_stays_reachable_from_its_project() {
+        let (_dir, app, task_dir, _worktree) = task_home();
+        let mut explorer = Explorer::new(
+            None,
+            task_dir.clone(),
+            "fix".into(),
+            "task canvas".into(),
+            WorktreeStatus::default(),
+            task_dir.clone(),
+        )
+        .unwrap();
+        assert_eq!(keys(&menu(&app, &mut explorer)), "tp");
+        go(&app, &mut explorer, 'p');
+        assert_eq!(keys(&menu(&app, &mut explorer)), "tp");
+        go(&app, &mut explorer, 't');
+        assert_eq!(explorer.root, task_dir);
     }
 }
