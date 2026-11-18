@@ -1512,8 +1512,9 @@ action = "review"
 
 It opens nothing: the notification carries `plete review open|diff|explore
 <review>`. It asks GitHub about the PR first, and reviews it when you are
-asked directly, or when a team is (GitHub told you of it, so you are on that
-team; membership is not looked up). A PR that is a draft, closed, your own, or
+asked directly, or when a team is: for a team request plete goes by GitHub's notification
+and a team request still pending on the PR, without looking up team
+membership, so limit the rule with `repos` if that is too broad. A PR that is a draft, closed, your own, or
 whose request has been withdrawn or answered gets the ordinary notification
 instead. A review is asked once per PR head, so a poll that sees the same
 request again does nothing, and a new commit asks again; it keeps

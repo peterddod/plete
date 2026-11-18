@@ -406,6 +406,8 @@ impl Source for Gh<'_> {
 #[derive(Debug, Default)]
 pub struct Polled {
     pub events: Vec<Event>,
+    /// Notifications were asked for.
+    pub asked: bool,
     pub errors: Vec<String>,
     /// The PRs' checks and the projects were polled too, not only the
     /// notifications.
@@ -428,6 +430,21 @@ fn passed(since: Option<i64>, now: i64, interval: u64) -> bool {
     }
 }
 
+/// Whether notification `n`, new since last seen, is one the user's PRs'
+/// checks must be fresh to tell of: CI, or a PR's state change.
+fn needs_checks(state: &WatchState, n: &Notification, watched: &dyn Fn(&str) -> bool) -> bool {
+    let Some(seen) = &state.seen else {
+        return false;
+    };
+    if seen.get(&n.id) == Some(&n.updated_at) || !watched(&n.repository.full_name) {
+        return false;
+    }
+    matches!(
+        read_reason(&n.reason, &n.subject.kind, &n.subject.title),
+        Reading::Kind(EventKind::CiFailed | EventKind::CiPassed) | Reading::StateChange
+    )
+}
+
 /// Whether the PRs' checks and the projects are due: `interval_secs` has
 /// passed since they were last polled.
 fn broad_due(watch: &WatchConfig, state: &WatchState, now: i64) -> bool {
@@ -448,12 +465,22 @@ fn notifications_due(watch: &WatchConfig, state: &WatchState, now: i64) -> bool 
 /// source that fails keeps what it had, and is asked again next time.
 pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, now: i64) -> Polled {
     let mut out = Polled::default();
-    let broad = broad_due(watch, state, now);
-    let notifications = notifications_due(watch, state, now);
-    // A source that failed is asked again on the next tick.
-    let mut broad_failed = false;
     let watched =
         |repo: &str| watch.repos.is_empty() || watch.repos.iter().any(|p| repo_matches(p, repo));
+
+    // Notifications are fetched first, and told of after the checks. A CI
+    // or state-change notification is for the checks to tell of when the PR
+    // is the user's, and the checks may be stale: a PR opened since they
+    // were polled would be told of twice. So such a notification brings the
+    // checks forward.
+    let fetched = notifications_due(watch, state, now).then(|| {
+        state.notifications_at = Some(now);
+        source.notifications(state.last_modified.as_deref())
+    });
+    out.asked = fetched.is_some();
+    let broad = broad_due(watch, state, now)
+        || matches!(&fetched, Some(Ok(Notifications::Changed { threads, .. }))
+            if threads.iter().any(|n| needs_checks(state, n, &watched)));
 
     // Checks first: a merge or close of one of the user's own PRs is told
     // from these, and not again from its notification.
@@ -485,17 +512,11 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
                 }
                 state.checks = Some(checks);
             }
-            Err(e) => {
-                broad_failed = true;
-                out.errors.push(format!("your pull requests: {e:#}"))
-            }
+            Err(e) => out.errors.push(format!("your pull requests: {e:#}")),
         }
     }
 
-    if notifications {
-        state.notifications_at = Some(now);
-    }
-    match notifications.then(|| source.notifications(state.last_modified.as_deref())) {
+    match fetched {
         None => {}
         Some(Ok(Notifications::NotModified { poll_interval })) => {
             state.poll_interval = poll_interval.or(state.poll_interval);
@@ -570,7 +591,6 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
                 projects.insert(key, seen);
             }
             Err(e) => {
-                broad_failed = true;
                 out.errors.push(format!("project {key}: {e:#}"));
                 if let Some(before) = state.projects.remove(&key) {
                     projects.insert(key, before);
@@ -580,7 +600,9 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
     }
     if broad {
         state.projects = projects;
-        state.broad_at = Some(now).filter(|_| !broad_failed);
+        // Stamped whether or not a source failed: a failing one is asked
+        // again after `interval_secs`, not on every tick.
+        state.broad_at = Some(now);
     }
     out.broad = broad;
 
@@ -1620,6 +1642,16 @@ pub fn run_once(app: &App) -> Result<()> {
     // A tick that found nothing and polled no more is not worth a log line.
     if !sent.is_empty() || polled.broad {
         eprintln!("plete: {}", summary(&sent));
+    } else if !polled.asked {
+        // Not under the timer, whose tick is when notifications fall due
+        // (unless GitHub asks for longer).
+        eprintln!(
+            "plete: nothing is due yet (notifications every {}s, the rest every {}s)",
+            watch
+                .notifications_interval_secs()
+                .max(state.poll_interval.unwrap_or(0)),
+            watch.interval_secs()
+        );
     }
     if polled.errors.is_empty() {
         return Ok(());
@@ -2095,6 +2127,8 @@ mod tests {
         pulls: BTreeMap<String, PullState>,
         items: RefCell<Vec<Vec<serde_json::Value>>>,
         asked_since: RefCell<Vec<Option<String>>>,
+        prs_asked: std::cell::Cell<usize>,
+        items_asked: std::cell::Cell<usize>,
     }
 
     impl Source for Fake {
@@ -2110,6 +2144,7 @@ mod tests {
             }
         }
         fn my_open_prs(&self) -> Result<Vec<MyPr>> {
+            self.prs_asked.set(self.prs_asked.get() + 1);
             Ok(self.prs.borrow_mut().pop().unwrap_or_default())
         }
         fn pull_state(&self, repo: &str, number: u64) -> Result<PullState> {
@@ -2119,6 +2154,7 @@ mod tests {
                 .context("no such pull request")
         }
         fn project_items(&self, _: &str, _: u64) -> Result<Vec<serde_json::Value>> {
+            self.items_asked.set(self.items_asked.get() + 1);
             Ok(self.items.borrow_mut().pop().unwrap_or_default())
         }
     }
@@ -2261,7 +2297,7 @@ mod tests {
     #[test]
     fn a_tick_inside_the_interval_asks_only_for_notifications() {
         let fake = Fake::default();
-        // The PRs would say the one open PR is gone, if asked.
+        // Asked, the fake would say the one open PR is gone.
         let watch = WatchConfig {
             projects: vec![ProjectRef {
                 owner: "acme".into(),
@@ -2275,7 +2311,7 @@ mod tests {
         let polled = poll(&fake, &watch, &mut state, 1060);
         assert!(!polled.broad);
         assert_eq!(fake.asked_since.borrow().len(), 1);
-        assert_eq!(fake.prs.borrow().len(), 0);
+        assert_eq!((fake.prs_asked.get(), fake.items_asked.get()), (0, 0));
         assert_eq!(state.checks, before.checks);
         assert_eq!(state.projects, before.projects);
         assert_eq!(state.broad_at, Some(1000));
@@ -2284,9 +2320,11 @@ mod tests {
         let polled = poll(&fake, &watch, &mut state, 1070);
         assert!(!polled.broad && polled.events.is_empty());
         assert_eq!(fake.asked_since.borrow().len(), 1);
+        assert_eq!((fake.prs_asked.get(), fake.items_asked.get()), (0, 0));
         // At 120 s everything is due again.
         let polled = poll(&fake, &watch, &mut state, 1120);
         assert!(polled.broad);
+        assert_eq!((fake.prs_asked.get(), fake.items_asked.get()), (1, 1));
         assert_eq!(state.broad_at, Some(1120));
         assert_eq!(fake.asked_since.borrow().len(), 2);
     }
@@ -2299,6 +2337,38 @@ mod tests {
         assert_eq!(fake.asked_since.borrow().len(), 1);
         poll(&fake, &WatchConfig::default(), &mut state, 1060);
         assert_eq!(fake.asked_since.borrow().len(), 1, "4 s after is too soon");
+        assert_eq!(fake.prs_asked.get(), 0);
+    }
+
+    /// CI on a PR opened since the checks were last polled is told once:
+    /// the notification brings the checks forward, and they tell of it.
+    #[test]
+    fn a_ci_notification_for_a_new_own_pr_is_told_once() {
+        let fake = Fake::default();
+        fake.prs
+            .borrow_mut()
+            .push(vec![pr("acme/api", 2, "b", Some("FAILURE"))]);
+        let threads = github::parse_notifications(
+            r#"[{"id":"500","reason":"ci_activity","updated_at":"2026-10-10T12:30:00Z",
+            "subject":{"title":"CI workflow run failed for branch-2 branch","type":"CheckSuite"},
+            "repository":{"full_name":"acme/api","html_url":"https://github.com/acme/api"}}]"#,
+        )
+        .unwrap();
+        fake.notifications
+            .borrow_mut()
+            .push(Ok(Notifications::Changed {
+                last_modified: None,
+                threads,
+                poll_interval: None,
+            }));
+        let mut state = state_polled_at(1000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1060);
+        assert!(polled.broad);
+        assert_eq!(fake.prs_asked.get(), 1);
+        assert_eq!(kinds(&polled.events), [(EventKind::CiFailed, Some(2))]);
+        // The next broad tick has nothing more to say of it.
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1180);
+        assert!(polled.events.is_empty(), "{:?}", polled.events);
     }
 
     #[test]
