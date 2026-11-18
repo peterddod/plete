@@ -20,6 +20,7 @@ plete was called jeet. The `jeet` command still works as an alias of the same bi
 - `plete alias install` makes `pt` a short name for plete, in `~/.local/bin` or `~/bin`. Nothing creates it on its own, and it never replaces another `pt`.
 - `plete doctor` lists what is still under the old name (old launchd jobs, `jeet-*` tmux sessions, `.jeet/` markers, the line in your shell rc).
 - `JEET_*` environment variables are read as `PLETE_*` still, and plete sets both for the processes it starts.
+- Installed from the tap as jeet? `brew update` follows the tap to `peterddod/plete`, and Homebrew does not trust a renamed tap until you say so: run `brew trust peterddod/plete`, then `brew upgrade` replaces jeet with plete (keeping the `jeet` link).
 
 ## Install
 
