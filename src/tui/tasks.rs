@@ -417,8 +417,8 @@ pub struct NewTaskForm {
     /// What `--parent` would name (`assistant`, or the node's id) and how
     /// the node is shown; `None` for a top-level task.
     pub parent: Option<(String, String)>,
-    /// Work or Manager, under a node.
-    pub kind: TaskKind,
+    /// Started as the planner profile, under a node.
+    pub planner: bool,
     pub name: String,
     /// What a blank name becomes.
     pub default_name: String,
@@ -452,7 +452,8 @@ pub struct TaskSpec {
 pub struct ChildSpec {
     /// `assistant`, or the node's id.
     pub parent: String,
-    pub kind: TaskKind,
+    /// Started as the planner profile, at once.
+    pub planner: bool,
     pub name: String,
     pub goal: Option<String>,
     pub done: Option<String>,
@@ -488,7 +489,7 @@ impl NewTaskForm {
         NewTaskForm {
             field: Field::Name,
             parent: None,
-            kind: TaskKind::Work,
+            planner: false,
             name: String::new(),
             default_name,
             goal: String::new(),
@@ -513,14 +514,12 @@ impl NewTaskForm {
         }
     }
 
-    /// The fields shown, in order: a manager has a project but no worktrees
-    /// (`manager new` takes none).
+    /// The fields shown, in order.
     pub fn fields(&self) -> &'static [Field] {
         use Field::*;
-        match (&self.parent, self.kind) {
-            (None, _) => &[Name, Project, Repos, Branch],
-            (Some(_), TaskKind::Manager) => &[Kind, Name, Goal, Done, Budget, Allow, Project],
-            (Some(_), _) => &[
+        match &self.parent {
+            None => &[Name, Project, Repos, Branch],
+            Some(_) => &[
                 Kind, Name, Goal, Done, Budget, Allow, Project, Repos, Branch,
             ],
         }
@@ -546,12 +545,9 @@ impl NewTaskForm {
         }
     }
 
-    /// A task, or a manager, under a node.
+    /// A task, or a planner, under a node.
     fn toggle_kind(&mut self) {
-        self.kind = match self.kind {
-            TaskKind::Manager => TaskKind::Work,
-            _ => TaskKind::Manager,
-        };
+        self.planner = !self.planner;
     }
 
     pub fn project_name(&self) -> Option<&str> {
@@ -598,17 +594,7 @@ impl NewTaskForm {
         let Some((parent, _)) = &self.parent else {
             return Err("a task under a node needs its parent".into());
         };
-        let task = match self.kind {
-            // A manager shows a project but no repos or branch, so only
-            // the project can say what it takes.
-            TaskKind::Manager => TaskSpec {
-                name: self.name_or_default(),
-                project: self.project_name().map(str::to_string),
-                repos: Vec::new(),
-                branch: None,
-            },
-            _ => self.spec()?,
-        };
+        let task = self.spec()?;
         let text = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
         let parts = |s: &str| {
             s.split(',')
@@ -633,7 +619,7 @@ impl NewTaskForm {
         };
         Ok(ChildSpec {
             parent: parent.clone(),
-            kind: self.kind,
+            planner: self.planner,
             name: task.name,
             goal: text(&self.goal),
             done: text(&self.done),
@@ -890,7 +876,7 @@ pub enum Action {
         parent_id: String,
     },
     /// Make, as the user, the task or manager the form describes under its
-    /// node; a manager starts at once (Q17).
+    /// node; a planner starts at once (Q17).
     CreateChild(ChildSpec),
     /// With tasks under it, `a` archives them all, leaves first, once
     /// confirmed: `recursive` says the confirm was for them all.
@@ -5002,9 +4988,9 @@ impl Screen<'_> {
         Ok(())
     }
 
-    /// `n` in the agents view: make the task or manager `spec` describes,
+    /// `n` in the agents view: make the task or planner `spec` describes,
     /// as `plete task new --parent` and `plete manager new` make it, as the
-    /// user: `plan_child`, then `create`, then, for a manager, its start
+    /// user: `plan_child`, then `create`, then, for a planner, its start
     /// (Q17). A worker is not started, as `n` in the active view does not
     /// start one. What `plan_child` refuses stays on the form.
     /// Record task `id`, just made here, as the user's, when this screen
@@ -5024,15 +5010,30 @@ impl Screen<'_> {
     fn create_child(&mut self, spec: ChildSpec) {
         let app = self.app;
         let user = Caller::User;
-        let d = spec.delegation();
-        let plan = match tasks::plan_child(app, &user, spec.kind, &spec.name, &d, None) {
-            Ok(plan) => plan,
-            Err(e) => {
-                if let Some(Panel::NewTask(form)) = &mut self.ui.panel {
-                    form.error = Some(printable(&format!("{e:#}")));
-                }
-                return;
+        let refused = |ui: &mut TasksUi, e: anyhow::Error| {
+            if let Some(Panel::NewTask(form)) = &mut ui.panel {
+                form.error = Some(printable(&format!("{e:#}")));
             }
+        };
+        let d = spec.delegation();
+        // A planner as `plete manager new` makes one: the planner
+        // profile's settings, and a manager's grant if it names none.
+        let planned = match spec.planner {
+            true if d.goal.is_none() => Err(anyhow::anyhow!(
+                "a planner needs a goal: it is what it works towards"
+            )),
+            true => commands::manager::as_planner(app, &d, spec.project.as_deref())
+                .map(|(d, max, profile)| (d, max, Some(profile))),
+            false => Ok((d, None, None)),
+        };
+        let (d, max_children, profile) = match planned {
+            Ok(planned) => planned,
+            Err(e) => return refused(&mut self.ui, e),
+        };
+        let plan = match tasks::plan_child(app, &user, TaskKind::Work, &spec.name, &d, max_children)
+        {
+            Ok(plan) => plan,
+            Err(e) => return refused(&mut self.ui, e),
         };
         let label = match spec.repos.len() + usize::from(spec.project.is_some()) {
             0 => format!("creating {}", spec.name),
@@ -5068,6 +5069,19 @@ impl Screen<'_> {
         self.started_by_user(&created.task.id);
         self.ui.panel = None;
         let task = created.task;
+        let mut warnings = created.warnings;
+        if let Some(profile) = &profile {
+            let recorded = app
+                .db
+                .set_task_agent(&task.id, &profile.name)
+                .and_then(|()| match profile.settings.pr {
+                    Some(pr) => app.db.set_task_pr(&task.id, Some(pr)),
+                    None => Ok(()),
+                });
+            if let Err(e) = recorded {
+                warnings.push(format!("{e:#}"));
+            }
+        }
         let under = match self.ui.node(spec.parent.as_str()) {
             Some(row) => manager::label(&row.task),
             None => match spec.parent.as_str() {
@@ -5075,11 +5089,10 @@ impl Screen<'_> {
                 id => format!("task {id}"),
             },
         };
-        let mut warnings = created.warnings;
-        let made = match task.kind {
-            // A manager has only its brief to work towards: it starts now,
+        let made = match profile {
+            // A planner has only its brief to work towards: it starts now,
             // or queued or held, as `plete manager new` starts it (M35).
-            TaskKind::Manager => {
+            Some(_) => {
                 let started = self
                     .progress(&format!("starting {}", task.slug), || {
                         commands::task::start(app, &task, &manager::first_prompt(app, &task)?)
@@ -5095,9 +5108,9 @@ impl Screen<'_> {
                     }
                     Err(e) => format!("{e:#}"),
                 };
-                format!("made manager {} under {under} · {how}", task.slug)
+                format!("made planner {} under {under} · {how}", task.slug)
             }
-            _ => format!("made {} under {under} — ⏎ starts its agent", task.slug),
+            None => format!("made {} under {under} — ⏎ starts its agent", task.slug),
         };
         self.refresh(false);
         // The new node shows, under its parent opened, with the cursor on it.
@@ -8473,10 +8486,13 @@ mod tests {
             [Kind, Name, Goal, Done, Budget, Allow, Project, Repos, Branch]
         );
         f.toggle_kind();
-        assert_eq!(f.kind, TaskKind::Manager);
-        // `manager new` takes a project but no worktrees.
-        assert_eq!(f.fields(), [Kind, Name, Goal, Done, Budget, Allow, Project]);
-        f.field = Project;
+        assert!(f.planner);
+        // A planner is a task: it takes worktrees too.
+        assert_eq!(
+            f.fields(),
+            [Kind, Name, Goal, Done, Budget, Allow, Project, Repos, Branch]
+        );
+        f.field = Branch;
         assert_eq!(f.step(1), Kind);
         assert_eq!(form().fields(), [Name, Project, Repos, Branch]);
     }
@@ -8485,7 +8501,7 @@ mod tests {
     fn the_form_under_a_node_is_filled_in_from_the_keyboard() {
         let mut ui = agents_sample();
         ui.panel = Some(Panel::NewTask(Box::new(child_form())));
-        press(&mut ui, KeyCode::Char(' ')); // a manager
+        press(&mut ui, KeyCode::Char(' ')); // a planner
         press(&mut ui, KeyCode::Tab);
         type_text(&mut ui, "sub");
         press(&mut ui, KeyCode::Tab);
@@ -8496,9 +8512,10 @@ mod tests {
         type_text(&mut ui, "2h, 40turns");
         press(&mut ui, KeyCode::Tab);
         type_text(&mut ui, "task.create,task.open");
-        // A manager's fields wrap round after the project: no repos or branch.
-        press(&mut ui, KeyCode::Tab);
-        press(&mut ui, KeyCode::Tab);
+        // Past the project, the repos and the branch, round to the kind.
+        for _ in 0..4 {
+            press(&mut ui, KeyCode::Tab);
+        }
         match &ui.panel {
             Some(Panel::NewTask(f)) => assert_eq!(f.field, Field::Kind),
             other => panic!("{other:?}"),
@@ -8507,7 +8524,7 @@ mod tests {
             press(&mut ui, KeyCode::Enter),
             Some(Action::CreateChild(ChildSpec {
                 parent: "m".into(),
-                kind: TaskKind::Manager,
+                planner: true,
                 name: "sub".into(),
                 goal: Some("ship v2".into()),
                 done: Some("it is out".into()),
@@ -8553,18 +8570,8 @@ mod tests {
         assert_eq!((&spec.goal, &spec.allow), (&None, &None));
         assert!(spec.budget.is_empty());
         assert_eq!(spec.repos, ["github.com/acme/api"]);
-        assert_eq!(spec.kind, TaskKind::Work);
+        assert!(!spec.planner);
         assert_eq!(spec.delegation().parent.as_deref(), Some("m"));
-    }
-
-    #[test]
-    fn a_manager_ignores_the_fields_it_hides() {
-        let mut f = child_form();
-        f.branch = "feat".into();
-        f.toggle_kind();
-        let spec = f.child_spec().unwrap();
-        assert_eq!(spec.kind, TaskKind::Manager);
-        assert!(spec.repos.is_empty());
     }
 
     #[test]

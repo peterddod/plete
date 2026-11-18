@@ -97,10 +97,7 @@ pub fn new(app: &App, args: &NewManager) -> Result<()> {
     if d.parent.is_none() && caller == Caller::User {
         d.parent = Some(crate::assistant::SLUG.to_string());
     }
-    let profile = profiles::find(app, PLANNER, args.project)?;
-    // A manager's grant, unasked, as before: `[managers] manager_default`.
-    d.manager_grant = profile.settings.allow.is_none();
-    let (d, max_children) = super::task::with_profile(&d, Some(&profile))?;
+    let (d, max_children, profile) = as_planner(app, &d, args.project)?;
     let flags = super::task::notify_flags(app, &caller, &d)?;
     let plan = tasks::plan_child(
         app,
@@ -146,16 +143,27 @@ pub fn new(app: &App, args: &NewManager) -> Result<()> {
         }
     }
     println!("{}", dir.display());
-    let prompt = format!(
-        "You are task `{}`, started as a planner. Read your brief, then plan your area of \
-         work and delegate it to tasks under you.",
-        manager::fence::fenced(&path)
-    );
-    start_new(app, &task, &prompt)
+    start_new(app, &task, &manager::first_prompt(app, &task)?)
 }
 
-/// The profile `plete manager new` starts a task as.
-const PLANNER: &str = "planner";
+/// The profile a planner is started as.
+pub const PLANNER: &str = "planner";
+
+/// `d` as a planner takes it, from `project` if named: the planner
+/// profile's settings and, when the profile names no grant, a manager's
+/// (`[managers] manager_default`), as a manager had. With the most
+/// children it may have, if the profile says.
+pub(crate) fn as_planner(
+    app: &App,
+    d: &Delegation,
+    project: Option<&str>,
+) -> Result<(Delegation, Option<u32>, profiles::Profile)> {
+    let profile = profiles::find(app, PLANNER, project)?;
+    let mut d = d.clone();
+    d.manager_grant = profile.settings.allow.is_none();
+    let (d, max_children) = super::task::with_profile(&d, Some(&profile))?;
+    Ok((d, max_children, profile))
+}
 
 /// The text of `--brief-file`: a regular file, read no further than a
 /// brief may be long. An agent's command is pre-approved and its brief

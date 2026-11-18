@@ -722,13 +722,13 @@ index every two seconds while the tab is shown.
 | `b` | its brief, grant, what it may do (and who cut the rest), budget, run state and the tasks under it, as `plete task show` |
 | `z` / `Z` | pause the node and everything below it / let it run again, as `plete task pause` / `resume` |
 | `x` | stop the node and everything below it, as `plete task stop`, after a confirm listing what runs; on the assistant, every task under it (`--all`) |
-| `n` | a new task under the assistant or any task under it, as `plete task new --parent`: its kind (`space`; ‹manager› is still offered for now and goes in the next release), name, goal, done, budget (`2h,40turns`) and allow (capabilities, comma-separated); a task takes a project, repositories and a branch (left on "no project", a task under a task with a project gets that project) |
+| `n` | a new task under the assistant or any task under it, as `plete task new --parent`: its kind (`space`: ‹task›, or ‹planner›, started as the `planner` profile as `plete manager new` makes it), name, goal, done, budget (`2h,40turns`) and allow (capabilities, comma-separated); a task takes a project, repositories and a branch (left on "no project", a task under a task with a project gets that project) |
 | `y` | answer the open question at the node or nearest below it, one passed to you first, as `plete report answer` does: type the answer, `⏎` sends it, `esc` cancels |
 | `c` `C` `t` `i` | the assistant, as in the active tab: `i` is its inbox, not the node's reports (`I`) |
 
 What each node made of a pause, resume or stop is shown when it is done. A
 task made with `n` is not started (`⏎` starts it), as in the active tab;
-only a manager-kind one starts at once, and the status line says whether it
+only a planner (which needs a goal) starts at once, and the status line says whether it
 started, was queued on `max_live` or is held by a paused task above it. What plete refuses (a capability
 the parent does not hold) is shown on the form. `l`, `I` and `b` show what
 agents wrote, unfenced, and `z`, `Z`, `x`, `n` and `y` act as you, so they
@@ -1780,8 +1780,8 @@ Any task can have tasks under it, agent profiles, and managers retired.
   watch rules find planner tasks.
 - **`plete manager …` is deprecated.** `manager new` makes a planner task,
   `manager ls` is `task tree`, and the rest are the `task` verbs; each
-  prints a deprecation line and they go in the next release, with the
-  new-task form's ‹manager› kind.
+  prints a deprecation line and they go in the next release. The new-task
+  form (`n` in the agents tab) offers ‹planner› where it offered ‹manager›.
 
 ## What's new in v0.16
 

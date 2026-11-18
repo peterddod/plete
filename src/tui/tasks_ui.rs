@@ -150,7 +150,7 @@ pub const HELP_AGENTS: &[(&str, &str)] = &[
     ),
     (
         "n",
-        "a task or manager under the assistant or a manager; a manager starts at once",
+        "a task or planner under the assistant or a task; a planner starts at once",
     ),
     (
         "y",
@@ -2524,19 +2524,19 @@ fn new_task_lines(form: &NewTaskForm) -> Vec<Line<'static>> {
             dim(hint),
         ])
     };
-    let manager = form.kind == TaskKind::Manager;
+    let planner = form.planner;
     let mut lines = Vec::new();
     for &field in form.fields() {
         let focused = focus == field;
         match field {
             Field::Kind => lines.push(choice(
                 "kind",
-                match manager {
-                    true => "‹ manager ›".to_string(),
+                match planner {
+                    true => "‹ planner ›".to_string(),
                     false => "‹ task ›".to_string(),
                 },
                 field,
-                match manager {
+                match planner {
                     true => "  space switches · starts at once with its brief",
                     false => "  space switches · ⏎ on it later starts its agent",
                 },
@@ -2551,7 +2551,7 @@ fn new_task_lines(form: &NewTaskForm) -> Vec<Line<'static>> {
                 "goal",
                 &form.goal,
                 focused,
-                match manager {
+                match planner {
                     true => "what it works towards (needed)",
                     false => "what its parent wants of it",
                 },
@@ -3245,7 +3245,7 @@ mod tests {
     }
 
     #[test]
-    fn the_form_under_a_node_shows_a_managers_fields_or_a_workers() {
+    fn the_form_under_a_node_shows_a_planner_or_a_worker() {
         let mut ui = agents_ui();
         ui.view = View::Agents;
         ui.set_rows(ui.rows.clone());
@@ -3270,26 +3270,22 @@ mod tests {
         ] {
             assert!(worker.contains(want), "{want}: {worker}");
         }
-        form.kind = TaskKind::Manager;
-        form.error =
-            Some("a manager needs --goal or --brief-file: it is what it works towards".into());
+        form.planner = true;
+        form.error = Some("a planner needs a goal: it is what it works towards".into());
         ui.panel = Some(Panel::NewTask(Box::new(form)));
-        let manager = render(&mut ui, 70, 30).join("\n");
+        let planner = render(&mut ui, 100, 30).join("\n");
         for want in [
-            "‹ manager ›",
+            "‹ planner ›",
             "goal",
             "done",
             "budget",
             "allow",
             "project ",
-            "a manager needs --goal",
+            "repos",
+            "a planner needs a goal",
             "esc cancel",
         ] {
-            assert!(manager.contains(want), "{want}: {manager}");
-        }
-        // The tab bar has "projects", so the field is told by what follows it.
-        for unwanted in ["repos", "branch"] {
-            assert!(!manager.contains(unwanted), "{unwanted}: {manager}");
+            assert!(planner.contains(want), "{want}: {planner}");
         }
     }
 

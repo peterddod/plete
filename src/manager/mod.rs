@@ -300,12 +300,13 @@ pub fn write_briefs(app: &App, nodes: &[TaskRecord]) {
     }
 }
 
-/// What manager `node` is started with (M35): where it sits, and to read
-/// its brief. The brief itself is in `BRIEF.md` and its session context,
-/// not on its command line.
+/// What planner `node` is started with (M35): where it sits, and to read
+/// its brief. The brief itself is in its session context, not on its
+/// command line.
 pub fn first_prompt(app: &App, node: &TaskRecord) -> Result<String> {
     Ok(format!(
-        "You are manager `{}`. Read BRIEF.md, then plan and delegate.",
+        "You are task `{}`, started as a planner. Read your brief, then plan your area of \
+         work and delegate it to tasks under you.",
         fence::fenced(&tree_path(app, node)?)
     ))
 }
@@ -892,7 +893,8 @@ mod tests {
 
         assert_eq!(
             first_prompt(&app, &api).unwrap(),
-            "You are manager `assistant/api`. Read BRIEF.md, then plan and delegate."
+            "You are task `assistant/api`, started as a planner. Read your brief, then plan \
+             your area of work and delegate it to tasks under you."
         );
     }
 
