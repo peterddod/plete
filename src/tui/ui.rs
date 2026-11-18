@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::keys::{self, Hint};
 use super::state::{
-    human_size, DiffCount, DiffMap, Explorer, Overlay, PendingAction, PrLookup, Row,
+    fuzzy_match, human_size, DiffCount, DiffMap, Explorer, Overlay, PendingAction, PrLookup, Row,
 };
 use crate::github::{PendingReview, PullRequest, Verdict};
 use crate::review::JobState;
@@ -653,6 +653,11 @@ fn draw_overlay(frame: &mut Frame, explorer: &Explorer, overlay: &Overlay) {
                 );
             frame.render_stateful_widget(list, area, &mut state);
         }
+        Overlay::Find {
+            query,
+            selected,
+            results,
+        } => draw_find(frame, explorer, query, *selected, results),
         Overlay::Confirm {
             title,
             lines,
@@ -938,6 +943,92 @@ fn draw_overlay(frame: &mut Frame, explorer: &Explorer, overlay: &Overlay) {
     }
 }
 
+/// `n` with thousands separated: `1204` as `1,204`.
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn draw_find(
+    frame: &mut Frame,
+    explorer: &Explorer,
+    query: &str,
+    selected: usize,
+    results: &[usize],
+) {
+    let area = centered_rect(80, 70, frame.area());
+    frame.render_widget(Clear, area);
+    let more = if explorer.found_capped { "+" } else { "" };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        // Only the best few hundred are ranked: at the limit, say so rather
+        // than pass them off as every match.
+        .title(format!(
+            " {}{} of {}{more} files ",
+            if results.len() >= super::state::FIND_SHOWN {
+                "best "
+            } else {
+                ""
+            },
+            grouped(results.len()),
+            grouped(explorer.found.len())
+        ))
+        .title_style(Style::default().fg(Color::Green))
+        .title_bottom(" type to find  ↑↓ move  ⏎ reveal  ^u clear  esc close ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("find ", Style::default().fg(Color::DarkGray)),
+            Span::raw(query.to_string()),
+            Span::styled("█", Style::default().fg(Color::Gray)),
+        ])),
+        query_area,
+    );
+    let hit = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let items: Vec<ListItem> = results
+        .iter()
+        .filter_map(|&i| explorer.found.get(i))
+        .map(|path| {
+            let at = fuzzy_match(path, query)
+                .map(|(_, at)| at)
+                .unwrap_or_default();
+            let spans: Vec<Span> = path
+                .chars()
+                .enumerate()
+                .map(|(i, c)| match at.contains(&i) {
+                    true => Span::styled(c.to_string(), hit),
+                    false => Span::raw(c.to_string()),
+                })
+                .collect();
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(if items.is_empty() {
+        None
+    } else {
+        Some(selected.min(items.len() - 1))
+    });
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, list_area, &mut state);
+}
+
 /// The summary that goes with a verdict, being typed — over the explorer's
 /// PR panel or over the review viewer, which share it.
 pub(super) fn draw_review_body(
@@ -1005,7 +1096,7 @@ pub(super) fn draw_review_body(
 }
 
 /// The key list, as it is both rendered and measured.
-const HELP: [(&str, &str); 27] = [
+const HELP: [(&str, &str); 28] = [
     (
         "a-z, 0-9, …",
         "type to filter this level (live, no key needed)",
@@ -1036,6 +1127,10 @@ const HELP: [(&str, &str); 27] = [
     (
         "ctrl-t",
         "go to: the worktree root, task root, project root, or worktrees",
+    ),
+    (
+        "ctrl-n",
+        "find a file by a few of its letters: ⏎ shows it in the tree",
     ),
     ("ctrl-w", "worktrees of this repository: switch to one"),
     ("", "  in the panel: o open its PR, r refresh, esc close"),

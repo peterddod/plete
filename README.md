@@ -20,6 +20,7 @@ plete was called jeet. The `jeet` command still works as an alias of the same bi
 - `plete alias install` makes `pt` a short name for plete, in `~/.local/bin` or `~/bin`. Nothing creates it on its own, and it never replaces another `pt`.
 - `plete doctor` lists what is still under the old name (old launchd jobs, `jeet-*` tmux sessions, `.jeet/` markers, the line in your shell rc).
 - `JEET_*` environment variables are read as `PLETE_*` still, and plete sets both for the processes it starts.
+- Installed from the tap as jeet? `brew update` follows the tap to `peterddod/plete`, and Homebrew does not trust a renamed tap until you say so: run `brew trust peterddod/plete`, then `brew upgrade` replaces jeet with plete (keeping the `jeet` link).
 
 ## Install
 
@@ -224,6 +225,7 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 |-----|--------|
 | `ctrl-a` | the task's coding agent, in its tmux session — started if it is not running |
 | `ctrl-t` | go to: `r` the worktree root (or back to the worktree you left), `t` the task's directory, `p` the task's project folder, `w` the worktrees |
+| `ctrl-n` | find a file by a few of its letters: `⏎` shows it in the tree |
 | `ctrl-w` | the repository's worktrees: `⏎` switches to one, `o` opens its PR |
 | `ctrl-f` | diff the highlighted file or folder against the default branch |
 | `ctrl-p` | the pull request: `o` open, `a` approve, `c` comment, `x` request changes, `d` diff, `v` review output |
@@ -233,6 +235,10 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 | `ctrl-q` | quit, leaving your shell in the directory you were browsing |
 | `esc` | quit without moving your shell (unless it moved out from under you) |
 | `F1` or `ctrl-g` | the key list, in plete |
+
+`ctrl-n` searches the files under the root — git's view of them in a
+repository (tracked, plus untracked that are not ignored), everything
+elsewhere.
 
 In the worktree panel: `↑` / `↓` move, `r` refreshes and `esc` closes.
 Worktrees are added to and removed from tasks — `plete worktree`, or `w` in
