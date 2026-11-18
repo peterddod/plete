@@ -11630,12 +11630,12 @@ fn manager_new_without_a_goal_makes_no_assistant() {
     assert!(calls_of(&tmux, "new-session").is_empty());
 }
 
-/// A planner is a work task, so `manager new` is no longer refused up front
-/// on a harness without hooks and the rest (M36): the task is made, and the
-/// check comes when a task is made under it.
+/// A planner needs what a task with tasks under it needs, so `manager new`
+/// on a harness without hooks and the rest is refused up front (M36):
+/// nothing is made.
 #[cfg(unix)]
 #[test]
-fn manager_new_is_not_refused_on_a_harness_without_hooks() {
+fn manager_new_is_refused_on_a_harness_without_hooks() {
     let lab = StoreLab::new();
     std::fs::write(
         lab.home().join("config.toml"),
@@ -11648,35 +11648,11 @@ fn manager_new_is_not_refused_on_a_harness_without_hooks() {
     let tmux_env = tmux.to_string_lossy().to_string();
     let env = [("PLETE_TMUX", tmux_env.as_str())];
 
-    // Made as a planner task; this harness takes no first prompt, so its
-    // agent is not started, and the command says so and fails.
     let output = lab.plete_at(&["manager", "new", "api", "--goal", "g"], &lab.home(), &env);
     assert!(!output.status.success());
     let said = stderr_of(&output);
-    assert!(
-        said.contains("was made, but its agent did not start"),
-        "{said}"
-    );
-    assert!(lab.home().join("tasks/api").is_dir());
-    let kind: String = lab
-        .index()
-        .query_row("SELECT kind FROM tasks WHERE slug = 'api'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(kind, "work");
-    assert!(calls_of(&tmux, "new-session").is_empty());
-
-    // A task under it is what needs the hooks.
-    let output = lab.plete_at(
-        &["task", "new", "sub", "--parent", "api", "--goal", "g"],
-        &lab.home(),
-        &env,
-    );
-    assert!(!output.status.success());
-    let said = stderr_of(&output);
     assert!(said.contains("hook events"), "{said}");
-    assert!(!lab.home().join("tasks/sub").exists());
+    assert!(!lab.home().join("tasks/api").exists());
     assert!(calls_of(&tmux, "new-session").is_empty());
 }
 
