@@ -271,6 +271,31 @@ pub enum Commands {
         reference: String,
     },
 
+    /// Find the notes, briefs, reports, plans and READMEs that answer a
+    /// question or request in plain language
+    Search {
+        /// What you want to know or find, in your own words
+        #[arg(required_unless_present_any = ["status", "reset"])]
+        query: Vec<String>,
+        /// Only search these kinds of documents: assistant, tasks, projects,
+        /// repos (repeatable)
+        #[arg(long = "in", value_name = "KIND", value_enum)]
+        kinds: Vec<SearchKind>,
+        /// How many documents to show (at most 20)
+        #[arg(short = 'n', long, default_value_t = 5)]
+        limit: usize,
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+        /// Show what is indexed for you instead
+        #[arg(long, conflicts_with = "reset")]
+        status: bool,
+        /// Empty the search index; it is rebuilt on the next search (user
+        /// and assistant only)
+        #[arg(long)]
+        reset: bool,
+    },
+
     /// Print what was kept for the assistant since you last ran this
     /// (reports, messages, watch events), then the open asks you hold
     Brief {
@@ -310,6 +335,15 @@ pub enum Commands {
 
     /// Query & list completion candidates (repos, branches)
     Complete { what: String },
+}
+
+/// A kind of document `plete search --in` narrows to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SearchKind {
+    Assistant,
+    Tasks,
+    Projects,
+    Repos,
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
@@ -579,9 +613,10 @@ pub enum TaskCommands {
 /// Where a new task sits in the tree, and what it is asked and allowed.
 #[derive(Args, Clone, Default)]
 pub struct Delegation {
-    /// The task it reports to: `assistant`, or a manager by its exact name.
-    /// Made by the assistant, a task reports to it without this; made by a
-    /// manager, to that manager; a manager the user makes, to the assistant
+    /// The task it reports to: `assistant`, or a task under it by its exact
+    /// name. Made by the assistant, a task reports to it without this; made
+    /// by a task under it, to that task; a manager the user makes, to the
+    /// assistant
     #[arg(long, add = ArgValueCandidates::new(parent_candidates))]
     pub parent: Option<String>,
     /// What its parent wants of it, shown to its agent as each session
@@ -592,8 +627,8 @@ pub struct Delegation {
     #[arg(long = "done", allow_hyphen_values = true)]
     pub done_when: Option<String>,
     /// What it may do (comma-separated capabilities), within what its
-    /// parent holds; default `[managers] worker_default`, or
-    /// `manager_default` for a manager, else every capability
+    /// parent holds; default `[tasks] default_allow`, or `[managers]
+    /// manager_default` for a manager, else every capability
     #[arg(long, value_delimiter = ',', value_parser = parse_capability, add = ArgValueCandidates::new(capability_candidates))]
     pub allow: Option<Vec<String>>,
     /// What it may spend: hours (4h), minutes (30m) and turns (20turns),
@@ -625,7 +660,7 @@ pub enum ManagerCommands {
         #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
         brief_file: Option<std::path::PathBuf>,
         /// How many active tasks it may have under it at once; at most
-        /// `[managers] max_children`, its default
+        /// `[tasks] max_children`, its default
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         max_children: Option<u32>,
         /// Project to start from: its skills and AGENTS.md (as PROJECT.md,
@@ -696,7 +731,7 @@ pub enum ManagerCommands {
         all: bool,
     },
 
-    /// Start what waits on `[managers] max_live`, while there is room (run
+    /// Start what waits on `[tasks] max_live`, while there is room (run
     /// by plete when a task's session ends)
     #[command(hide = true)]
     Drain {

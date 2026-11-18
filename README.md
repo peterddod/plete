@@ -147,12 +147,26 @@ From the tasks list, `e` opens it on a task, and `esc` goes back to the list.
 ┌ plete · github.com/acme/widget ────────────────────────────────┐
 │worktree feature-x  [task]  1 uncommitted  +2/-0 in 1 file     │
 │path     /src                                                  │
-│filter   co█  1 of 2                                           │
+│filter   com█  1 of 2                                          │
 └───────────────────────────────────────────────────────────────┘
 ┌ 1 of 2 items ─────────────────────────────────────────────────┐
-│▸ commands/                                                    │
+│▾ src/                                                  +40 -3 │
+│  ▸ commands/                                                  │
+│▸ tests/                                                       │
+│  README.md                                              110 K │
 └───────────────────────────────────────────────────────────────┘
 ```
+
+Folders open and close where they stand, so every folder above the one you are
+in stays on screen. Only open folders are read, and they stay open when you
+refresh. The filter narrows the level the cursor is in — `com` above has hidden
+`src/`'s other entries — and leaves the rest of the tree whole; the count in the
+title is for that level.
+
+The bottom line shows the keys that apply right now — a file offers `⏎ edit`,
+a closed folder `⏎ open` and `→ open`, an open one `⏎ close` and `← close`, a
+command line `⏎ run` — and ends in `F1 +N more` when they do not all fit. `F1`
+opens the key list with those keys first.
 
 ### Type to find things
 
@@ -165,9 +179,9 @@ merely contain it.
 |-----|--------|
 | any letter, digit or symbol | filter this level |
 | `⇥` | complete the filter as far as the matches agree; again takes the highlighted row |
-| `/` or `\` | step into the highlighted folder, and start a fresh filter |
+| `/` or `\` | open the highlighted folder, step into it, and start a fresh filter |
 | | (`\` is also a legal filename character, so it types whenever there is still a name it could be part of) |
-| `⌫` | delete a character — or, with nothing typed, leave the folder, as `←` |
+| `⌫` | delete a character — or, with nothing typed, close the folder or go out, as `←` |
 | `ctrl-u` | clear the filter |
 | `esc` | clear the filter — or, with nothing typed, quit |
 
@@ -178,7 +192,7 @@ towards that row, and the cursor stays on it. With nothing typed it only fills
 in what every name shares, as a shell does. `/` then walks in, so `sr⇥/` gets
 you into `src/` without leaving the keyboard, exactly as typing a path does.
 
-`/` steps into the highlighted folder — the same row `⏎` and `→` act on, and
+`/` opens the highlighted folder and steps into it — the same row `⏎` and `→` act on, and
 the one you can see. Typing a folder's name out in full puts it there: an exact
 match sorts to the top whatever else the filter caught.
 
@@ -186,11 +200,11 @@ match sorts to the top whatever else the filter caught.
 
 | key | action |
 |-----|--------|
-| `↑` / `↓` | move within the current level |
-| `→` | expand: step into the highlighted folder |
-| `←` | back: leave the folder (never above the worktree root) |
-| `⏎` | folder: step in · file: open it in your editor |
-| click | a folder to step into it, a file to select it, a path crumb to jump up |
+| `↑` / `↓` | move through the tree (with a filter typed, among that level's matches) |
+| `→` | a closed folder: open it · an open one: go to its first entry |
+| `←` | an open folder: close it · otherwise go to the folder you are in (never above the worktree root) |
+| `⏎` | folder: open or close it where it stands · file: open it in your editor |
+| click | a folder to open or close it, a file to select it, a path crumb to jump to that folder |
 | scroll | move the cursor |
 | shift-drag | select text (see below) |
 | `Home` / `End` | jump to the top / bottom |
@@ -219,8 +233,9 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 | `esc` | quit without moving your shell (unless it moved out from under you) |
 | `F1` or `ctrl-g` | the key list, in plete |
 
-In the worktree panel: `r` refreshes and `esc` closes. Worktrees are added to
-and removed from tasks — `plete worktree`, or `w` in the tasks list — not here.
+In the worktree panel: `↑` / `↓` move, `r` refreshes and `esc` closes.
+Worktrees are added to and removed from tasks — `plete worktree`, or `w` in
+the tasks list — not here.
 The panels are keyboard-driven, so single letters still work inside them, and
 the key that opened one closes it again.
 
@@ -555,6 +570,17 @@ plete task new "Launch" --project web
 plete task resync launch                       # --force replaces the task's edits too
 plete manager new web --goal "Own the web app" --project web   # its tasks start from web too
 ```
+
+A project also keeps shared docs, in `docs/` beside its `AGENTS.md` (made with
+a starter `index.md`; a project from before gets it at its next task's
+start): what its tasks know and keep for the tasks after them. They are not
+copied into tasks. Each task in the project (a task made under one starts from
+its project too) is told where they are as each session starts, and its agent
+is given the folder (Claude Code: `--add-dir`). Your own tasks, and tasks whose grant holds
+`project.write` (in the default grant), may edit them: one file per topic,
+listed in `index.md`, kept up to date rather than appended to. Without
+`project.write` they are read-only: its agent's edits there are denied. Writes are last-writer-wins, and the folder
+keeps no history of its own.
 
 `AGENTS.md` is the file Codex, Cursor, Amp, Gemini CLI and most other coding
 agents read, so a project works whichever agent you run. Next to it, plete writes
@@ -1152,13 +1178,23 @@ as an answer: `plete task send` and `plete task new --prompt` from anyone but
 you turn the `<` of a `<plete-…` tag into `‹`.
 
 plete reports for the task too, as `status`: when its agent waits on a prompt
-only you can answer, sits idle longer than `[managers] idle_report_mins`
+only you can answer, sits idle longer than `[tasks] idle_report_mins`
 (default 10; `plete watch` and the assistant's own turns look), or ends without
-reporting done. These never start an assistant session. `--goal` and `--done`
+reporting done. These never start an assistant session.
+
+Any task under the assistant, not only a manager, may have tasks under it,
+to any depth (`[tasks] max_depth` caps it; unset, there is no limit): its
+agent runs `plete task new` when its grant holds `task.create`, and you or
+the assistant may pass `--parent <task>`. Its tasks report to it, their
+questions are its to answer or pass up, each of its sessions starts with
+them and their last reports, it hands on at most what it holds, and
+`[tasks] max_children` (default 6) caps how many it keeps at once. A task
+made under one gets `[tasks] default_budget` unless given a budget, cut to
+what is left above it. `--goal` and `--done`
 on `plete task new` give the task a definition of done, shown to its agent at
 the start of each session with what it may do and how to report. `--allow
-task.create,worktree.add` names what it may do instead of `[managers]
-worker_default` (every capability but `assistant.interrupt` unless set), refused unless its parent holds each one, and `--budget
+task.create,worktree.add` names what it may do instead of `[tasks]
+default_allow` (every capability but `assistant.interrupt` unless set), refused unless its parent holds each one, and `--budget
 1h,20turns` gives it a budget of busy time and turns (no `$`: cost budgets
 wait). A budget is charged with the time the task's agent is busy (running,
 or waiting on a prompt, while its agent's pane is alive: a window you opened in its session does not count) and a turn for each turn it ends, and counts toward
@@ -1167,7 +1203,7 @@ deleting a task mid-turn charges the turn so far first). At 80% the parent is to
 note; at 100% the task is paused and its parent told `blocked: budget`: its
 turn ends with nothing more handed to it, and messages for it wait in its
 inbox until the budget is raised and it is resumed.
-At most `[managers] max_live` tasks under the assistant run at once (a
+At most `[tasks] max_live` tasks under the assistant run at once (a
 review agent counts toward `[review] max_live` instead, and spends only its
 own `[review]` budget: [Review limits](#review-limits)): a
 start past it is queued and the task's parent told, and it starts when a
@@ -1198,11 +1234,11 @@ plete manager new api --goal "Ship the v2 API" --done "PRs open, CI green" \
 It goes under the assistant, or under `--parent` (a manager by its exact
 name); made by a manager, it goes under that manager. `--goal`, `--done`,
 `--allow` and `--budget` work as on `task new`, but an unasked grant is
-`[managers] manager_default` (every capability but `assistant.interrupt` unless set) and an unasked budget `[managers]
+`[managers] manager_default` (every capability but `assistant.interrupt` unless set) and an unasked budget `[tasks]
 default_budget`; `--brief-file` adds a longer brief after the goal (the two
 together at most 8,000 bytes; a regular file, and, named by the assistant
 or a manager, one inside its own home and of one name, no hard link), and
-`--max-children` lowers `[managers] max_children` for it. `--project <name>`
+`--max-children` lowers `[tasks] max_children` for it. `--project <name>`
 starts it from a [project](#projects): its skills are copied in and its
 `AGENTS.md` becomes `PROJECT.md`, imported from the end of the manager's own
 `AGENTS.md` (which stays as it is); no worktrees are added, as a manager holds
@@ -1491,6 +1527,57 @@ waits in its inbox until the agent next runs, and is notified now. With a
 `[watch]` section, the tasks list also polls while it is open. Installing or removing the watcher takes the
 assistant the `watch.install` capability; polling takes none.
 
+## Search
+
+`plete search` finds the documents that answer a question or request put in
+plain language: notes, briefs, reports, plans, design docs and READMEs. It
+does not search code.
+
+```bash
+plete search what did we decide about retries    # the 5 best documents
+plete search -n 10 how a task reports it is blocked
+plete search --in repos --in projects deploy rollback
+plete search --json retries                      # for scripts and agents
+plete search --status                            # what is indexed for you
+plete search --reset                             # empty the index (user and assistant)
+```
+
+Each document comes with up to three of its best passages: the heading path
+they sit under, their line range and a short excerpt, so the right part can
+be read at once. Documents are ranked by BM25 over passages (a section of a
+Markdown file, cut to between about 120 and 400 words) with common question
+words dropped, and a document's score is its best passage plus half the
+second and a quarter of the third. The score shown is relative to the best
+hit, which is 1.00.
+
+What a caller may search depends on who it is:
+
+- the user at a shell and the assistant: the assistant's home, every work and
+  manager task's folder, every project, and every repository in the store;
+- any other task: its own folder, the folders of the tasks below it, their
+  projects, and the repositories those hold worktrees of or list in their
+  `project.toml`. Never the assistant's notes, nor the folder of a task above;
+- a review's agent: the repository under review;
+- everyone: the repositories holding plete's own docs (under its old name
+  jeet too), when they are in the store.
+
+`--in assistant|tasks|projects|repos` narrows that; it never adds to it.
+
+The documents are `.md`, `.markdown`, `.mdx`, `.txt`, `.rst` and `.adoc` files
+and extension-less `README`, `CHANGELOG` and `CONTRIBUTING`. A task's folder
+contributes its top-level files (not the generated `AGENTS.md` and
+`CLAUDE.md`) and everything under `notes/` and `docs/`; a repository, the
+files git tracks at its trunk. Files over 2 MB, binaries, and the directories
+`.git`, `.claude`, `.jeet`, `.plete`, `node_modules`, `target`, `vendor`,
+`third_party`, `dist`, `build`, `out` and `*-backup` are skipped, and so are
+symbolic links, which could point outside what the caller may read.
+
+The index is one SQLite file, `~/.plete/search/index.db`. It is a cache:
+every search first brings the sources it covers up to date (reading only
+files that changed). A repository is listed again only when its HEAD moves
+or `[search] exclude` changes, so an uncommitted edit in a trunk is not
+seen. `plete search --reset` empties it.
+
 ## Setup
 
 ```bash
@@ -1660,6 +1747,65 @@ into tasks.
 | `plete worktree list` | `plete worktree ls` |
 | `plete cd` | `plete exec` (subshell) or `plete cd` via init-shell |
 | `plete cd --print` | `plete path` |
+
+## What's new in v0.16
+
+jeet is now **plete**, and it can search your documents.
+
+### Renamed to plete
+
+- **The binary, package, tap and apt repository are called plete.** The
+  repository is [peterddod/plete](https://github.com/peterddod/plete); the
+  old URLs redirect, except the apt repository, which moves to
+  `https://peterddod.github.io/plete` (rerun the installer once, or edit
+  `/etc/apt/sources.list.d/jeet.list`). See [Renamed from jeet](#renamed-from-jeet).
+- **`jeet` keeps working.** Homebrew installs `bin/jeet` as a link to
+  plete, and the deb a `/usr/bin/jeet` link, so running agents' hooks,
+  launchd jobs and the line in your shell rc carry on across the upgrade.
+  `brew upgrade` moves a `jeet` install to `plete` on its own; the deb
+  replaces the `jeet` package.
+- **Two homes.** Existing tasks, projects, reviews, the index and config stay
+  in `~/.jeet` and are read from there; new tasks, projects, reviews and
+  clones go to `~/.plete`. Everything that names plete reads the old name
+  too: `JEET_*` variables, `jeet-*` tmux sessions, `.jeet/` markers, `refs/jeet`,
+  `jeet://` links and keyring entries.
+- **`plete migrate-home`** moves everything left in `~/.jeet` to `~/.plete`,
+  when you choose to. It backs up first, prints its plan and what may break
+  (running sessions especially), needs `--yes`, refuses while agent sessions
+  are alive unless `--force`, can be run again if interrupted, and leaves
+  `~/.jeet` as a link to `~/.plete`.
+- **`pt`, if you want it.** `plete alias install` makes `pt` a short name for
+  plete in `~/.local/bin` or `~/bin`; `plete alias status|uninstall` check and
+  remove it. No package ships `pt`, and it never replaces another `pt`.
+- **`plete doctor`** lists what still runs under the old name: old launchd
+  jobs, `jeet-*` tmux sessions, `.jeet/` markers, the line in your shell rc.
+
+### Search
+
+- **`plete search <question>`** finds the notes, briefs, reports, plans,
+  design docs and READMEs that answer a question in plain language, ranked
+  by BM25 over their sections, with the best passages of each
+  ([Search](#search)). `--in`, `-n`, `--json`, `--status` and `--reset`.
+- **What it searches follows the caller**: the user and the assistant see
+  everything; a task sees its own folder, the tasks below it, their projects
+  and repositories, never the assistant's notes or a task above it.
+- `[search] exclude` and `[search] exclude_repos` leave paths and
+  repositories out ([Searching documents](#searching-documents)).
+
+### Permissions
+
+- **`assistant.interrupt`**: a task or manager granted it by name can push a
+  report or message straight into the assistant's session with
+  `plete report <kind> --interrupt "…"` or `plete task send assistant
+  --interrupt "…"`. No default grant includes it; without it the message
+  waits in the inbox as before
+  ([Letting a task interrupt the assistant](#letting-a-task-interrupt-the-assistant)).
+
+### Development
+
+- A development build refuses to migrate the index in the account's real
+  home, even with a faked `$HOME`: only `PLETE_ALLOW_DEV_MIGRATE=<index path>`
+  lets it. The test suite drops every inherited `PLETE_*` and `JEET_*`.
 
 ## What's new in v0.15
 
@@ -3059,7 +3205,7 @@ push = false    # keep what is sent to it for `plete brief` (the default)
 The capabilities: `task.create`, `task.open`, `task.send`, `task.archive`,
 `task.unarchive`, `task.delete`, `task.resync`, `worktree.add`, `worktree.rm`,
 `review.start`, `project.read`, `project.create`, `project.delete`,
-`repo.clone`, `repo.import`, `repo.sync`, `shell.install`, `watch.install`,
+`project.write` (the project's shared docs), `repo.clone`, `repo.import`, `repo.sync`, `shell.install`, `watch.install`,
 `pr.comment`, `pr.review`, `pr.merge` (`plete pr merge`), `manager.grant`
 (`plete manager grant` and `budget`), `manager.create` (`plete manager new`)
 `manager.stop` (`plete manager pause`, `resume` and `stop`) and
@@ -3228,7 +3374,7 @@ is the PR policy: `[tasks] pr = "draft"` denies `gh pr ready` and `"ask"`
 denies `gh pr create`, as that is your policy, not a default restriction. To
 restrict:
 
-- `[managers] worker_default` and `manager_default`, or `--allow` on `plete
+- `[tasks] default_allow` and `[managers] manager_default`, or `--allow` on `plete
   task new` / `plete manager new` and `plete manager grant`, narrow what a new
   task or manager may do (for example `["worktree.add"]`).
 - `[permissions] guards = true` denies force-pushes, merges outside `plete pr
@@ -3248,22 +3394,42 @@ plete command bare: `for t in a b; do plete task archive $t --force; done` or
 `Bash(plete task archive:*)` allowed.
 
 ```toml
-[managers]
-idle_report_mins = 10   # tell the assistant when a task of its sits idle this long
-max_depth = 3           # a task at most 3 below the assistant, a manager 2
-max_children = 6        # active tasks under one manager (the assistant has no limit)
-default_budget = "4h"   # for a manager's task when `--budget` names none
+[tasks]
+idle_report_mins = 10   # tell a task's parent when it sits idle this long
+max_depth = 5           # unset: no limit; set, a task sits at most this far below the assistant
+max_children = 6        # active tasks under one task (the assistant has no limit)
+default_budget = "4h"   # for a manager, or a task under a task, when `--budget` names none
 max_live = 8            # tasks under the assistant running at once, reviews apart; a start past it waits
-# Unset, both default to every capability but assistant.interrupt. Setting them restricts, e.g.:
-worker_default = ["worktree.add"]   # a new task's grant when `--allow` names none
-manager_default = ["task.create"]   # a new manager's
+# Unset, it defaults to every capability but assistant.interrupt. Setting it restricts, e.g.:
+default_allow = ["worktree.add"]    # a new task's grant when `--allow` names none
 held = []               # added to pr.merge, pr.comment, pr.review, task.delete: logged and notified when a grant names them
+
+[managers]
+manager_default = ["task.create"]   # a new manager's grant
 ```
+
+These keys lived in `[managers]` before (`default_allow` as
+`worker_default`); plete still reads each one there that `[tasks]` does not
+set.
 
 The tree's settings are checked when they are used, not when config.toml
 is read: a mistake in them (an unknown capability, a limit of 0, a `$` budget) refuses making tasks under the
 assistant, starting one, `plete manager grant` and unarchiving a task under
 a manager, and nothing else.
+
+### Searching documents
+
+`plete search` has two optional settings, both in a `[search]` table:
+
+```toml
+[search]
+exclude = ["~/.plete/assistant/private"]   # path prefixes never indexed or shown
+exclude_repos = ["acme/legacy"]           # repositories left out of every scope
+```
+
+Each `exclude_repos` entry is a repository's whole id or its last parts
+(`legacy`, `acme/legacy`), case aside, and leaves out every repository it
+matches.
 
 ### Template overrides
 
