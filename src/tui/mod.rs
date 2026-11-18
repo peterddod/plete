@@ -275,6 +275,7 @@ fn handle_browse_key(
         }
         KeyCode::Char('p') if ctrl => open_pr_panel(app, terminal, explorer, false),
         KeyCode::Char('o') if ctrl => open_repo_prs(app, terminal, explorer, None),
+        KeyCode::Char('n') if ctrl => open_find(terminal, explorer),
         KeyCode::Char('a') if ctrl => open_agent(app, terminal, explorer)?,
         KeyCode::Char('w') if ctrl => open_worktrees(app, terminal, explorer),
         // F1 alone would do, except macOS gives it to the media keys by
@@ -566,6 +567,7 @@ fn handle_overlay_key(
         (Overlay::Worktrees { .. }, KeyCode::Char('w')) => ctrl,
         (Overlay::PullRequest { .. }, KeyCode::Char('p')) => ctrl,
         (Overlay::RepoPrs { .. }, KeyCode::Char('o')) => ctrl,
+        (Overlay::Find { .. }, KeyCode::Char('n')) => ctrl,
         (Overlay::Help { .. }, KeyCode::Char('g')) => ctrl,
         (Overlay::Help { .. }, KeyCode::F(1)) => true,
         _ => false,
@@ -576,8 +578,9 @@ fn handle_overlay_key(
 
     // Otherwise the browse-mode shortcuts mean nothing in a panel, and letting
     // them through would act on the listing hidden behind it. The review
-    // body is the exception: it takes typed input, and ctrl-u clears.
-    let typing = matches!(overlay, Overlay::ReviewBody { .. });
+    // body and the find panel are the exceptions: they take typed input, and
+    // ctrl-u clears.
+    let typing = matches!(overlay, Overlay::ReviewBody { .. } | Overlay::Find { .. });
     if !typing && ctrl {
         explorer.overlay = Some(overlay);
         return Ok(());
@@ -765,6 +768,38 @@ fn handle_overlay_key(
             }
             _ => explorer.overlay = Some(Overlay::RepoPrs { rows, selected }),
         },
+        Overlay::Find {
+            mut query,
+            mut selected,
+            mut results,
+        } => match edit_find(
+            &explorer.found,
+            &mut query,
+            &mut selected,
+            &mut results,
+            key,
+        ) {
+            FindKey::Close => {}
+            FindKey::Pick => {
+                let Some(rel) = results.get(selected).and_then(|&i| explorer.found.get(i)) else {
+                    return Ok(());
+                };
+                let rel = rel.clone();
+                let said = match explorer.reveal(&rel) {
+                    Ok(true) => format!("found {rel} · ⏎ opens it"),
+                    Ok(false) => format!("{rel} is not shown — ^d toggles hidden files"),
+                    Err(e) => format!("could not show {rel}: {e:#}"),
+                };
+                explorer.set_status(said);
+            }
+            FindKey::Typing => {
+                explorer.overlay = Some(Overlay::Find {
+                    query,
+                    selected,
+                    results,
+                });
+            }
+        },
         Overlay::ReviewBody {
             verdict,
             mut input,
@@ -807,6 +842,43 @@ fn handle_overlay_key(
         },
     }
     Ok(())
+}
+
+/// `ctrl-n`: list the files under the root once, then let the panel rank them
+/// as the query changes.
+fn open_find(terminal: &mut Tui, explorer: &mut Explorer) {
+    let root = explorer.root.clone();
+    let in_repo = explorer.repo.is_some();
+    let hidden = explorer.show_hidden;
+    let listed = with_progress(terminal, explorer, "listing files", || {
+        state::find_candidates(&root, in_repo, hidden)
+    })
+    .and_then(|inner| inner);
+    match listed {
+        Ok((files, capped)) => {
+            let results = state::fuzzy_matches(&files, "");
+            explorer.found = files;
+            explorer.found_capped = capped;
+            explorer.overlay = Some(Overlay::Find {
+                query: String::new(),
+                selected: 0,
+                results,
+            });
+            if capped {
+                explorer.set_status(format!(
+                    "only the first {} files are searched",
+                    state::FIND_LIMIT
+                ));
+            }
+        }
+        Err(e) => {
+            explorer.overlay = Some(Overlay::Message {
+                title: "could not list files".into(),
+                lines: vec![format!("{e:#}")],
+                from_panel: false,
+            });
+        }
+    }
 }
 
 fn open_worktrees(app: &App, terminal: &mut Tui, explorer: &mut Explorer) {
@@ -1274,6 +1346,49 @@ enum BodyKey {
     Submit,
 }
 
+enum FindKey {
+    Typing,
+    Close,
+    Pick,
+}
+
+/// Edit the find panel's query and move its selection, re-ranking `files`
+/// when the query changes. `Pick` leaves `selected` on the result chosen.
+fn edit_find(
+    files: &[String],
+    query: &mut String,
+    selected: &mut usize,
+    results: &mut Vec<usize>,
+    key: KeyEvent,
+) -> FindKey {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let last = results.len().saturating_sub(1);
+    let before = query.len();
+    match key.code {
+        KeyCode::Esc => return FindKey::Close,
+        KeyCode::Enter if results.is_empty() => {}
+        KeyCode::Enter => return FindKey::Pick,
+        KeyCode::Up => *selected = selected.saturating_sub(1),
+        KeyCode::Down => *selected = (*selected + 1).min(last),
+        KeyCode::PageUp => *selected = selected.saturating_sub(10),
+        KeyCode::PageDown => *selected = (*selected + 10).min(last),
+        KeyCode::Char('u') if ctrl => query.clear(),
+        KeyCode::Backspace => {
+            query.pop();
+        }
+        KeyCode::Char(c) if !ctrl && !alt => query.push(c),
+        _ => {}
+    }
+    // A moved selection stays put; an edited query starts again at the best.
+    let edited = query.len() != before || (ctrl && key.code == KeyCode::Char('u'));
+    if edited {
+        *results = state::fuzzy_matches(files, query);
+        *selected = 0;
+    }
+    FindKey::Typing
+}
+
 /// Edit a review summary: the one text box both the PR panel and the review
 /// viewer type verdicts into.
 fn edit_review_body(input: &mut String, key: KeyEvent) -> BodyKey {
@@ -1523,5 +1638,58 @@ pub fn start_dir(root: &Path, cwd: &Path) -> PathBuf {
         cwd.to_path_buf()
     } else {
         root.to_path_buf()
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+
+    struct Panel {
+        files: Vec<String>,
+        query: String,
+        selected: usize,
+        results: Vec<usize>,
+    }
+
+    impl Panel {
+        fn send(&mut self, code: KeyCode, modifiers: KeyModifiers) -> FindKey {
+            let key = KeyEvent::new(code, modifiers);
+            let (files, query) = (&self.files, &mut self.query);
+            edit_find(files, query, &mut self.selected, &mut self.results, key)
+        }
+    }
+
+    #[test]
+    fn find_keys_edit_the_query_and_move_the_selection() {
+        let files: Vec<String> = ["src/a.rs", "src/b.rs", "docs/b.md"]
+            .map(String::from)
+            .to_vec();
+        let mut panel = Panel {
+            files,
+            query: String::new(),
+            selected: 0,
+            results: vec![0, 1, 2],
+        };
+        let none = KeyModifiers::NONE;
+        // Bare letters type, `/` included, rather than run a command.
+        assert!(matches!(
+            panel.send(KeyCode::Char('b'), none),
+            FindKey::Typing
+        ));
+        panel.send(KeyCode::Char('/'), none);
+        assert_eq!(panel.query, "b/");
+        panel.send(KeyCode::Backspace, none);
+        assert_eq!(panel.results, [1, 2], "src/a.rs has no b");
+        panel.send(KeyCode::Down, none);
+        panel.send(KeyCode::Down, none);
+        assert_eq!(panel.selected, 1, "stops at the last result");
+        // Other ctrl keys do not type; ctrl-u clears and starts again.
+        panel.send(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(panel.query, "b");
+        panel.send(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(panel.query.is_empty() && panel.results.len() == 3 && panel.selected == 0);
+        assert!(matches!(panel.send(KeyCode::Enter, none), FindKey::Pick));
+        assert!(matches!(panel.send(KeyCode::Esc, none), FindKey::Close));
     }
 }

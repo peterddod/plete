@@ -511,6 +511,29 @@ pub fn tracked_files(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The files in `path` as git sees them — tracked, plus untracked ones that
+/// are not ignored — relative to it. A nested repository is listed by git as
+/// one `dir/` entry, which is no file, so it is left out.
+pub fn visible_files(path: &Path) -> Result<Vec<String>> {
+    let out = git_output(
+        path,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        &[],
+        None,
+    )?;
+    Ok(out
+        .split('\0')
+        .filter(|p| !p.is_empty() && !p.ends_with('/'))
+        .map(str::to_string)
+        .collect())
+}
+
 /// `(uncommitted, ignored)` entry counts for a worktree.
 ///
 /// `--untracked-files=normal` overrides a repo or user `status.showUntrackedFiles=no`,
@@ -1022,6 +1045,28 @@ fn git_output_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What ctrl-n searches in a repository: tracked and untracked files, not
+    /// ignored ones.
+    #[test]
+    fn visible_files_leave_out_what_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("target/out"), "").unwrap();
+        let mut files = visible_files(root).unwrap();
+        files.sort();
+        assert_eq!(files, [".gitignore", "src/main.rs"]);
+    }
 
     #[test]
     fn ignored_entries_are_the_bang_lines_only() {
