@@ -224,6 +224,7 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 |-----|--------|
 | `ctrl-a` | the task's coding agent, in its tmux session — started if it is not running |
 | `ctrl-t` | go to: `r` the worktree root (or back to the worktree you left), `t` the task's directory, `p` the task's project folder, `w` the worktrees |
+| `ctrl-n` | find a file by a few of its letters: `⏎` shows it in the tree |
 | `ctrl-w` | the repository's worktrees: `⏎` switches to one, `o` opens its PR |
 | `ctrl-f` | diff the highlighted file or folder against the default branch |
 | `ctrl-p` | the pull request: `o` open, `a` approve, `c` comment, `x` request changes, `d` diff, `v` review output |
@@ -233,6 +234,10 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 | `ctrl-q` | quit, leaving your shell in the directory you were browsing |
 | `esc` | quit without moving your shell (unless it moved out from under you) |
 | `F1` or `ctrl-g` | the key list, in plete |
+
+`ctrl-n` searches the files under the root — git's view of them in a
+repository (tracked, plus untracked that are not ignored), everything
+elsewhere.
 
 In the worktree panel: `↑` / `↓` move, `r` refreshes and `esc` closes.
 Worktrees are added to and removed from tasks — `plete worktree`, or `w` in

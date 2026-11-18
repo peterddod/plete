@@ -107,6 +107,7 @@ pub fn explorer_hints(explorer: &Explorer) -> Vec<Hint> {
     }
     hints.extend([
         hint("^t", "go to"),
+        hint("^n", "find"),
         hint("^a", "agent"),
         hint("^d", "hidden"),
         hint("^r", "refresh"),
@@ -194,10 +195,11 @@ mod tests {
             assert!(!canvas.contains(&key), "{key}");
         }
         let repo = keys(&explorer_at(dir.path(), true));
-        for key in ["^f", "^p", "^o", "^w", "^t", "^a", "^d", "^r", "^q"] {
+        for key in ["^f", "^p", "^o", "^w", "^t", "^n", "^a", "^d", "^r", "^q"] {
             assert!(repo.contains(&key), "{key}");
         }
-        assert!(canvas.contains(&"^a") && canvas.contains(&"^q") && canvas.contains(&"^t"));
+        assert!(canvas.contains(&"^a") && canvas.contains(&"^q"));
+        assert!(canvas.contains(&"^t") && canvas.contains(&"^n"));
     }
 
     #[test]

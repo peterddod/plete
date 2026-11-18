@@ -165,6 +165,13 @@ pub enum Overlay {
         rows: Vec<crate::commands::prs::PrRow>,
         selected: usize,
     },
+    /// Find a file by a few of its letters. `results` indexes
+    /// [`Explorer::found`], best first; `selected` indexes `results`.
+    Find {
+        query: String,
+        selected: usize,
+        results: Vec<usize>,
+    },
     /// The summary comment that goes with a verdict.
     ReviewBody {
         verdict: Verdict,
@@ -320,6 +327,11 @@ pub struct Explorer {
     pub selected: usize,
     pub show_hidden: bool,
     pub overlay: Option<Overlay>,
+    /// Every file under the root, relative to it, as read when the find panel
+    /// last opened.
+    pub found: Vec<String>,
+    /// `found` stopped at [`FIND_LIMIT`] files.
+    pub found_capped: bool,
     /// Worktrees of this repo, refreshed whenever the overlay is opened.
     pub worktree_rows: Vec<WorktreeRow>,
     pub status_line: String,
@@ -393,6 +405,8 @@ impl Explorer {
             selected: 0,
             show_hidden: false,
             overlay: None,
+            found: Vec::new(),
+            found_capped: false,
             worktree_rows: Vec::new(),
             status_line: String::new(),
             working: None,
@@ -966,6 +980,18 @@ impl Explorer {
         true
     }
 
+    /// Show the file `rel`, a path under the root: open every folder down to
+    /// it and put the cursor on its row. False when it is not on screen —
+    /// gone since it was listed, or inside a dot folder that is hidden.
+    pub fn reveal(&mut self, rel: &str) -> Result<bool> {
+        let file = self.root.join(rel);
+        let Some(parent) = file.parent() else {
+            return Ok(false);
+        };
+        self.show(parent.to_path_buf(), Some(&file))?;
+        Ok(self.selected_entry().is_some_and(|e| e.path == file))
+    }
+
     /// Whether adding `c` to the filter would still match something here.
     pub fn filter_would_match(&self, c: char) -> bool {
         let mut wider = folded(&self.filter);
@@ -1165,6 +1191,171 @@ pub fn rank_matches<'a>(names: impl IntoIterator<Item = &'a str>, filter: &str) 
     exact.append(&mut prefixed);
     exact.append(&mut contained);
     exact
+}
+
+/// The most files the find panel will hold: past this a listing is slow to
+/// make and slower to rank on every keystroke, and nobody scrolls it.
+pub const FIND_LIMIT: usize = 50_000;
+
+/// The most results the find panel ranks and shows.
+pub const FIND_SHOWN: usize = 200;
+
+/// Every file under `root`, relative to it and in path order, and whether the
+/// list was cut at [`FIND_LIMIT`].
+///
+/// In a repository it is git's view — what is tracked and what is not
+/// ignored — so build output and dependencies stay out of it. Anywhere else
+/// there is no ignore file to ask, so it is a walk that leaves `.git` alone
+/// and dotfiles out unless they are shown.
+pub fn find_candidates(
+    root: &Path,
+    in_repo: bool,
+    show_hidden: bool,
+) -> Result<(Vec<String>, bool)> {
+    let mut files = match in_repo {
+        true => crate::git::visible_files(root)?,
+        false => walk_files(root, show_hidden),
+    };
+    // Git lists dotfiles whatever the tree shows; one found here that the tree
+    // is hiding would be revealed onto no row at all.
+    if !show_hidden {
+        files.retain(|file| !file.split('/').any(|part| part.starts_with('.')));
+    }
+    // Git still lists a tracked file deleted from the worktree, or left out of
+    // a sparse checkout: there is nothing there to reveal.
+    if in_repo {
+        files.retain(|file| root.join(file).symlink_metadata().is_ok());
+    }
+    files.sort();
+    files.dedup();
+    let capped = files.len() > FIND_LIMIT;
+    files.truncate(FIND_LIMIT);
+    Ok((files, capped))
+}
+
+fn walk_files(root: &Path, show_hidden: bool) -> Vec<String> {
+    let mut files = Vec::new();
+    let walk = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        e.depth() == 0 || (name != ".git" && (show_hidden || !name.starts_with('.')))
+    });
+    // Unreadable folders are skipped: a find that fails over one is no find.
+    for entry in walk.flatten() {
+        if files.len() > FIND_LIMIT {
+            break;
+        }
+        // A link to a file is a file the tree shows; a link to a folder is not
+        // followed, so a link back up cannot walk forever.
+        let file =
+            entry.file_type().is_file() || (entry.path_is_symlink() && entry.path().is_file());
+        if !file {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        // A name that is not UTF-8 cannot be typed, matched or drawn.
+        if let Some(rel) = rel.to_str() {
+            files.push(rel.to_string());
+        }
+    }
+    files
+}
+
+/// Characters lowercased one for one, so a position in the result is a
+/// position in the text — [`folded`] may grow a character, which would shift
+/// every highlight after it.
+fn fold_chars(text: &str) -> Vec<char> {
+    text.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
+}
+
+/// Whether `query`'s characters occur in `path` in order, and if so how well,
+/// with the character positions of the best way to read it.
+///
+/// A match scores for each character, more when it starts a path segment or
+/// follows `/ _ - .`, when it continues the run before it, and when it is in
+/// the file name — what you type is usually the name, not the folders.
+pub fn fuzzy_match(path: &str, query: &str) -> Option<(i64, Vec<usize>)> {
+    let query = fold_chars(query);
+    if query.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    let chars: Vec<char> = path.chars().collect();
+    let text = fold_chars(path);
+    // Most paths fail here, and the scoring below allocates.
+    let mut rest = text.iter();
+    if !query.iter().all(|q| rest.any(|c| c == q)) {
+        return None;
+    }
+    let name_start = chars.iter().rposition(|&c| c == '/').map_or(0, |i| i + 1);
+    let bonus = |at: usize| -> i64 {
+        let boundary = at == 0 || matches!(chars[at - 1], '/' | '_' | '-' | '.');
+        1 + if boundary { 6 } else { 0 } + if at >= name_start { 3 } else { 0 }
+    };
+    // `best[i][at]`: the top score with query[i] matched at `at`, and where
+    // query[i - 1] was matched to get it.
+    let mut best: Vec<Vec<Option<(i64, usize)>>> = Vec::with_capacity(query.len());
+    for (i, &q) in query.iter().enumerate() {
+        let mut row = vec![None; text.len()];
+        // The best earlier match that is not adjacent, kept as the scan goes.
+        let mut apart: Option<(i64, usize)> = None;
+        for at in 0..text.len() {
+            if i > 0 && at >= 2 {
+                if let Some((score, _)) = best[i - 1][at - 2] {
+                    if apart.is_none_or(|(s, _)| score > s) {
+                        apart = Some((score, at - 2));
+                    }
+                }
+            }
+            if text[at] != q {
+                continue;
+            }
+            row[at] = match i {
+                0 => Some((bonus(at), 0)),
+                _ => {
+                    let run = at
+                        .checked_sub(1)
+                        .and_then(|prev| best[i - 1][prev].map(|(s, _)| (s + 10, prev)));
+                    run.into_iter()
+                        .chain(apart)
+                        .max()
+                        .map(|(s, from)| (s + bonus(at), from))
+                }
+            };
+        }
+        best.push(row);
+    }
+    let (score, mut at) = best
+        .last()?
+        .iter()
+        .enumerate()
+        .filter_map(|(at, cell)| cell.map(|(s, _)| (s, at)))
+        .max()?;
+    let mut positions = vec![at];
+    for i in (1..query.len()).rev() {
+        at = best[i][at]?.1;
+        positions.push(at);
+    }
+    positions.reverse();
+    Some((score, positions))
+}
+
+/// Indices into `files` of the best matches for `query`, best first; shorter
+/// paths win a tie. An empty query keeps `files` as given.
+pub fn fuzzy_matches(files: &[String], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..files.len().min(FIND_SHOWN)).collect();
+    }
+    let mut scored: Vec<(i64, usize, usize)> = files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| fuzzy_match(f, query).map(|(score, _)| (score, f.len(), i)))
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    scored.truncate(FIND_SHOWN);
+    scored.into_iter().map(|(_, _, i)| i).collect()
 }
 
 /// What ⇥ should leave in the filter box, given the names on screen and which
@@ -1389,6 +1580,98 @@ mod tests {
         assert_eq!(get("README.md").map(|d| d.added), Some(1));
         assert_eq!(get("docs"), None, "untouched paths have no count");
         assert_eq!(diffs.get(root, Path::new("/elsewhere/src")), None);
+    }
+
+    fn ranked(files: &[&str], query: &str) -> Vec<String> {
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        fuzzy_matches(&files, query)
+            .into_iter()
+            .map(|i| files[i].clone())
+            .collect()
+    }
+
+    #[test]
+    fn fuzzy_needs_every_character_in_order() {
+        assert!(fuzzy_match("src/tui/state.rs", "stt").is_some());
+        assert!(fuzzy_match("src/tui/state.rs", "etr").is_none());
+        assert!(fuzzy_match("src/tui/state.rs", "zz").is_none());
+        assert_eq!(ranked(&["abc", "bca", "cab"], "ab"), ["abc", "cab"]);
+    }
+
+    #[test]
+    fn fuzzy_is_case_insensitive_and_reports_positions() {
+        let (_, at) = fuzzy_match("src/README.md", "readme").unwrap();
+        assert_eq!(at, [4, 5, 6, 7, 8, 9]);
+        assert!(fuzzy_match("src/readme.md", "README").is_some());
+    }
+
+    #[test]
+    fn fuzzy_prefers_names_and_segment_starts() {
+        assert_eq!(
+            ranked(&["src/statement/x.rs", "src/tui/state.rs"], "state"),
+            ["src/tui/state.rs", "src/statement/x.rs"]
+        );
+        assert_eq!(
+            ranked(&["docs/first.md", "src/tui/state.rs"], "st"),
+            ["src/tui/state.rs", "docs/first.md"]
+        );
+        // Letters scattered across a name lose to the same letters run together.
+        assert_eq!(
+            ranked(&["a/c_o_n_f.rs", "a/config.rs"], "conf"),
+            ["a/config.rs", "a/c_o_n_f.rs"]
+        );
+    }
+
+    #[test]
+    fn fuzzy_ties_go_to_the_shorter_path() {
+        assert_eq!(
+            ranked(&["lib/deeper/mod.rs", "lib/mod.rs"], "mod"),
+            ["lib/mod.rs", "lib/deeper/mod.rs"]
+        );
+    }
+
+    #[test]
+    fn an_empty_query_lists_files_in_order_and_results_are_capped() {
+        assert_eq!(ranked(&["b", "a", "c"], ""), ["b", "a", "c"]);
+        let many: Vec<String> = (0..500).map(|i| format!("f{i}")).collect();
+        assert_eq!(fuzzy_matches(&many, "f").len(), FIND_SHOWN);
+        assert_eq!(fuzzy_matches(&many, "").len(), FIND_SHOWN);
+    }
+
+    #[test]
+    fn the_walk_skips_git_and_hides_dotfiles_unless_shown() {
+        let dir = tree();
+        std::fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "x").unwrap();
+        std::fs::write(dir.path().join(".env"), "x").unwrap();
+        std::fs::create_dir(dir.path().join(".cfg")).unwrap();
+        std::fs::write(dir.path().join(".cfg/a.toml"), "x").unwrap();
+        let (hidden, capped) = find_candidates(dir.path(), false, false).unwrap();
+        assert_eq!(hidden, ["a/b/deep.txt", "a/one.txt", "top.txt"]);
+        assert!(!capped);
+        let (shown, _) = find_candidates(dir.path(), false, true).unwrap();
+        assert_eq!(
+            shown,
+            [
+                ".cfg/a.toml",
+                ".env",
+                "a/b/deep.txt",
+                "a/one.txt",
+                "top.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn reveal_opens_the_folders_and_lands_on_the_file() {
+        let dir = tree();
+        let mut explorer = explorer_at(dir.path());
+        assert!(explorer.reveal("a/b/deep.txt").unwrap());
+        assert_eq!(explorer.cwd, dir.path().join("a/b"));
+        assert_eq!(cursor(&explorer), "deep.txt");
+        assert!(explorer.is_open(&dir.path().join("a")));
+        assert!(explorer.is_open(&dir.path().join("a/b")));
+        assert!(!explorer.reveal("a/gone.txt").unwrap());
     }
 
     fn explorer_at(root: &Path) -> Explorer {
@@ -2589,5 +2872,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(explorer.cwd, dir.path());
+    }
+
+    /// A tracked file deleted from the worktree is nothing to find.
+    #[test]
+    fn find_leaves_out_tracked_files_that_are_gone() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(ok.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("kept.rs"), "").unwrap();
+        std::fs::write(root.join("gone.rs"), "").unwrap();
+        git(&["add", "kept.rs", "gone.rs"]);
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        let (files, capped) = find_candidates(root, true, false).unwrap();
+        assert_eq!(files, ["kept.rs"]);
+        assert!(!capped);
     }
 }
