@@ -245,6 +245,43 @@ pub fn pr_review(repo_dir: &Path, number: u64) -> Result<ReviewedPr> {
     serde_json::from_str(&text).context("parse gh pr view output")
 }
 
+/// One entry of a PR's `reviewRequests`: a user, or a team.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ReviewRequest {
+    /// `User` or `Team`.
+    #[serde(rename = "__typename", default)]
+    pub kind: String,
+    /// A user's login; empty for a team.
+    #[serde(default)]
+    pub login: String,
+    /// A team's slug; empty for a user.
+    #[serde(default)]
+    pub slug: String,
+}
+
+/// A PR with who wrote it and who is asked to review it.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestedPr {
+    #[serde(flatten)]
+    pub pr: PullRequest,
+    /// None when the author's account is gone.
+    #[serde(default)]
+    pub author: Option<Login>,
+    #[serde(default)]
+    pub review_requests: Vec<ReviewRequest>,
+}
+
+/// A PR by number, with its author and review requests.
+pub fn pr_requested(repo_dir: &Path, number: u64) -> Result<RequestedPr> {
+    let fields = format!("{PR_FIELDS},author,reviewRequests");
+    let text = gh_ok(
+        repo_dir,
+        &["pr", "view", &number.to_string(), "--json", &fields],
+    )?;
+    serde_json::from_str(&text).context("parse gh pr view output")
+}
+
 /// The PR for a local branch, if there is one.
 ///
 /// `pr/<n>` is how [`PullRequest::local_branch`] names a fork's PR, so that
@@ -1669,6 +1706,25 @@ mod tests {
         assert!(pr.requests("me"));
         assert!(!pr.requests("ada"));
         assert!(!pr.requests(""), "a team request is nobody's login");
+    }
+
+    #[test]
+    fn parses_a_prs_review_requests() {
+        let json = r#"{"author":{"id":"x","is_bot":false,"login":"ada","name":"Ada"},"baseRefName":"main","headRefName":"feat","headRefOid":"5f13","isCrossRepository":false,"isDraft":false,"number":10,"reviewDecision":"","reviewRequests":[{"__typename":"User","login":"me"},{"__typename":"Team","name":"Core Team","slug":"core"}],"state":"OPEN","title":"T","url":"u"}"#;
+        let pr: RequestedPr = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.pr.number, 10);
+        assert_eq!(pr.author.unwrap().login, "ada");
+        let [user, team] = &pr.review_requests[..] else {
+            panic!("{:?}", pr.review_requests);
+        };
+        assert_eq!((user.kind.as_str(), user.login.as_str()), ("User", "me"));
+        assert_eq!((team.kind.as_str(), team.slug.as_str()), ("Team", "core"));
+        assert_eq!(team.login, "");
+        // No requests and no author still parse.
+        let bare = json.replace(r#""author""#, r#""x""#);
+        let bare = bare.replace(r#""reviewRequests""#, r#""y""#);
+        let pr: RequestedPr = serde_json::from_str(&bare).unwrap();
+        assert!(pr.author.is_none() && pr.review_requests.is_empty());
     }
 
     #[test]

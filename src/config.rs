@@ -570,7 +570,7 @@ pub enum EventKind {
 }
 
 /// What a rule does with the events it matches: `action = "assistant"`,
-/// `"task"`, `"notify"` or `"manager:<slug>"` in config.toml.
+/// `"task"`, `"review"`, `"notify"` or `"manager:<slug>"` in config.toml.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleAction {
     /// Hand it to the assistant, which decides what to do within what it is
@@ -579,6 +579,10 @@ pub enum RuleAction {
     /// Send it to the task whose pull request it is about; to the assistant
     /// when no task has it.
     Task,
+    /// For a review request, start the review as `plete review <pr>` does,
+    /// opening nothing, and tell the user how to open it. Any other event
+    /// is notified, as is a request that is not the user's to review.
+    Review,
     /// A desktop notification, nothing more.
     Notify,
     /// Hand it to the manager with this slug, which acts within its own
@@ -594,12 +598,13 @@ impl RuleAction {
         match text {
             "assistant" => return Ok(RuleAction::Assistant),
             "task" => return Ok(RuleAction::Task),
+            "review" => return Ok(RuleAction::Review),
             "notify" => return Ok(RuleAction::Notify),
             _ => {}
         }
         let Some(slug) = text.strip_prefix("manager:") else {
             bail!(
-                "unknown rule action `{text}`: expected assistant, task, notify or manager:<slug>"
+                "unknown rule action `{text}`: expected assistant, task, review, notify or manager:<slug>"
             );
         };
         let slug = slug.trim();
@@ -615,6 +620,7 @@ impl std::fmt::Display for RuleAction {
         match self {
             RuleAction::Assistant => f.write_str("assistant"),
             RuleAction::Task => f.write_str("task"),
+            RuleAction::Review => f.write_str("review"),
             RuleAction::Notify => f.write_str("notify"),
             RuleAction::Manager(slug) => write!(f, "manager:{slug}"),
         }
@@ -2224,7 +2230,7 @@ action = "task"
         assert!(out.contains("action = \"manager:backend\""), "{out}");
         let again: Config = toml::from_str(&out).unwrap();
         assert_eq!(again.assistant.rules, config.assistant.rules);
-        for action in ["assistant", "task", "notify"] {
+        for action in ["assistant", "task", "review", "notify"] {
             assert_eq!(RuleAction::parse(action).unwrap().to_string(), action);
         }
 

@@ -1500,6 +1500,28 @@ on = ["mention"]
 action = "notify"      # just a notification
 ```
 
+`action = "review"` starts the review of a `review_requested` PR itself, as
+`plete review <pr> --repo <repo>` does, and tells you how to open it:
+
+```toml
+[[assistant.rules]]
+on = ["review_requested"]
+action = "review"
+```
+
+It opens nothing: the notification carries `plete review open|diff|explore
+<review>`. It asks GitHub about the PR first, and reviews it when you are
+asked directly, or when a team is (GitHub told you of it, so you are on that
+team; membership is not looked up). A PR that is a draft, closed, your own, or
+whose request has been withdrawn or answered gets the ordinary notification
+instead. A review is asked once per PR head, so a poll that sees the same
+request again does nothing, and a new commit asks again; it keeps
+`[review]`'s limits, `max_live` (over it, the review waits for a slot) and
+`time` and `turns`. The repository must already be in plete's store (it is
+never cloned): otherwise, or on any error, the event goes to the assistant.
+For any other kind of event the action is a notification. The first rule that
+matches wins, so put this one before a broader `review_requested` rule.
+
 `on` and `repos` may be left out to match anything. Events for the assistant
 go to its sessions by the rules above (primary, else most recent, else a new
 `events <date>` session), several to a message; an event for a task goes to

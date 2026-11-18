@@ -1268,13 +1268,37 @@ pub fn start_agent(
     rerun: bool,
     requested_by: Option<&str>,
 ) -> Result<String> {
+    Ok(
+        match ask_agent(app, review, pr, worktree, rerun, requested_by)? {
+            Asking::Asked { line, .. } | Asking::Declined(line) => line,
+        },
+    )
+}
+
+/// What [`ask_agent`] did.
+pub enum Asking {
+    /// The agent was asked, or the ask queued; `line` says how.
+    Asked { line: String, delivered: Delivered },
+    /// Nothing was asked, for the reason in the line.
+    Declined(String),
+}
+
+/// [`start_agent`], saying whether the agent was asked.
+pub fn ask_agent(
+    app: &App,
+    review: &ReviewRecord,
+    pr: &PullRequest,
+    worktree: &Path,
+    rerun: bool,
+    requested_by: Option<&str>,
+) -> Result<Asking> {
     // Who asked sticks: a run by the user never clears the assistant's, and
     // this holds when nothing is asked again.
     remember_requester(app, &review.id, requested_by)?;
     let review = &folded(app, review);
     let job = job_of(app, review);
     if let Some(why) = reason_not_to_ask(asked(review).as_ref(), job.as_ref(), pr, rerun) {
-        return Ok(why);
+        return Ok(Asking::Declined(why));
     }
     let prompt = expand_prompt(app.config.review.prompt(), pr, worktree);
     let dir = dir(app, review);
@@ -1282,10 +1306,10 @@ pub fn start_agent(
     // already, so one is enough, not a second review behind it.
     let checked = messages::checked(&prompt)?;
     if messages::peek(&dir).iter().any(|q| q.message == checked) {
-        return Ok(format!(
+        return Ok(Asking::Declined(format!(
             "the review of #{} is already queued for the review agent",
             pr.number
-        ));
+        )));
     }
     give_budget(app, review)?;
     let review = &app
@@ -1302,7 +1326,7 @@ pub fn start_agent(
     }
     let session = session_name(review);
     let watch = format!("`plete task open {}` to watch it", review.slug);
-    Ok(match delivered {
+    let line = match delivered {
         Delivered::Started => {
             format!(
                 "reviewing #{} in tmux session {session}; {watch}",
@@ -1334,7 +1358,8 @@ pub fn start_agent(
         ),
         // Only the assistant's are stored.
         Delivered::Stored => format!("the review of #{} is queued", pr.number),
-    })
+    };
+    Ok(Asking::Asked { line, delivered })
 }
 
 /// Record `requested_by`, the task that asks for review `id` now, if there

@@ -13,7 +13,8 @@
 //! What is new since the last poll — by `$PLETE_HOME/watch.json` — becomes an
 //! [`Event`] of one [`EventKind`], and the first `[[assistant.rules]]` that
 //! matches it decides where it goes: to the assistant, to the task whose
-//! pull request it is about, to a manager the rule names by slug, or to a
+//! pull request it is about, to a manager the rule names by slug, to a
+//! review that `action = "review"` starts for a review request, or to a
 //! desktop notification, which is also where an event no rule matches goes.
 //! The first poll of each source only notes what is there, so turning the
 //! watcher on is not a flood.
@@ -904,6 +905,8 @@ pub enum Sent {
     /// A review's agent, by the review's slug.
     Review(String),
     Manager(String),
+    /// A review started for a review request, by the review's slug.
+    ReviewStarted(String),
     Notified,
 }
 
@@ -914,6 +917,7 @@ impl Sent {
             Sent::Task(slug) => format!("task {slug}"),
             Sent::Review(slug) => format!("review {slug}"),
             Sent::Manager(slug) => format!("manager {slug}"),
+            Sent::ReviewStarted(slug) => format!("review {slug} (started)"),
             Sent::Notified => "notified".to_string(),
         }
     }
@@ -928,9 +932,16 @@ pub fn dispatch(app: &App, rules: &[Rule], events: &[Event]) -> Vec<Sent> {
     let mut held = vec![false; events.len()];
     let mut for_assistant = Vec::new();
     let mut for_managers: BTreeMap<String, Vec<(usize, &Event)>> = BTreeMap::new();
+    // The signed-in login, asked for once and only if a review rule needs it.
+    let mut me: Option<Result<String, String>> = None;
     for (i, event) in events.iter().enumerate() {
         match decide(rules, event) {
             RuleAction::Notify => {}
+            RuleAction::Review => match auto_review(app, event, &mut me) {
+                AutoReview::Started(slug) => sent[i] = Sent::ReviewStarted(slug),
+                AutoReview::Notify => {}
+                AutoReview::Assistant => for_assistant.push((i, event)),
+            },
             RuleAction::Assistant => for_assistant.push((i, event)),
             RuleAction::Manager(slug) => for_managers.entry(slug).or_default().push((i, event)),
             RuleAction::Task => match owning_task(app, event) {
@@ -1064,6 +1075,173 @@ pub fn dispatch(app: &App, rules: &[Rule], events: &[Event]) -> Vec<Sent> {
         .collect();
     notify_events(app, &notified);
     sent
+}
+
+/// What `action = "review"` made of an event.
+enum AutoReview {
+    /// The review is started or queued, and the user told: by this slug.
+    Started(String),
+    /// Nothing was started; the ordinary notification stands.
+    Notify,
+    /// It could not be done; the assistant has the event.
+    Assistant,
+}
+
+/// How the user is asked to review a PR.
+#[derive(Debug, PartialEq, Eq)]
+enum Via {
+    Direct,
+    Team,
+}
+
+/// Whether `me` is to review `pr`, or why not. Of a team request, GitHub's
+/// `review_requested` notification is the evidence that `me` is on it:
+/// membership is not looked up, which takes `read:org`.
+fn review_wanted(pr: &github::RequestedPr, me: &str) -> Result<Via, String> {
+    if pr.pr.state != "OPEN" {
+        return Err(format!("it is {}", pr.pr.state.to_ascii_lowercase()));
+    }
+    if pr.pr.is_draft {
+        return Err("it is a draft".to_string());
+    }
+    if pr
+        .author
+        .as_ref()
+        .is_some_and(|a| a.login.eq_ignore_ascii_case(me))
+    {
+        return Err("it is your own".to_string());
+    }
+    let requests = &pr.review_requests;
+    if requests
+        .iter()
+        .any(|r| r.kind != "Team" && r.login.eq_ignore_ascii_case(me))
+    {
+        return Ok(Via::Direct);
+    }
+    match requests.iter().any(|r| r.kind == "Team") {
+        true => Ok(Via::Team),
+        false => Err("no review is asked of you now".to_string()),
+    }
+}
+
+/// Carry out a review rule for `event`; see [`AutoReview`].
+fn auto_review(app: &App, event: &Event, me: &mut Option<Result<String, String>>) -> AutoReview {
+    let place = event.place();
+    match start_review(app, event, me) {
+        Ok(Some(slug)) => AutoReview::Started(slug),
+        Ok(None) => AutoReview::Notify,
+        Err(e) => {
+            eprintln!(
+                "plete: could not start a review for {place}: {e:#}; handing it to the assistant"
+            );
+            AutoReview::Assistant
+        }
+    }
+}
+
+/// Start the review of the PR a review request is for, as `plete review`
+/// does, opening nothing, and tell the user how to open it. `Ok(None)`: not
+/// started, for a reason said on stderr. A repository not in plete's store
+/// is an error: it is not cloned for this.
+///
+/// The start goes through `messages::deliver`, whose `ReviewAgent` admits
+/// through [`run::admit_review`] whoever calls: a review over `[review]
+/// max_live` waits for a slot, as for the assistant, not as for the user at
+/// a terminal.
+fn start_review(
+    app: &App,
+    event: &Event,
+    me: &mut Option<Result<String, String>>,
+) -> Result<Option<String>> {
+    let place = event.place();
+    let (EventKind::ReviewRequested, Some(number)) = (event.kind, event.number) else {
+        eprintln!("plete: a review rule is for review requests only; {place} is notified");
+        return Ok(None);
+    };
+    let Some(repo) = app
+        .db
+        .list_repos(None)?
+        .into_iter()
+        .find(|r| repo_id_is(&r.id, &event.repo))
+    else {
+        bail!("{} is not in plete's store", event.repo);
+    };
+    let trunk = Path::new(&repo.trunk_path);
+    let login = me
+        .get_or_insert_with(|| github::current_user(trunk).map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(|e| anyhow::anyhow!("could not tell who you are on GitHub: {e}"))?;
+    let requested = github::pr_requested(trunk, number)?;
+    let via = match review_wanted(&requested, &login) {
+        Ok(via) => via,
+        Err(why) => {
+            eprintln!("plete: not reviewing {place}: {why}; it is notified");
+            return Ok(None);
+        }
+    };
+    let pr = &requested.pr;
+    let checkout = crate::review::review_for(app, &repo, pr, None)?;
+    let review = &checkout.review;
+    // As `plete review` has it: once its agent has been asked, the
+    // deprecated job beside it is not run, and one never asked is not
+    // started over by it.
+    let has_agent = crate::review::asked(&crate::review::folded(app, review)).is_some();
+    if app.config.review.command().is_some() && !has_agent {
+        eprintln!(
+            "plete: not reviewing {place}: [review] command is deprecated and not run by a              watch rule; remove it to have the agent review; it is notified"
+        );
+        return Ok(None);
+    }
+    let asking = crate::review::ask_agent(app, review, pr, &checkout.path, false, None)?;
+    let (line, delivered) = match asking {
+        crate::review::Asking::Asked { line, delivered } => (line, delivered),
+        crate::review::Asking::Declined(why) => {
+            eprintln!("plete: not reviewing {place}: {why}; it is notified");
+            return Ok(None);
+        }
+    };
+    let slug = &review.slug;
+    let how = match via {
+        Via::Direct => "for a review request",
+        Via::Team => "for a team's review request",
+    };
+    let action = format!(
+        "started review {slug} of {} #{number} {how} (watch rule)",
+        event.repo
+    );
+    if let Err(e) = crate::permissions::append(
+        &crate::permissions::actions_log(&app.home),
+        "review.start",
+        &action,
+        crate::permissions::Outcome::Done,
+        None,
+    ) {
+        eprintln!("plete: warning: could not log the review started: {e:#}");
+    }
+    let waiting = matches!(delivered, Delivered::StartQueued { .. });
+    let link = Some(event.url.clone()).filter(|u| notify::openable_url(u));
+    notify::event(
+        app,
+        notify::Event {
+            kind: "review".into(),
+            level: Some(config::NotifyLevel::Review),
+            task: Some(slug.clone()),
+            // Each head of the PR is told once.
+            reference: Some(format!("requested:{}@{}", review.id, pr.head_ref_oid)),
+            title: match waiting {
+                true => format!("plete: review queued for {} #{number}", event.repo),
+                false => format!("plete: reviewing {} #{number}", event.repo),
+            },
+            subtitle: Some(event.title.clone()).filter(|t| !t.is_empty()),
+            body: format!(
+                "{line}\nplete review open {slug}\nplete review diff {slug}\nplete review explore {slug}"
+            ),
+            pr: link.clone(),
+            link,
+            ..notify::Event::default()
+        },
+    );
+    Ok(Some(slug.clone()))
 }
 
 /// Tell the user of each of the user's PRs whose checks just failed for
@@ -2349,6 +2527,103 @@ mod tests {
         assert_eq!(
             decide(&[], &event(EventKind::CiFailed, "a/b")),
             RuleAction::Notify
+        );
+    }
+
+    #[test]
+    fn a_review_rule_may_be_limited_to_repos() {
+        let rules = [
+            rule(
+                &[EventKind::ReviewRequested],
+                &["acme/*"],
+                RuleAction::Review,
+            ),
+            rule(&[EventKind::ReviewRequested], &[], RuleAction::Assistant),
+        ];
+        let decide_for = |repo| decide(&rules, &event(EventKind::ReviewRequested, repo));
+        assert_eq!(decide_for("acme/api"), RuleAction::Review);
+        assert_eq!(decide_for("other/api"), RuleAction::Assistant);
+    }
+
+    fn requested(json_extra: &str) -> github::RequestedPr {
+        let json = format!(
+            r#"{{"number":3,"title":"T","url":"u","state":"OPEN","headRefName":"f","baseRefName":"main",
+            "author":{{"login":"Ada"}},"reviewRequests":[]{json_extra}}}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn a_review_is_wanted_for_a_request_to_the_user_or_a_team() {
+        let with = |requests: &str| {
+            let mut pr = requested("");
+            pr.review_requests = serde_json::from_str(requests).unwrap();
+            pr
+        };
+        let direct = with(r#"[{"__typename":"User","login":"Me"}]"#);
+        assert_eq!(review_wanted(&direct, "me"), Ok(Via::Direct));
+        let team = with(r#"[{"__typename":"Team","name":"Core","slug":"core"}]"#);
+        assert_eq!(review_wanted(&team, "me"), Ok(Via::Team));
+        // Both: the direct request is what is said.
+        let both =
+            with(r#"[{"__typename":"Team","slug":"core"},{"__typename":"User","login":"me"}]"#);
+        assert_eq!(review_wanted(&both, "me"), Ok(Via::Direct));
+        // Someone else's request, or none: withdrawn or answered.
+        let other = with(r#"[{"__typename":"User","login":"bob"}]"#);
+        assert!(review_wanted(&other, "me").is_err());
+        assert!(review_wanted(&with("[]"), "me").is_err());
+
+        let mut pr = direct.clone();
+        pr.pr.is_draft = true;
+        assert!(review_wanted(&pr, "me").unwrap_err().contains("draft"));
+        let mut pr = direct.clone();
+        pr.pr.state = "MERGED".into();
+        assert!(review_wanted(&pr, "me").unwrap_err().contains("merged"));
+        let mut pr = direct.clone();
+        pr.pr.state = "CLOSED".into();
+        assert!(review_wanted(&pr, "me").is_err());
+        // Its author is the user, whatever the case.
+        assert!(review_wanted(&direct, "ada").unwrap_err().contains("own"));
+        let mut pr = team;
+        pr.author = None;
+        assert_eq!(review_wanted(&pr, "me"), Ok(Via::Team));
+    }
+
+    #[test]
+    fn a_review_rule_that_cannot_apply_does_not_start_a_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let app = App {
+            config: crate::config::load_or_create(&home).unwrap(),
+            db: crate::db::Database::open(&crate::config::index_path(&home)).unwrap(),
+            new_home: None,
+            home,
+        };
+        let mut me = None;
+        // Not a review request: notified, nothing asked of GitHub.
+        let ev = event(EventKind::Comment, "acme/api");
+        assert!(start_review(&app, &ev, &mut me).unwrap().is_none());
+        // A repository plete does not have is an error, for the assistant.
+        let ev = event(EventKind::ReviewRequested, "acme/api");
+        let err = start_review(&app, &ev, &mut me).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not in plete's store"),
+            "{err:#}"
+        );
+        assert!(matches!(
+            auto_review(&app, &ev, &mut me),
+            AutoReview::Assistant
+        ));
+        assert!(me.is_none(), "who the user is was not asked for");
+    }
+
+    #[test]
+    fn a_started_review_reads_as_one() {
+        let sent = Sent::ReviewStarted("review-api-3".into());
+        assert_eq!(sent.describe(), "review review-api-3 (started)");
+        assert_eq!(
+            summary(&[sent, Sent::Notified]),
+            "2 new GitHub events: 1 notified, 1 to review review-api-3 (started)"
         );
     }
 

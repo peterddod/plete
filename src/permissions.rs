@@ -2084,7 +2084,7 @@ pub struct ActionRecord {
 
 /// Append one record to the log, as a single line in a single write so two
 /// pletes writing at once do not interleave.
-fn append(
+pub fn append(
     log: &Path,
     capability: &str,
     action: &str,
