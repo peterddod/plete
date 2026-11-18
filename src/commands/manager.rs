@@ -159,6 +159,9 @@ pub(crate) fn as_planner(
     project: Option<&str>,
 ) -> Result<(Delegation, Option<u32>, profiles::Profile)> {
     let profile = profiles::find(app, PLANNER, project)?;
+    // Refused before anything is made: a harness without what a planner
+    // needs leaves nothing behind.
+    tasks::manager_harness(crate::agent::AgentSpec::from_config(&app.config)?.harness)?;
     let mut d = d.clone();
     d.manager_grant = profile.settings.allow.is_none();
     let (d, max_children) = super::task::with_profile(&d, Some(&profile))?;

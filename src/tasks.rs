@@ -1005,10 +1005,6 @@ pub struct AddedWorktree {
 /// branch it is detached at `origin/<default>`. With one, an existing local
 /// branch is checked out, one that exists only on origin is tracked, and
 /// anything else is created from `origin/<default>`.
-///
-/// A manager's worktrees are always detached and marked read-only, to read
-/// and review from: a lint that keeps an honest manager from writing code,
-/// not a guarantee (it runs unconfined, as the user).
 pub fn add_worktree(
     app: &App,
     task: &TaskRecord,
@@ -2750,13 +2746,11 @@ pub fn delete_reparenting(
 }
 
 /// Once `plan` is written: each moved task's new place, and what each
-/// node's grant dropped; every active manager in the subtrees gets its
-/// `BRIEF.md` again (its path and who it reports to changed); a running
-/// mover is handed its new brief now, without starting one that is not;
+/// node's grant dropped; a running mover is handed its new brief now, without starting one that is not;
 /// and each mover tells its new parent it moved there, in plete's words,
 /// naming its open question if it has one; then each open ask among the
 /// reports `kept` from a deleted task is delivered to the new parent
-/// that holds it now. Slugs only: a node may run this, and a manager
+/// that holds it now. Slugs only: a node may run this, and a task
 /// writes task names (C19). One line per thing said.
 fn after_move(app: &App, caller: &Caller, plan: &MovePlan, kept: &[i64]) -> Vec<String> {
     let mut lines = Vec::new();

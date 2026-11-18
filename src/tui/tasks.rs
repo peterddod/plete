@@ -5076,8 +5076,15 @@ impl Screen<'_> {
                     Some(pr) => app.db.set_task_pr(&task.id, Some(pr)),
                     None => Ok(()),
                 });
+            // Not started as a plain task: it would not be the planner asked for.
             if let Err(e) = recorded {
-                warnings.push(format!("{e:#}"));
+                self.refresh(false);
+                self.ui.message(
+                    "made the task, but could not make it a planner",
+                    vec![printable(&format!("{e:#}"))],
+                    None,
+                );
+                return;
             }
         }
         let under = match self.ui.node(spec.parent.as_str()) {

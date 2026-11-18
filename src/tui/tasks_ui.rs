@@ -130,7 +130,7 @@ pub const HELP_AGENTS: &[(&str, &str)] = &[
     ),
     (
         "l",
-        "the worklog (notes/worklog.md) of the assistant or a manager",
+        "the worklog (notes/worklog.md) of the assistant or a task",
     ),
     (
         "I",
@@ -150,7 +150,7 @@ pub const HELP_AGENTS: &[(&str, &str)] = &[
     ),
     (
         "n",
-        "a task or planner under the assistant or a task; a planner starts at once",
+        "a task, or a planner, under the node; a planner starts at once",
     ),
     (
         "y",
@@ -2530,7 +2530,7 @@ fn new_task_lines(form: &NewTaskForm) -> Vec<Line<'static>> {
                 },
                 field,
                 match planner {
-                    true => "  space switches · starts at once with its brief",
+                    true => "  space switches · starts at once on its goal",
                     false => "  space switches · ⏎ on it later starts its agent",
                 },
             )),

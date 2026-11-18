@@ -15832,26 +15832,17 @@ fn a_held_start_with_a_prompt_is_refused_on_an_agent_that_takes_none() {
     multi_session(&tmux);
     let tmux_env = tmux.to_string_lossy().to_string();
     let env = [("PLETE_TMUX", tmux_env.as_str()), ("PLETE_AGENT", "aider")];
-    let m = lab.new_task_with("m", &["--parent", "assistant"]);
-    lab.index()
-        .execute("UPDATE tasks SET kind = 'manager' WHERE id = ?1", [&m])
-        .unwrap();
-    succeeded(&lab.plete_at(&["manager", "pause", "m"], &lab.home(), &env));
-
-    let output = lab.plete_at(
-        &["task", "new", "kid", "--parent", "m", "--prompt", "go"],
+    // A task with tasks under it needs an agent with hooks, so kid is made
+    // under one, and held; the agent is changed after.
+    lab.new_task_with("m", &["--parent", "assistant"]);
+    let claude = [("PLETE_TMUX", tmux_env.as_str())];
+    succeeded(&lab.plete_at(&["task", "pause", "m"], &lab.home(), &claude));
+    succeeded(&lab.plete_at(
+        &["task", "new", "kid", "--parent", "m"],
         &lab.home(),
-        &env,
-    );
-    assert!(!output.status.success());
-    assert!(
-        stderr_of(&output).contains("takes no first prompt"),
-        "{}",
-        stderr_of(&output)
-    );
-    assert!(lab.home().join("tasks/kid").is_dir());
+        &claude,
+    ));
     let inbox = lab.home().join("tasks/kid/.plete/inbox.jsonl");
-    assert!(!inbox.exists());
 
     let output = lab.plete_at(&["task", "send", "kid", "hi"], &lab.home(), &env);
     assert!(!output.status.success());

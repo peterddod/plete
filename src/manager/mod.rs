@@ -1,8 +1,8 @@
 //! What every node that manages tasks has, whatever runs it: its home's
 //! templates by role, the fences what others wrote reaches it in, its inbox
-//! hand-over, a manager's `BRIEF.md` and first prompt, and ([`context`])
-//! the sections of its summary on its children, its todo and its inbox,
-//! and a manager's whole summary. The assistant is the root node;
+//! hand-over, a planner's first prompt, the tidying of an old manager's
+//! home, and ([`context`]) the sections of its summary on its children,
+//! its todo and its inbox. The assistant is the root node;
 //! [`crate::assistant`] keeps its sessions and windows.
 
 pub mod budget;

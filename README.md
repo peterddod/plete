@@ -1271,8 +1271,8 @@ a task by its slug in what they print.
 A planner's worktrees are ordinary: it may commit and push like any task,
 within its grant and the PR policy. No `BRIEF.md` is written for it: its goal,
 done-when, budget and what it may do are in the context each session starts
-with, with the tasks below it and their last reports, its budget, its todo
-list and what is queued for it. By its profile's instructions it keeps
+with, with the tasks below it, their last reports and the questions it
+holds. By its profile's instructions it keeps
 `notes/worklog.md` and `todo.md`, which it edits by hand (`plete todo` stays
 the assistant's list). The assistant learns of planners from its
 `plete-planners` skill.

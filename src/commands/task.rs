@@ -978,7 +978,11 @@ pub fn ls(app: &App, archived: bool) -> Result<()> {
             status.push_str(" (unanchored)");
             unanchored.push(task.slug.clone());
         }
-        let mut kind = String::new();
+        // A planner is said to be one (M29).
+        let mut kind = match tasks::role(app, &task) {
+            crate::db::tasks::Role::Planner => " (planner)".to_string(),
+            _ => String::new(),
+        };
         if app.db.task_notify_flags(&task.id)?.quiet {
             kind.push_str(" (quiet)");
         }
