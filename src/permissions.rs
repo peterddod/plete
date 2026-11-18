@@ -325,6 +325,7 @@ pub const READ_ONLY: &[&str] = &[
     "plete agents ls",
     "plete agents show",
     "plete notify",
+    "plete search",
 ];
 
 /// The assistant's own files, which it keeps through plete: pre-approved
@@ -710,6 +711,8 @@ pub fn gate(command: Option<&Commands>, terminal: bool) -> Gate {
         | Commands::Brief { .. }
         // Reads only, and cuts itself to what the caller reaches.
         | Commands::Show { .. }
+        // Reads only, and cuts itself to what the caller may see.
+        | Commands::Search { .. }
         // Reads only.
         | Commands::Doctor { .. }
         // Started by plete itself, under the command that was checked.
@@ -1794,6 +1797,8 @@ fn node_scope(command: Option<&Commands>) -> Option<Scope> {
         // Cuts itself to the reports and messages of the caller and the
         // tasks below it.
         Commands::Show { .. } => Some(Scope::Listed),
+        // Cuts itself to the sources the caller may see.
+        Commands::Search { .. } => Some(Scope::Listed),
         // Setup is the user's: a task with a parent only reads what is
         // staged.
         Commands::Setup { command, .. } => match command {
@@ -3290,6 +3295,7 @@ mod tests {
             (&["report", "escalate", "4"], true),
             (&["report", "ls"], true),
             (&["show", "r1"], true),
+            (&["search", "retries"], true),
             (&["brief"], true),
             (&["init-shell"], true),
             (&["install-shell"], false),
