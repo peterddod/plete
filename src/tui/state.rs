@@ -1121,6 +1121,11 @@ pub fn find_candidates(
     if !show_hidden {
         files.retain(|file| !file.split('/').any(|part| part.starts_with('.')));
     }
+    // Git still lists a tracked file deleted from the worktree, or left out of
+    // a sparse checkout: there is nothing there to reveal.
+    if in_repo {
+        files.retain(|file| root.join(file).symlink_metadata().is_ok());
+    }
     files.sort();
     files.dedup();
     let capped = files.len() > FIND_LIMIT;
@@ -1139,7 +1144,11 @@ fn walk_files(root: &Path, show_hidden: bool) -> Vec<String> {
         if files.len() > FIND_LIMIT {
             break;
         }
-        if !entry.file_type().is_file() {
+        // A link to a file is a file the tree shows; a link to a folder is not
+        // followed, so a link back up cannot walk forever.
+        let file =
+            entry.file_type().is_file() || (entry.path_is_symlink() && entry.path().is_file());
+        if !file {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(root) else {
@@ -2666,5 +2675,28 @@ mod tests {
         assert!(explorer.select_row(3));
         assert_eq!(cursor(&explorer), "z");
         assert_eq!(explorer.cwd, dir.path());
+    }
+
+    /// A tracked file deleted from the worktree is nothing to find.
+    #[test]
+    fn find_leaves_out_tracked_files_that_are_gone() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(ok.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("kept.rs"), "").unwrap();
+        std::fs::write(root.join("gone.rs"), "").unwrap();
+        git(&["add", "kept.rs", "gone.rs"]);
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        let (files, capped) = find_candidates(root, true, false).unwrap();
+        assert_eq!(files, ["kept.rs"]);
+        assert!(!capped);
     }
 }

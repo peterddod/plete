@@ -787,6 +787,9 @@ fn handle_overlay_key(
                 let rel = rel.clone();
                 let said = match explorer.reveal(&rel) {
                     Ok(true) => format!("found {rel} · ⏎ opens it"),
+                    Ok(false) if !explorer.root.join(&rel).exists() => {
+                        format!("{rel} no longer exists")
+                    }
                     Ok(false) => format!("{rel} is not shown — ^d toggles hidden files"),
                     Err(e) => format!("could not show {rel}: {e:#}"),
                 };
@@ -1377,7 +1380,8 @@ fn edit_find(
         KeyCode::Backspace => {
             query.pop();
         }
-        KeyCode::Char(c) if !ctrl && !alt => query.push(c),
+        // AltGr arrives as ctrl+alt, and types `@` or `{` on many layouts.
+        KeyCode::Char(c) if ctrl == alt => query.push(c),
         _ => {}
     }
     // A moved selection stays put; an edited query starts again at the best.

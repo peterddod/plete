@@ -515,7 +515,7 @@ pub fn tracked_files(path: &Path) -> Result<Vec<String>> {
 /// are not ignored — relative to it. A nested repository is listed by git as
 /// one `dir/` entry, which is no file, so it is left out.
 pub fn visible_files(path: &Path) -> Result<Vec<String>> {
-    let out = git_output(
+    let out = git_output_raw(
         path,
         &[
             "ls-files",
@@ -524,11 +524,12 @@ pub fn visible_files(path: &Path) -> Result<Vec<String>> {
             "--exclude-standard",
             "-z",
         ],
-        &[],
-        None,
     )?;
+    // A name that is not UTF-8 cannot be typed, matched or drawn, and a lossy
+    // copy of it names no file; a nested repository's `dir/` is no file either.
     Ok(out
-        .split('\0')
+        .split(|&b| b == 0)
+        .filter_map(|p| std::str::from_utf8(p).ok())
         .filter(|p| !p.is_empty() && !p.ends_with('/'))
         .map(str::to_string)
         .collect())
