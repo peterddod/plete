@@ -3241,7 +3241,7 @@ The capabilities: `task.create`, `task.open`, `task.send`, `task.archive`,
 `review.start`, `project.read`, `project.create`, `project.delete`,
 `project.write` (the project's shared docs), `repo.clone`, `repo.import`, `repo.sync`, `shell.install`, `watch.install`,
 `pr.comment`, `pr.review`, `pr.merge` (`plete pr merge`), `task.grant`
-(`plete task grant` and `budget`),, `task.stop` (`plete task pause`, `resume` and `stop`) and
+(`plete task grant` and `budget`), `task.stop` (`plete task pause`, `resume` and `stop`) and
 `assistant.interrupt` (`--interrupt` on `plete report` and `plete task send
 assistant`, for the tasks under the assistant; see [Letting a task
 interrupt the assistant](#letting-a-task-interrupt-the-assistant)). Nothing is
