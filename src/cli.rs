@@ -228,6 +228,11 @@ pub enum Commands {
         /// Poll once and exit: what launchd and the tasks list run
         #[arg(long)]
         once: bool,
+        /// With --once, ask each source only when its interval has passed
+        /// (`[watch]`'s `notifications_interval_secs` and `interval_secs`):
+        /// what the timer and the tasks list run
+        #[arg(long, requires = "once")]
+        due: bool,
         #[command(subcommand)]
         command: Option<WatchCommands>,
     },

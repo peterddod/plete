@@ -10,10 +10,10 @@
 //! Notifications run on a faster cadence than the rest: `[watch]
 //! notifications_interval_secs` (60), never sooner than GitHub's
 //! `X-Poll-Interval`, against `interval_secs` (120) for the PRs' checks and
-//! the projects. The timer runs `plete watch --once` every tick (the smaller
-//! of the two), and each source is asked only when its own
-//! interval has passed ([`poll`]); a tick with nothing due asks GitHub
-//! nothing.
+//! the projects. The timer runs `plete watch --once --due` every tick (the
+//! smaller of the two), and with `--due` each source is asked only when its
+//! own interval has passed ([`poll`]); a tick with nothing due asks GitHub
+//! nothing. A bare `plete watch --once` asks every source, as it always did.
 //!
 //! Each poll that asks for the PRs' checks also archives the reviews whose
 //! PR has been merged or closed, once their agent is idle
@@ -33,7 +33,7 @@
 //! goes near a shell; what the assistant or a manager then does is held to
 //! its permissions by plete, whatever the event says.
 //!
-//! `plete watch install` has launchd run `plete watch --once` every
+//! `plete watch install` has launchd run `plete watch --once --due` every
 //! tick on macOS; elsewhere it prints a systemd user timer to
 //! install by hand. The tasks list starts a poll in the background too,
 //! while it is open, when config.toml has a `[watch]` section.
@@ -463,7 +463,13 @@ fn notifications_due(watch: &WatchConfig, state: &WatchState, now: i64) -> bool 
 
 /// Ask `source` what is new since `state`, and bring `state` up to date. A
 /// source that fails keeps what it had, and is asked again next time.
-pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, now: i64) -> Polled {
+pub fn poll(
+    source: &dyn Source,
+    watch: &WatchConfig,
+    state: &mut WatchState,
+    now: i64,
+    due: bool,
+) -> Polled {
     let mut out = Polled::default();
     let watched =
         |repo: &str| watch.repos.is_empty() || watch.repos.iter().any(|p| repo_matches(p, repo));
@@ -473,12 +479,13 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
     // is the user's, and the checks may be stale: a PR opened since they
     // were polled would be told of twice. So such a notification brings the
     // checks forward.
-    let fetched = notifications_due(watch, state, now).then(|| {
+    let fetched = (!due || notifications_due(watch, state, now)).then(|| {
         state.notifications_at = Some(now);
         source.notifications(state.last_modified.as_deref())
     });
     out.asked = fetched.is_some();
-    let broad = broad_due(watch, state, now)
+    let broad = !due
+        || broad_due(watch, state, now)
         || matches!(&fetched, Some(Ok(Notifications::Changed { threads, .. }))
             if threads.iter().any(|n| needs_checks(state, n, &watched)));
 
@@ -1567,7 +1574,7 @@ fn trim_log(home: &Path) {
 
 /// `plete watch --once`: poll, send what is new where the rules say, and
 /// remember what was seen. Quietly does nothing while another poll runs.
-pub fn run_once(app: &App) -> Result<()> {
+pub fn run_once(app: &App, due: bool) -> Result<()> {
     let Some(_lock) = try_lock(&app.home)? else {
         eprintln!("plete: another plete watch is running");
         return Ok(());
@@ -1578,7 +1585,7 @@ pub fn run_once(app: &App) -> Result<()> {
     let watch = app.config.watch.clone().unwrap_or_default();
     let path = config::watch_state_path(&app.home);
     let mut state = load_state(&path);
-    let polled = poll(&Gh { dir: &app.home }, &watch, &mut state, now);
+    let polled = poll(&Gh { dir: &app.home }, &watch, &mut state, now, due);
     let sent = dispatch(app, &app.config.assistant.rules, &polled.events);
     tell_stuck_ci(app, &polled.events, &state);
     state.last_run = Some(now_secs());
@@ -1642,7 +1649,7 @@ pub fn run_once(app: &App) -> Result<()> {
     // A tick that found nothing and polled no more is not worth a log line.
     if !sent.is_empty() || polled.broad {
         eprintln!("plete: {}", summary(&sent));
-    } else if !polled.asked {
+    } else if due && !polled.asked {
         // Not under the timer, whose tick is when notifications fall due
         // (unless GitHub asks for longer).
         eprintln!(
@@ -1736,7 +1743,9 @@ fn launch(home: &Path, new_home: Option<&Path>) -> Result<()> {
 /// assistant, nor the task whose terminal opened the tasks list.
 fn once_command(home: &Path, new_home: Option<&Path>, exe: &Path) -> Command {
     let mut cmd = Command::new("nohup");
-    cmd.arg(exe).args(["watch", "--once"]).current_dir(home);
+    cmd.arg(exe)
+        .args(["watch", "--once", "--due"])
+        .current_dir(home);
     crate::env::set_home(&mut cmd, home, new_home);
     crate::env::remove_both(&mut cmd, crate::permissions::ASSISTANT_ENV);
     crate::env::remove_both(&mut cmd, crate::tasks::TASK_ID_ENV);
@@ -1788,6 +1797,7 @@ pub fn plist(
 		<string>{exe}</string>
 		<string>watch</string>
 		<string>--once</string>
+		<string>--due</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>{interval}</integer>
@@ -1847,7 +1857,7 @@ pub fn systemd_units(
         "[Unit]\nDescription=plete: poll GitHub for the assistant and your tasks\n\n\
          [Service]\nType=oneshot\nEnvironment={env}\nEnvironment={new_env}\n{new_home}\
          Environment=JEET_BACKGROUND=1\nEnvironment=PLETE_BACKGROUND=1\n\
-         ExecStart={exe} watch --once\n",
+         ExecStart={exe} watch --once --due\n",
         env = systemd_word(&format!("JEET_HOME={}", home.display())),
         new_env = systemd_word(&format!("PLETE_HOME={}", home.display())),
         exe = systemd_word(&exe.to_string_lossy()),
@@ -2116,7 +2126,7 @@ mod tests {
         }
         assert!(envs.contains(&(std::ffi::OsStr::new("PLETE_HOME"), Some(home.as_os_str()))));
         let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, ["/bin/plete", "watch", "--once"]);
+        assert_eq!(args, ["/bin/plete", "watch", "--once", "--due"]);
     }
 
     /// GitHub as fixtures say, noting what it was asked.
@@ -2195,7 +2205,7 @@ mod tests {
         let mut state = WatchState::default();
 
         // The first poll only notes what is there.
-        let first = poll(&fake, &watch, &mut state, 1000);
+        let first = poll(&fake, &watch, &mut state, 1000, true);
         assert!(first.events.is_empty(), "{:?}", first.events);
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         assert_eq!(state.seen.as_ref().unwrap().len(), 3);
@@ -2211,7 +2221,7 @@ mod tests {
                 }),
             },
         );
-        let second = poll(&fake, &watch, &mut state, 2000);
+        let second = poll(&fake, &watch, &mut state, 2000, true);
         assert!(second.errors.is_empty(), "{:?}", second.errors);
         assert_eq!(
             *fake.asked_since.borrow(),
@@ -2257,7 +2267,7 @@ mod tests {
             ..WatchState::default()
         };
         let mut before = state.clone();
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
         assert!(polled.events.is_empty());
         assert_eq!(state.notifications_at, Some(1000));
         assert_eq!(state.broad_at, Some(1000));
@@ -2308,7 +2318,7 @@ mod tests {
         let mut state = state_polled_at(1000);
         let before = state.clone();
         // 60 s on: notifications are due (60 s), the rest (120 s) is not.
-        let polled = poll(&fake, &watch, &mut state, 1060);
+        let polled = poll(&fake, &watch, &mut state, 1060, true);
         assert!(!polled.broad);
         assert_eq!(fake.asked_since.borrow().len(), 1);
         assert_eq!((fake.prs_asked.get(), fake.items_asked.get()), (0, 0));
@@ -2317,12 +2327,12 @@ mod tests {
         assert_eq!(state.broad_at, Some(1000));
         assert_eq!(state.notifications_at, Some(1060));
         // A tick that early again asks nothing at all.
-        let polled = poll(&fake, &watch, &mut state, 1070);
+        let polled = poll(&fake, &watch, &mut state, 1070, true);
         assert!(!polled.broad && polled.events.is_empty());
         assert_eq!(fake.asked_since.borrow().len(), 1);
         assert_eq!((fake.prs_asked.get(), fake.items_asked.get()), (0, 0));
         // At 120 s everything is due again.
-        let polled = poll(&fake, &watch, &mut state, 1120);
+        let polled = poll(&fake, &watch, &mut state, 1120, true);
         assert!(polled.broad);
         assert_eq!((fake.prs_asked.get(), fake.items_asked.get()), (1, 1));
         assert_eq!(state.broad_at, Some(1120));
@@ -2333,9 +2343,9 @@ mod tests {
     fn a_timer_a_few_seconds_early_is_not_missed() {
         let fake = Fake::default();
         let mut state = state_polled_at(1000);
-        poll(&fake, &WatchConfig::default(), &mut state, 1056);
+        poll(&fake, &WatchConfig::default(), &mut state, 1056, true);
         assert_eq!(fake.asked_since.borrow().len(), 1);
-        poll(&fake, &WatchConfig::default(), &mut state, 1060);
+        poll(&fake, &WatchConfig::default(), &mut state, 1060, true);
         assert_eq!(fake.asked_since.borrow().len(), 1, "4 s after is too soon");
         assert_eq!(fake.prs_asked.get(), 0);
     }
@@ -2362,12 +2372,12 @@ mod tests {
                 poll_interval: None,
             }));
         let mut state = state_polled_at(1000);
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1060);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1060, true);
         assert!(polled.broad);
         assert_eq!(fake.prs_asked.get(), 1);
         assert_eq!(kinds(&polled.events), [(EventKind::CiFailed, Some(2))]);
         // The next broad tick has nothing more to say of it.
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1180);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1180, true);
         assert!(polled.events.is_empty(), "{:?}", polled.events);
     }
 
@@ -2376,9 +2386,9 @@ mod tests {
         let fake = Fake::default();
         let mut state = state_polled_at(1000);
         state.poll_interval = Some(300);
-        poll(&fake, &WatchConfig::default(), &mut state, 1100);
+        poll(&fake, &WatchConfig::default(), &mut state, 1100, true);
         assert!(fake.asked_since.borrow().is_empty());
-        poll(&fake, &WatchConfig::default(), &mut state, 1300);
+        poll(&fake, &WatchConfig::default(), &mut state, 1300, true);
         assert_eq!(fake.asked_since.borrow().len(), 1);
         // What GitHub says next is kept; a 304 answer carries it too.
         fake.notifications
@@ -2386,8 +2396,18 @@ mod tests {
             .push(Ok(Notifications::NotModified {
                 poll_interval: Some(90),
             }));
-        poll(&fake, &WatchConfig::default(), &mut state, 1600);
+        poll(&fake, &WatchConfig::default(), &mut state, 1600, true);
         assert_eq!(state.poll_interval, Some(90));
+    }
+
+    #[test]
+    fn a_poll_not_asked_for_what_is_due_asks_everything() {
+        let fake = Fake::default();
+        let mut state = state_polled_at(1000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1010, false);
+        assert!(polled.broad && polled.asked);
+        assert_eq!(fake.prs_asked.get(), 1);
+        assert_eq!(state.broad_at, Some(1010));
     }
 
     #[test]
@@ -2400,7 +2420,7 @@ mod tests {
             checks: Some(BTreeMap::new()),
             ..WatchState::default()
         };
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
         assert!(polled.broad);
         assert_eq!(fake.asked_since.borrow().len(), 1);
         assert_eq!(
@@ -2420,7 +2440,7 @@ mod tests {
             seen: Some(BTreeMap::new()),
             ..WatchState::default()
         };
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
         assert_eq!(polled.errors.len(), 1);
         assert!(polled.errors[0].starts_with("notifications: "));
         assert_eq!(state.last_modified.as_deref(), Some("then"));
@@ -2438,8 +2458,8 @@ mod tests {
             ..WatchConfig::default()
         };
         let mut state = WatchState::default();
-        poll(&fake, &watch, &mut state, 1000);
-        let polled = poll(&fake, &watch, &mut state, 2000);
+        poll(&fake, &watch, &mut state, 1000, true);
+        let polled = poll(&fake, &watch, &mut state, 2000, true);
         assert_eq!(kinds(&polled.events), [(EventKind::Mention, Some(7))]);
     }
 
@@ -2599,8 +2619,8 @@ mod tests {
             changed("notifications_before.json", "a"),
         ]);
         let mut state = WatchState::default();
-        poll(&fake, &WatchConfig::default(), &mut state, 1000);
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000);
+        poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000, true);
         let closing: Vec<(EventKind, Option<u64>)> = kinds(&polled.events)
             .into_iter()
             .filter(|(k, _)| matches!(k, EventKind::PrMerged | EventKind::PrClosed))
@@ -2622,10 +2642,10 @@ mod tests {
             .borrow_mut()
             .extend([vec![], vec![], vec![pr("acme/api", 42, "a", None)]]);
         let mut state = WatchState::default();
-        poll(&fake, &WatchConfig::default(), &mut state, 1000);
+        poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
 
         // Gone, and GitHub cannot say how: kept, and said so.
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000, true);
         assert!(polled.events.is_empty(), "{:?}", polled.events);
         assert_eq!(polled.errors.len(), 1, "{:?}", polled.errors);
         assert!(state.checks.as_ref().unwrap().contains_key("acme/api#42"));
@@ -2639,7 +2659,7 @@ mod tests {
                 merged_by: None,
             },
         );
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 3000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 3000, true);
         assert!(polled.errors.is_empty(), "{:?}", polled.errors);
         assert_eq!(kinds(&polled.events), [(EventKind::PrMerged, Some(42))]);
         assert!(state.checks.as_ref().unwrap().is_empty());
@@ -2662,8 +2682,8 @@ mod tests {
             changed("notifications_before.json", "a"),
         ]);
         let mut state = WatchState::default();
-        poll(&fake, &WatchConfig::default(), &mut state, 1000);
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000);
+        poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000, true);
         let ci: Vec<(EventKind, Option<u64>)> = kinds(&polled.events)
             .into_iter()
             .filter(|(k, _)| matches!(k, EventKind::CiFailed | EventKind::CiPassed))
@@ -3150,6 +3170,7 @@ mod tests {
 		<string>/opt/plete &amp; co/plete</string>
 		<string>watch</string>
 		<string>--once</string>
+		<string>--due</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>120</integer>
@@ -3195,7 +3216,7 @@ mod tests {
              [Service]\nType=oneshot\nEnvironment=\"JEET_HOME=/home/me/100%% \\\"j\\\"\"\n\
              Environment=\"PLETE_HOME=/home/me/100%% \\\"j\\\"\"\n\
              Environment=JEET_BACKGROUND=1\nEnvironment=PLETE_BACKGROUND=1\n\
-             ExecStart=\"/home/me/bin/plete\" watch --once\n"
+             ExecStart=\"/home/me/bin/plete\" watch --once --due\n"
         );
         assert_eq!(timer_name, "plete-watch.timer");
         assert_eq!(

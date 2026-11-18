@@ -1456,7 +1456,8 @@ no permission for its own list.
 ### Watching GitHub
 
 ```bash
-plete watch --once        # poll now: what launchd and the tasks list run
+plete watch --once        # poll now, every source
+plete watch --once --due  # only the sources whose interval has passed: what the timer runs
 plete watch install       # every tick (see `[watch]` below), with launchd (macOS)
 plete watch uninstall
 plete watch status        # installed? last poll, what it follows
@@ -1529,10 +1530,12 @@ so a review request is seen within about a minute), your open PRs' checks and
 the projects every `interval_secs`. An answer of "not modified" costs nothing
 against GitHub's rate limit, and GitHub's own `X-Poll-Interval` is honoured:
 notifications are never asked for sooner than it says, whatever you set. The
-timer runs `plete watch --once` every tick, the smaller of the two intervals,
-and each source is asked only when it is due; a tick with nothing due asks
-GitHub nothing. An installed timer picks up a changed interval only after you
-run `plete watch install` again.
+timer runs `plete watch --once --due` every tick, the smaller of the two
+intervals, and each source is asked only when it is due; a tick with nothing
+due asks GitHub nothing. A bare `plete watch --once` asks every source, as it
+always did. An installed timer picks up a changed interval, and `--due`, only
+after you run `plete watch install` again; until then it runs as before, every
+`interval_secs`, asking everything.
 
 `on` and `repos` may be left out to match anything. Events for the assistant
 go to its sessions by the rules above (primary, else most recent, else a new
@@ -1552,7 +1555,7 @@ event, and where it went, is appended to
 `~/.plete/watch-events.jsonl`.
 
 `plete watch install` writes `~/Library/LaunchAgents/dev.plete.watch.plist`,
-which runs `plete watch --once` every tick with the `PATH` you
+which runs `plete watch --once --due` every tick with the `PATH` you
 installed it from, logging to `~/.plete/watch.log`, and loads it with
 `launchctl bootstrap`. Elsewhere it installs nothing, and prints a systemd user
 service and timer to set up instead. The job never starts a tmux server: one
