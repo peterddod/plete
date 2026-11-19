@@ -164,7 +164,7 @@ refresh. The filter narrows the level the cursor is in — `com` above has hidde
 `src/`'s other entries — and leaves the rest of the tree whole; the count in the
 title is for that level.
 
-The bottom line shows the keys that apply right now — a file offers `⏎ edit`,
+The bottom line shows the keys that apply right now — a file offers `⏎ show` and `^e edit`,
 a closed folder `⏎ open` and `→ open`, an open one `⏎ close` and `← close`, a
 command line `⏎ run` — and ends in `F1 +N more` when they do not all fit. `F1`
 opens the key list with those keys first.
@@ -204,12 +204,24 @@ match sorts to the top whatever else the filter caught.
 | `↑` / `↓` | move through the tree (with a filter typed, among that level's matches) |
 | `→` | a closed folder: open it · an open one: go to its first entry |
 | `←` | an open folder: close it · otherwise go to the folder you are in (never above the worktree root) |
-| `⏎` | folder: open or close it where it stands · file: open it in your editor |
+| `⏎` | folder: open or close it where it stands · file: show it in the other pane (read-only) |
 | click | a folder to open or close it, a file to select it, a path crumb to jump to that folder |
 | scroll | move the cursor |
 | shift-drag | select text (see below) |
 | `Home` / `End` | jump to the top / bottom |
 | `PageUp` / `PageDown` | move ten rows |
+
+#### Viewing files
+
+`⏎` on a file shows it in the other pane — the explorer splits to make room, and
+keeps the keyboard, so `⏎` on the next file replaces the view. The view is
+read-only, with line numbers and syntax colours (drawn plain for a moment while
+they are worked out); binary files and files over 2 MiB are not shown. `ctrl-l`
+moves into it: `↑` `↓` `PgUp` `PgDn` `Home` `End` and the wheel scroll, `←` `→`
+scroll sideways, `esc` or `q` closes it. `e` opens the file in `$EDITOR`: inside
+tmux in a split beside plete, otherwise plete steps aside until the editor
+exits. `ctrl-e` does the same from the explorer. Only the explorer closes
+last: `esc` or `ctrl-v` never leave a file on its own.
 
 While the explorer is up it has the mouse, which means your terminal's own
 click-drag text selection is off for as long as it runs. Hold **shift** while
@@ -225,8 +237,9 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 |-----|--------|
 | `ctrl-a` | the task's coding agent, in its tmux session — started if it is not running |
 | `ctrl-t` | go to: `r` the worktree root (or back to the worktree you left), `t` the task's directory, `p` the task's project folder, `w` the worktrees |
-| `ctrl-n` | find a file by a few of its letters: `⏎` shows it in the tree |
-| `ctrl-v` | split into two explorers side by side, or close the other one |
+| `ctrl-n` | find a file by a few of its letters: `⏎` shows it in the tree, and a file in the other pane |
+| `ctrl-e` | open the highlighted file in your editor (`$VISUAL`/`$EDITOR`) |
+| `ctrl-v` | split into two explorers side by side, or close the other pane |
 | `ctrl-l` | focus the other pane |
 | `ctrl-w` | the repository's worktrees: `⏎` switches to one, `o` opens its PR |
 | `ctrl-f` | diff the highlighted file or folder against the default branch |
