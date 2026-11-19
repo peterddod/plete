@@ -915,9 +915,9 @@ mod tests {
         };
         let root = super::super::root(&app).unwrap();
         for (slug, kind, parent) in [
-            ("m", TaskKind::Manager, root.id.as_str()),
+            ("m", TaskKind::Work, root.id.as_str()),
             ("w1", TaskKind::Work, "m"),
-            ("m2", TaskKind::Manager, "m"),
+            ("m2", TaskKind::Work, "m"),
             ("w2", TaskKind::Work, "m2"),
         ] {
             app.db.insert_task(&task(slug, kind, parent)).unwrap();
@@ -992,7 +992,7 @@ mod tests {
     fn the_tree_counts_its_tasks_below_the_assistant() {
         let live = [
             task("w", TaskKind::Work, "a"),
-            task("m", TaskKind::Manager, "a"),
+            task("m", TaskKind::Work, "a"),
             TaskRecord {
                 parent_id: None,
                 ..task("top", TaskKind::Work, "a")
@@ -1348,7 +1348,7 @@ mod tests {
         let err = resume(&app, &Caller::Root, &get(&app, "m2")).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "manager m2 is under manager m, which is paused; resume that first"
+            "task m2 is under task m, which is paused; resume that first"
         );
         assert_eq!(get(&app, "m2").run_state, RunState::Paused);
 
@@ -1376,7 +1376,7 @@ mod tests {
         let err = may(Setter::User, &Caller::Root).unwrap_err();
         assert_eq!(
             err,
-            "manager m2 was paused by the user; only the user can resume it"
+            "task m2 was paused by the user; only the user can resume it"
         );
         assert!(may(Setter::User, &m).is_err());
         assert!(may(Setter::User, &Caller::User).is_ok());
@@ -1390,7 +1390,7 @@ mod tests {
         assert!(may(Setter::Node("m".into()), &Caller::Root).is_ok());
         // A node below may not undo what the node above it set.
         let err = may(Setter::Node("m".into()), &m2).unwrap_err();
-        assert!(err.contains("by manager m; only manager m"), "{err}");
+        assert!(err.contains("by task m; only task m"), "{err}");
         // A node above undoes what one below it set, however far below;
         // one beside it does not.
         assert!(may(Setter::Node("m2".into()), &m).is_ok());
@@ -1398,7 +1398,7 @@ mod tests {
         assert!(may(Setter::Node("w2".into()), &m2).is_ok());
         let w1 = Caller::Node(get(&app, "w1"));
         let err = may(Setter::Node("m2".into()), &w1).unwrap_err();
-        assert!(err.contains("by manager m2; only manager m2"), "{err}");
+        assert!(err.contains("by task m2; only task m2"), "{err}");
         assert!(may(Setter::Node("w2".into()), &w1).is_err());
         // The budget ranks lowest: anyone in scope resumes once it is raised.
         app.db.set_budget_max("m2", None, Some(1)).unwrap();
@@ -1712,7 +1712,7 @@ mod tests {
             let started = runtime::ensure_running(&app, &w2, None, Some("go"), admission);
             assert_eq!(
                 started.err().unwrap().to_string(),
-                "task w2 is paused under manager m; `plete task resume m` first"
+                "task w2 is paused under task m; `plete task resume m` first"
             );
         }
         // Held is not queued.

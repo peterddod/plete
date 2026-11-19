@@ -69,7 +69,7 @@ impl Origin {
     pub fn task(app: &App, task: &TaskRecord) -> Result<Origin> {
         let flags = app.db.task_notify_flags(&task.id)?;
         Ok(Origin {
-            level: Some(super::level(task.kind)),
+            level: Some(super::level(crate::tasks::role(app, task))),
             slug: Some(task.slug.clone()),
             top_level: under_assistant(app, task.parent_id.as_deref())?,
             user_started: flags.user_started(),

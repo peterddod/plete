@@ -21,7 +21,9 @@ use crate::agent::AgentSpec;
 use crate::cd;
 use crate::context::App;
 use crate::db::anchors::AnchorKind;
-use crate::db::tasks::{RunState, TaskKind, TaskRecord, TaskSessionRecord, TaskState};
+use crate::db::tasks::{
+    Role as ConfigRole, RunState, TaskKind, TaskRecord, TaskSessionRecord, TaskState,
+};
 use crate::harness::HookSetup;
 use crate::identity;
 use crate::instructions;
@@ -96,7 +98,7 @@ pub fn ensure_files(dir: &Path) -> Result<Vec<&'static str>> {
 
 /// The built-in templates, by where they go under [`BUILTIN`]: the
 /// assistant's files at their target ids (`assistant/AGENTS.md`, …) and
-/// those of new homes under `templates/{root,manager,worker}/`.
+/// those of new homes under `templates/{root,worker}/`.
 fn builtin_files() -> Vec<(String, &'static str)> {
     let mut out = Vec::new();
     let instructions_only = |rel: &str| {
@@ -108,11 +110,9 @@ fn builtin_files() -> Vec<(String, &'static str)> {
             out.push((format!("assistant/{rel}"), text));
         }
     }
-    for (role, dir) in [(Role::Root, "root"), (Role::Manager, "manager")] {
-        for (rel, text) in manager::templates(role) {
-            if instructions_only(rel) {
-                out.push((format!("templates/{dir}/{rel}"), text));
-            }
+    for (rel, text) in manager::templates(Role::Root) {
+        if instructions_only(rel) {
+            out.push((format!("templates/root/{rel}"), text));
         }
     }
     out.push(("templates/worker/SKILL.md".to_string(), tasks::SKILL));
@@ -304,7 +304,7 @@ fn home_entries(home: &Path) -> Vec<String> {
 pub fn run(app: &App, new: bool) -> Result<()> {
     tmux::require()?;
     let spec = AgentSpec::from_config(&app.config)?
-        .with_model(app.config.models.for_kind(TaskKind::Setup));
+        .with_model(app.config.models.for_role(ConfigRole::Setup));
     if !(spec.supports_sessions() && spec.has_hooks() && spec.harness.prompt_args("").is_some()) {
         bail!(
             "the setup agent runs in a harness whose sessions, hooks and first prompt \
@@ -548,7 +548,6 @@ mod tests {
             "assistant/.claude/skills/plete-assistant/SKILL.md",
             "assistant/.claude/skills/plete-planners/SKILL.md",
             "templates/root/AGENTS.md",
-            "templates/manager/AGENTS.md",
             "templates/worker/SKILL.md",
         ] {
             assert!(ids.contains(&id), "{id}: {ids:?}");

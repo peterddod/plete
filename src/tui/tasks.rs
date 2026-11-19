@@ -417,8 +417,8 @@ pub struct NewTaskForm {
     /// What `--parent` would name (`assistant`, or the node's id) and how
     /// the node is shown; `None` for a top-level task.
     pub parent: Option<(String, String)>,
-    /// Work or Manager, under a node.
-    pub kind: TaskKind,
+    /// Started as the planner profile, under a node.
+    pub planner: bool,
     pub name: String,
     /// What a blank name becomes.
     pub default_name: String,
@@ -452,7 +452,8 @@ pub struct TaskSpec {
 pub struct ChildSpec {
     /// `assistant`, or the node's id.
     pub parent: String,
-    pub kind: TaskKind,
+    /// Started as the planner profile, at once.
+    pub planner: bool,
     pub name: String,
     pub goal: Option<String>,
     pub done: Option<String>,
@@ -488,7 +489,7 @@ impl NewTaskForm {
         NewTaskForm {
             field: Field::Name,
             parent: None,
-            kind: TaskKind::Work,
+            planner: false,
             name: String::new(),
             default_name,
             goal: String::new(),
@@ -513,14 +514,12 @@ impl NewTaskForm {
         }
     }
 
-    /// The fields shown, in order: a manager has a project but no worktrees
-    /// (`manager new` takes none).
+    /// The fields shown, in order.
     pub fn fields(&self) -> &'static [Field] {
         use Field::*;
-        match (&self.parent, self.kind) {
-            (None, _) => &[Name, Project, Repos, Branch],
-            (Some(_), TaskKind::Manager) => &[Kind, Name, Goal, Done, Budget, Allow, Project],
-            (Some(_), _) => &[
+        match &self.parent {
+            None => &[Name, Project, Repos, Branch],
+            Some(_) => &[
                 Kind, Name, Goal, Done, Budget, Allow, Project, Repos, Branch,
             ],
         }
@@ -546,12 +545,9 @@ impl NewTaskForm {
         }
     }
 
-    /// A task, or a manager, under a node.
+    /// A task, or a planner, under a node.
     fn toggle_kind(&mut self) {
-        self.kind = match self.kind {
-            TaskKind::Manager => TaskKind::Work,
-            _ => TaskKind::Manager,
-        };
+        self.planner = !self.planner;
     }
 
     pub fn project_name(&self) -> Option<&str> {
@@ -598,17 +594,7 @@ impl NewTaskForm {
         let Some((parent, _)) = &self.parent else {
             return Err("a task under a node needs its parent".into());
         };
-        let task = match self.kind {
-            // A manager shows a project but no repos or branch, so only
-            // the project can say what it takes.
-            TaskKind::Manager => TaskSpec {
-                name: self.name_or_default(),
-                project: self.project_name().map(str::to_string),
-                repos: Vec::new(),
-                branch: None,
-            },
-            _ => self.spec()?,
-        };
+        let task = self.spec()?;
         let text = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
         let parts = |s: &str| {
             s.split(',')
@@ -633,7 +619,7 @@ impl NewTaskForm {
         };
         Ok(ChildSpec {
             parent: parent.clone(),
-            kind: self.kind,
+            planner: self.planner,
             name: task.name,
             goal: text(&self.goal),
             done: text(&self.done),
@@ -890,7 +876,7 @@ pub enum Action {
         parent_id: String,
     },
     /// Make, as the user, the task or manager the form describes under its
-    /// node; a manager starts at once (Q17).
+    /// node; a planner starts at once (Q17).
     CreateChild(ChildSpec),
     /// With tasks under it, `a` archives them all, leaves first, once
     /// confirmed: `recursive` says the confirm was for them all.
@@ -1525,11 +1511,9 @@ impl TasksUi {
                     && self.level_parent(r) == Some(row.task.id.as_str())
             });
         }
-        row.task.kind == TaskKind::Manager
-            || self.rows.iter().any(|r| {
-                r.task.state == TaskState::Active
-                    && r.task.parent_id.as_deref() == Some(&row.task.id)
-            })
+        self.rows.iter().any(|r| {
+            r.task.state == TaskState::Active && r.task.parent_id.as_deref() == Some(&row.task.id)
+        })
     }
 
     /// The managers above active task `id`, outermost first: the path that
@@ -2437,7 +2421,7 @@ impl TasksUi {
                         None
                     }
                     (true, Some(node))
-                        if matches!(node.kind, TaskKind::Assistant | TaskKind::Manager)
+                        if matches!(node.kind, TaskKind::Assistant)
                             || (node.kind == TaskKind::Work && node.parent_id.is_some()) =>
                     {
                         Some(Action::NewChildForm { parent_id: node.id })
@@ -5002,9 +4986,9 @@ impl Screen<'_> {
         Ok(())
     }
 
-    /// `n` in the agents view: make the task or manager `spec` describes,
+    /// `n` in the agents view: make the task or planner `spec` describes,
     /// as `plete task new --parent` and `plete manager new` make it, as the
-    /// user: `plan_child`, then `create`, then, for a manager, its start
+    /// user: `plan_child`, then `create`, then, for a planner, its start
     /// (Q17). A worker is not started, as `n` in the active view does not
     /// start one. What `plan_child` refuses stays on the form.
     /// Record task `id`, just made here, as the user's, when this screen
@@ -5024,15 +5008,30 @@ impl Screen<'_> {
     fn create_child(&mut self, spec: ChildSpec) {
         let app = self.app;
         let user = Caller::User;
-        let d = spec.delegation();
-        let plan = match tasks::plan_child(app, &user, spec.kind, &spec.name, &d, None) {
-            Ok(plan) => plan,
-            Err(e) => {
-                if let Some(Panel::NewTask(form)) = &mut self.ui.panel {
-                    form.error = Some(printable(&format!("{e:#}")));
-                }
-                return;
+        let refused = |ui: &mut TasksUi, e: anyhow::Error| {
+            if let Some(Panel::NewTask(form)) = &mut ui.panel {
+                form.error = Some(printable(&format!("{e:#}")));
             }
+        };
+        let d = spec.delegation();
+        // A planner as `plete manager new` makes one: the planner
+        // profile's settings, and a manager's grant if it names none.
+        let planned = match spec.planner {
+            true if d.goal.is_none() => Err(anyhow::anyhow!(
+                "a planner needs a goal: it is what it works towards"
+            )),
+            true => commands::manager::as_planner(app, &d, spec.project.as_deref())
+                .map(|(d, max, profile)| (d, max, Some(profile))),
+            false => Ok((d, None, None)),
+        };
+        let (d, max_children, profile) = match planned {
+            Ok(planned) => planned,
+            Err(e) => return refused(&mut self.ui, e),
+        };
+        let plan = match tasks::plan_child(app, &user, TaskKind::Work, &spec.name, &d, max_children)
+        {
+            Ok(plan) => plan,
+            Err(e) => return refused(&mut self.ui, e),
         };
         let label = match spec.repos.len() + usize::from(spec.project.is_some()) {
             0 => format!("creating {}", spec.name),
@@ -5068,6 +5067,26 @@ impl Screen<'_> {
         self.started_by_user(&created.task.id);
         self.ui.panel = None;
         let task = created.task;
+        let mut warnings = created.warnings;
+        if let Some(profile) = &profile {
+            let recorded = app
+                .db
+                .set_task_agent(&task.id, &profile.name)
+                .and_then(|()| match profile.settings.pr {
+                    Some(pr) => app.db.set_task_pr(&task.id, Some(pr)),
+                    None => Ok(()),
+                });
+            // Not started as a plain task: it would not be the planner asked for.
+            if let Err(e) = recorded {
+                self.refresh(false);
+                self.ui.message(
+                    "made the task, but could not make it a planner",
+                    vec![printable(&format!("{e:#}"))],
+                    None,
+                );
+                return;
+            }
+        }
         let under = match self.ui.node(spec.parent.as_str()) {
             Some(row) => manager::label(&row.task),
             None => match spec.parent.as_str() {
@@ -5075,11 +5094,10 @@ impl Screen<'_> {
                 id => format!("task {id}"),
             },
         };
-        let mut warnings = created.warnings;
-        let made = match task.kind {
-            // A manager has only its brief to work towards: it starts now,
+        let made = match profile {
+            // A planner has only its brief to work towards: it starts now,
             // or queued or held, as `plete manager new` starts it (M35).
-            TaskKind::Manager => {
+            Some(_) => {
                 let started = self
                     .progress(&format!("starting {}", task.slug), || {
                         commands::task::start(app, &task, &manager::first_prompt(app, &task)?)
@@ -5095,9 +5113,9 @@ impl Screen<'_> {
                     }
                     Err(e) => format!("{e:#}"),
                 };
-                format!("made manager {} under {under} · {how}", task.slug)
+                format!("made planner {} under {under} · {how}", task.slug)
             }
-            _ => format!("made {} under {under} — ⏎ starts its agent", task.slug),
+            None => format!("made {} under {under} — ⏎ starts its agent", task.slug),
         };
         self.refresh(false);
         // The new node shows, under its parent opened, with the cursor on it.
@@ -6275,10 +6293,10 @@ mod tests {
             row
         };
         TasksUi::new(vec![
-            under("ops", TaskKind::Manager, Some("assistant-id"), 50),
+            under("ops", TaskKind::Work, Some("assistant-id"), 50),
             under("docs", TaskKind::Work, Some("assistant-id"), 40),
             under("loose", TaskKind::Work, None, 30),
-            under("deploy", TaskKind::Manager, Some("ops"), 20),
+            under("deploy", TaskKind::Work, Some("ops"), 20),
             under("fix", TaskKind::Work, Some("ops"), 10),
             under("ship", TaskKind::Work, Some("deploy"), 5),
         ])
@@ -6382,25 +6400,6 @@ mod tests {
             press(&mut ui, KeyCode::Char('a')),
             Some(Action::Archive { .. })
         ));
-    }
-
-    #[test]
-    fn an_empty_manager_is_entered_and_says_so() {
-        let mut ui = nested();
-        ui.select("ship");
-        press(&mut ui, KeyCode::Left);
-        press(&mut ui, KeyCode::Down);
-        assert_eq!(ui.selected_id(), Some("fix"));
-        // A manager with nothing under it is still a level.
-        let mut rows = ui.rows.clone();
-        rows.retain(|r| r.task.id != "ship");
-        ui.set_rows(rows);
-        ui.selected = 0;
-        assert_eq!(ui.selected_id(), Some("deploy"));
-        press(&mut ui, KeyCode::Right);
-        assert!(ui.visible.is_empty());
-        assert_eq!(ui.breadcrumb(), ["assistant", "ops", "deploy"]);
-        assert!(ui.status_line.contains("← back up"), "{}", ui.status_line);
     }
 
     #[test]
@@ -6619,10 +6618,10 @@ mod tests {
         ui
     }
 
-    fn projects(ui: &TasksUi) -> Vec<(&str, usize, usize)> {
+    fn projects(ui: &TasksUi) -> Vec<(&str, usize)> {
         ui.projects
             .iter()
-            .map(|p| (p.name.as_str(), p.managers, p.tasks))
+            .map(|p| (p.name.as_str(), p.tasks))
             .collect()
     }
 
@@ -6716,7 +6715,7 @@ mod tests {
     #[test]
     fn the_projects_view_groups_by_project() {
         let ui = by_project();
-        assert_eq!(projects(&ui), [("api", 1, 1), ("web", 2, 2)]);
+        assert_eq!(projects(&ui), [("api", 2), ("web", 4)]);
         assert_eq!(ui.count(View::Projects), 2);
         // The top level has no task under the cursor.
         assert_eq!(ui.selected_row().map(|r| r.task.id.as_str()), None);
@@ -6788,7 +6787,7 @@ mod tests {
         let mut ui = by_project();
         press(&mut ui, KeyCode::Char('A'));
         assert!(ui.archived_projects);
-        assert_eq!(projects(&ui), [("gone", 0, 1), ("idle", 0, 0)]);
+        assert_eq!(projects(&ui), [("gone", 1), ("idle", 0)]);
         assert!(ui.status_line.contains("other"), "{}", ui.status_line);
         // Inside, the archived tasks, flat; ⏎ explains, a brings back.
         press(&mut ui, KeyCode::Enter);
@@ -6810,7 +6809,7 @@ mod tests {
     }
 
     #[test]
-    fn a_manager_reaching_a_project_through_other_projects_tasks_is_walked_to_its_member() {
+    fn a_task_reaching_a_project_through_other_projects_tasks_is_walked_to_its_member() {
         let mut ui = by_project();
         let mut rows = ui.rows.clone();
         let mut sub = task("sub", "sub", TaskState::Active, 1);
@@ -6818,11 +6817,8 @@ mod tests {
         sub.task.project = Some("docs".into());
         rows.push(sub);
         ui.set_rows(rows);
-        // docs: ops and deploy (managers above sub) and sub; ship is web's.
-        assert_eq!(
-            projects(&ui),
-            [("api", 1, 1), ("docs", 2, 1), ("web", 2, 2)]
-        );
+        // docs: ops, deploy and ship (above sub) and sub.
+        assert_eq!(projects(&ui), [("api", 2), ("docs", 4), ("web", 4)]);
         ui.selected = 1;
         press(&mut ui, KeyCode::Enter);
         assert_eq!(ui.breadcrumb(), ["projects", "docs"]);
@@ -6831,12 +6827,12 @@ mod tests {
         assert_eq!(shown(&ui), ["deploy"]);
         press(&mut ui, KeyCode::Right);
         assert_eq!(ui.breadcrumb(), ["projects", "docs", "ops", "deploy"]);
+        assert_eq!(shown(&ui), ["ship"]);
+        press(&mut ui, KeyCode::Right);
         assert_eq!(shown(&ui), ["sub"]);
         // sub has nothing of docs below it.
         let sub = ui.row("sub").unwrap().clone();
         assert!(!ui.enterable(&sub));
-        let ship = ui.row("ship").unwrap().clone();
-        assert!(!ui.enterable(&ship));
     }
 
     #[test]
@@ -6852,7 +6848,7 @@ mod tests {
         assert_eq!(projects(&ui)[ui.selected].0, "idle");
         // A project made meanwhile is listed; one deleted goes.
         ui.set_known_projects(["api", "fresh", "gone", "web"].map(String::from).to_vec());
-        assert_eq!(projects(&ui), [("gone", 0, 1), ("fresh", 0, 0)]);
+        assert_eq!(projects(&ui), [("gone", 1), ("fresh", 0)]);
     }
 
     #[test]
@@ -6860,7 +6856,7 @@ mod tests {
         let mut ui = by_project();
         press(&mut ui, KeyCode::Char('/'));
         type_text(&mut ui, "we");
-        assert_eq!(projects(&ui), [("web", 2, 2)]);
+        assert_eq!(projects(&ui), [("web", 4)]);
         press(&mut ui, KeyCode::Enter);
         press(&mut ui, KeyCode::Right);
         assert!(ui.filter.is_empty());
@@ -7907,7 +7903,6 @@ mod tests {
             stash_ref: None,
             pr_number: None,
             created_at: 0,
-            read_only: false,
         };
         let canvas = places(dir.path(), &[]);
         assert_eq!(only_place(&canvas).unwrap().repo_id, None);
@@ -8102,7 +8097,7 @@ mod tests {
         let mut root = task("root", "assistant", TaskState::Active, 0);
         root.task.kind = TaskKind::Assistant;
         let mut m = task("m", "m", TaskState::Active, 0);
-        m.task.kind = TaskKind::Manager;
+        m.task.kind = TaskKind::Work;
         m.task.parent_id = Some("root".into());
         let mut w = task("w", "w", TaskState::Active, 0);
         w.task.parent_id = Some("m".into());
@@ -8473,10 +8468,13 @@ mod tests {
             [Kind, Name, Goal, Done, Budget, Allow, Project, Repos, Branch]
         );
         f.toggle_kind();
-        assert_eq!(f.kind, TaskKind::Manager);
-        // `manager new` takes a project but no worktrees.
-        assert_eq!(f.fields(), [Kind, Name, Goal, Done, Budget, Allow, Project]);
-        f.field = Project;
+        assert!(f.planner);
+        // A planner is a task: it takes worktrees too.
+        assert_eq!(
+            f.fields(),
+            [Kind, Name, Goal, Done, Budget, Allow, Project, Repos, Branch]
+        );
+        f.field = Branch;
         assert_eq!(f.step(1), Kind);
         assert_eq!(form().fields(), [Name, Project, Repos, Branch]);
     }
@@ -8485,7 +8483,7 @@ mod tests {
     fn the_form_under_a_node_is_filled_in_from_the_keyboard() {
         let mut ui = agents_sample();
         ui.panel = Some(Panel::NewTask(Box::new(child_form())));
-        press(&mut ui, KeyCode::Char(' ')); // a manager
+        press(&mut ui, KeyCode::Char(' ')); // a planner
         press(&mut ui, KeyCode::Tab);
         type_text(&mut ui, "sub");
         press(&mut ui, KeyCode::Tab);
@@ -8496,9 +8494,10 @@ mod tests {
         type_text(&mut ui, "2h, 40turns");
         press(&mut ui, KeyCode::Tab);
         type_text(&mut ui, "task.create,task.open");
-        // A manager's fields wrap round after the project: no repos or branch.
-        press(&mut ui, KeyCode::Tab);
-        press(&mut ui, KeyCode::Tab);
+        // Past the project, the repos and the branch, round to the kind.
+        for _ in 0..4 {
+            press(&mut ui, KeyCode::Tab);
+        }
         match &ui.panel {
             Some(Panel::NewTask(f)) => assert_eq!(f.field, Field::Kind),
             other => panic!("{other:?}"),
@@ -8507,7 +8506,7 @@ mod tests {
             press(&mut ui, KeyCode::Enter),
             Some(Action::CreateChild(ChildSpec {
                 parent: "m".into(),
-                kind: TaskKind::Manager,
+                planner: true,
                 name: "sub".into(),
                 goal: Some("ship v2".into()),
                 done: Some("it is out".into()),
@@ -8553,18 +8552,8 @@ mod tests {
         assert_eq!((&spec.goal, &spec.allow), (&None, &None));
         assert!(spec.budget.is_empty());
         assert_eq!(spec.repos, ["github.com/acme/api"]);
-        assert_eq!(spec.kind, TaskKind::Work);
+        assert!(!spec.planner);
         assert_eq!(spec.delegation().parent.as_deref(), Some("m"));
-    }
-
-    #[test]
-    fn a_manager_ignores_the_fields_it_hides() {
-        let mut f = child_form();
-        f.branch = "feat".into();
-        f.toggle_kind();
-        let spec = f.child_spec().unwrap();
-        assert_eq!(spec.kind, TaskKind::Manager);
-        assert!(spec.repos.is_empty());
     }
 
     #[test]
@@ -8909,7 +8898,7 @@ mod tests {
             row.task
         };
         let root = record("root", TaskKind::Assistant, None);
-        let api = record("api", TaskKind::Manager, Some("root"));
+        let api = record("api", TaskKind::Work, Some("root"));
         let w = record("w", TaskKind::Work, Some("api"));
         app.db
             .insert_report(
@@ -8940,15 +8929,15 @@ mod tests {
         let text = lines.join("\n");
         assert!(!prs);
         assert!(
-            text.starts_with(format!("open ask\n  #{asked} question to manager api").as_str()),
+            text.starts_with(format!("open ask\n  #{asked} question to task api").as_str()),
             "{text}"
         );
         assert!(text.contains("    keep v1?\n    [2Jsay"), "{text}");
         assert!(text.contains("inbox · 1 queued"), "{text}");
         assert!(text.contains("    from api"), "{text}");
         // Newest first, and no fence: the TUI is the user.
-        let newest = text.find(format!("#{asked} question · task w → manager api").as_str());
-        let older = text.find("progress · task w → manager api");
+        let newest = text.find(format!("#{asked} question · task w → task api").as_str());
+        let older = text.find("progress · task w → task api");
         assert!(
             newest.is_some() && older.is_some() && newest < older,
             "{text}"
@@ -8959,7 +8948,7 @@ mod tests {
         let (lines, _) = report_lines(&app, &api, &tasks::task_dir(&app, &api)).unwrap();
         let text = lines.join("\n");
         assert!(text.starts_with("open ask\n  none"), "{text}");
-        assert!(text.contains("question · task w → manager api"), "{text}");
+        assert!(text.contains("question · task w → task api"), "{text}");
 
         let text = brief_lines(&app, &w).unwrap().join("\n");
         assert!(text.contains("task root/api/w"), "{text}");
@@ -8969,7 +8958,7 @@ mod tests {
         );
         // The CLI's `manager show` refuses the assistant; `b` reads it.
         let text = brief_lines(&app, &root).unwrap().join("\n");
-        assert!(text.contains("- api (manager, active)"), "{text}");
+        assert!(text.contains("- api (work, active)"), "{text}");
 
         // Where an ask stands: with the user, then answered, with the
         // answer, which is kept whether or not it reached the asker.
@@ -9007,7 +8996,7 @@ mod tests {
         app.db.answer_report(next, Some("api"), "x", "api").unwrap();
         let (lines, _) = report_lines(&app, &w, &w_dir).unwrap();
         assert!(
-            lines.join("\n").contains("answered by manager api"),
+            lines.join("\n").contains("answered by task api"),
             "{lines:?}"
         );
     }
@@ -9429,7 +9418,6 @@ mod tests {
                 stash_ref: None,
                 pr_number: None,
                 created_at: 0,
-                read_only: false,
             },
             path: PathBuf::from("/t/api"),
             present: true,

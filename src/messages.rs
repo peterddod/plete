@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentSpec;
 use crate::context::App;
-use crate::db::tasks::{TaskKind, TaskRecord};
+use crate::db::tasks::{Role, TaskKind, TaskRecord};
 use crate::manager::run::{self, StartGate, StartGuard};
 use crate::permissions;
 use crate::placement;
@@ -358,28 +358,23 @@ fn highest_delivered(home: &Path, task_dir: &Path) -> i64 {
 /// `[messages] render`'s key for its kind, with a planner task, as every
 /// manager now is, taking the managers' key.
 pub fn quiet_for(app: &App, task: &TaskRecord) -> bool {
-    let planner = task.kind == TaskKind::Work
-        && app.db.task_agent(&task.id).ok().flatten().as_deref() == Some("planner");
-    match planner {
-        true => app.config.quiet_for(TaskKind::Manager),
-        false => app.config.quiet_for(task.kind),
-    }
+    app.config.quiet_for(tasks::role(app, task))
 }
 
-/// `meta` with no ref yet, of `text` for a task of `kind` in `dir`, given the
-/// ref `m<id>` and kept whole in `delivered.jsonl`, when that kind is
+/// `meta` with no ref yet, of `text` for a task of `role` in `dir`, given the
+/// ref `m<id>` and kept whole in `delivered.jsonl`, when that role is
 /// rendered quietly; otherwise as it was, with no ref and no file. It never
 /// fails the delivery: without a ref the item is rendered all the same, and
 /// the task still hears from the others.
 pub fn number_if_quiet(
     app: &App,
-    kind: TaskKind,
+    role: Role,
     dir: &Path,
     meta: Option<Meta>,
     text: &str,
 ) -> Result<Option<Meta>> {
     match meta {
-        Some(meta) if meta.r#ref.is_none() && app.config.quiet_for(kind) => {
+        Some(meta) if meta.r#ref.is_none() && app.config.quiet_for(role) => {
             match number(&app.home, dir, meta.clone(), text) {
                 Ok(numbered) => Ok(Some(numbered)),
                 Err(e) => {
@@ -1963,7 +1958,7 @@ mod tests {
             slug: "m".into(),
             name: "m".into(),
             project: None,
-            kind: TaskKind::Manager,
+            kind: TaskKind::Work,
             state: crate::db::tasks::TaskState::Active,
             created_at: 0,
             last_activity: 0,

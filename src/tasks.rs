@@ -27,13 +27,12 @@ use crate::config::{PrMode, DEFAULT_PR_MODE};
 use crate::context::App;
 use crate::db::anchors::AnchorKind;
 use crate::db::tasks::{
-    MoveRows, RunState, Setter, TaskBriefRecord, TaskKind, TaskRecord, TaskState,
+    MoveRows, Role, RunState, Setter, TaskBriefRecord, TaskKind, TaskRecord, TaskState,
     TaskWorktreeRecord,
 };
 use crate::db::RepoRecord;
 use crate::git;
 use crate::identity;
-use crate::instructions;
 use crate::manager;
 use crate::manager::budget::{self, Limits};
 use crate::messages::{self, Delivered, Sender};
@@ -196,7 +195,20 @@ pub fn task_dir(app: &App, task: &TaskRecord) -> PathBuf {
     match task.kind {
         TaskKind::Assistant => crate::config::assistant_dir(&app.home),
         TaskKind::Setup => crate::setup::setup_dir(&app.home),
-        TaskKind::Work | TaskKind::Manager => app.item_dir(crate::config::tasks_root, &task.slug),
+        TaskKind::Work => app.item_dir(crate::config::tasks_root, &task.slug),
+    }
+}
+
+/// The role `task` takes for the config's per-kind keys: its kind's, or a
+/// planner's. An error reading its agent counts as not a planner.
+pub fn role(app: &App, task: &TaskRecord) -> Role {
+    match task.kind {
+        TaskKind::Assistant => Role::Assistant,
+        TaskKind::Setup => Role::Setup,
+        TaskKind::Work => match app.db.task_agent(&task.id) {
+            Ok(Some(agent)) if agent == crate::commands::manager::PLANNER => Role::Planner,
+            _ => Role::Work,
+        },
     }
 }
 
@@ -497,12 +509,6 @@ pub fn plan_child(
     d: &Delegation,
     max_children: Option<u32>,
 ) -> Result<NewNode> {
-    // A worker has its prompt; a manager has only its brief to work
-    // towards, so it is not made without one. First of all, before the
-    // parent is resolved, which may make the assistant.
-    if kind == TaskKind::Manager && d.goal.is_none() {
-        bail!("a manager needs --goal or --brief-file: it is what it works towards");
-    }
     let name = child_name(name)?;
     let goal = match d.goal.as_deref().map(messages::checked).transpose() {
         Ok(goal) => goal,
@@ -523,33 +529,17 @@ pub fn plan_child(
         );
     }
 
-    // Before the parent is resolved, which makes the assistant if the user's
-    // manager would be its first child: a harness that refuses managers
-    // leaves nothing behind.
-    if kind == TaskKind::Manager {
-        manager_harness(AgentSpec::from_config(&app.config)?.harness)?;
-    }
-    let target = match (&d.parent, caller, kind) {
-        // A manager the user makes goes under the assistant.
-        (None, Caller::User, TaskKind::Manager) => {
-            Target::Parent(Some(crate::assistant::SLUG.to_string()))
-        }
-        (parent, _, _) => Target::Parent(parent.clone()),
-    };
+    let target = Target::Parent(d.parent.clone());
     let parent = match permissions::resolve(app, caller, &target) {
         Ok(parent) => parent,
         Err(e) => bail!("--parent: {e:#}"),
     };
-    let verb = match kind {
-        TaskKind::Manager => Verb::ManagerNew,
-        _ => Verb::TaskNew,
-    };
-    permissions::in_scope(app, caller, verb, &parent)?;
+    permissions::in_scope(app, caller, Verb::TaskNew, &parent)?;
     if parent.state != TaskState::Active {
         bail!("task {} is archived; it takes no new tasks", parent.slug);
     }
     match parent.kind {
-        TaskKind::Assistant | TaskKind::Manager => {}
+        TaskKind::Assistant => {}
         // Any task may have tasks under it, on a harness that tells it how
         // they go: the same that a manager needs.
         TaskKind::Work if parent.parent_id.is_some() => {
@@ -581,14 +571,11 @@ pub fn plan_child(
         app,
         caller,
         &parent,
-        match d.manager_grant {
-            true => TaskKind::Manager,
-            false => kind,
-        },
+        d.manager_grant,
         d.allow.as_deref(),
         &policy,
     )?;
-    let budget = child_budget(app, &parent, kind, d, &policy)?;
+    let budget = child_budget(app, &parent, d, &policy)?;
 
     let created_by = match caller {
         Caller::User => "user".to_string(),
@@ -708,7 +695,6 @@ pub(crate) fn format_char(c: char) -> bool {
 fn child_budget(
     app: &App,
     parent: &TaskRecord,
-    kind: TaskKind,
     d: &Delegation,
     policy: &crate::config::ManagerPolicy,
 ) -> Result<Option<Limits>> {
@@ -733,7 +719,7 @@ fn child_budget(
         }
         return Ok(Some(want));
     }
-    if kind != TaskKind::Manager && !d.default_budget && parent.kind == TaskKind::Assistant {
+    if !d.default_budget && parent.kind == TaskKind::Assistant {
         return Ok(None);
     }
     let cut = |want: Option<i64>, left: Option<i64>| match (want, left) {
@@ -763,7 +749,7 @@ pub fn commit_child(
         ..plan.record.clone()
     };
     let budget = plan.budget.map(|b| (b.secs, b.turns));
-    let mut notes = write_task(app, &task, project, || {
+    let notes = write_task(app, &task, project, || {
         app.db.insert_child(
             &task,
             &plan.grant.caps,
@@ -772,17 +758,6 @@ pub fn commit_child(
             plan.fan_out,
         )
     })?;
-    // Only now, with its row in: the brief names its place in the tree.
-    // Its session context carries the same, so a brief not written costs
-    // the file, not the manager.
-    if task.kind == TaskKind::Manager {
-        if let Err(e) = manager::write_brief(app, &task) {
-            notes.push(format!(
-                "could not write task {}'s BRIEF.md: {e:#}",
-                task.slug
-            ));
-        }
-    }
     Ok((task, notes))
 }
 
@@ -804,9 +779,7 @@ fn record_child_held(
     }
 }
 
-/// The marker, the project's files and the plete skill, or for a manager
-/// its role's files ([`manager::ensure_files`]) in the skill's place: the
-/// worker's skill would tell it what a worker may do. Returns notes on
+/// The marker, the project's files and the plete skill. Returns notes on
 /// project files that were not copied.
 fn scaffold(
     dir: &Path,
@@ -815,9 +788,8 @@ fn scaffold(
     templates: &Path,
 ) -> Result<Vec<String>> {
     write_marker(dir, &task.id)?;
-    let is_manager = task.kind == TaskKind::Manager;
     let notes = match project {
-        Some(project) => projects::copy_files_for(project, dir, false, is_manager)?
+        Some(project) => projects::copy_files(project, dir, false)?
             .notes()
             .into_iter()
             .map(|note| format!("project {}: {note}", project.name))
@@ -826,56 +798,12 @@ fn scaffold(
     };
     // Last, so nothing of the project's can shadow it.
     match task.kind {
-        TaskKind::Manager => {
-            manager::ensure_files(dir, manager::Role::Manager, templates)?;
-            if let Some(project) = project {
-                link_project_instructions(dir, &project.name)?;
-            }
-        }
         TaskKind::Work | TaskKind::Assistant => install_skill(dir, templates)?,
         TaskKind::Setup => {
             crate::setup::ensure_files(dir)?;
         }
     }
     Ok(notes)
-}
-
-/// Have a manager's AGENTS.md import the project's instructions
-/// ([`projects::MANAGER_INSTRUCTIONS`]), if it has them: a section at the
-/// end, so the manager's own text stands first and is kept. Done once; an
-/// AGENTS.md that already names the file is left alone.
-pub fn link_project_instructions(dir: &Path, project: &str) -> Result<()> {
-    use std::io::Write;
-    let file = projects::MANAGER_INSTRUCTIONS;
-    if !dir.join(file).is_file() {
-        return Ok(());
-    }
-    let path = dir.join(instructions::AGENTS_MD);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    // The heading and the import together mark it as ours; a manager's own
-    // mention of `@PROJECT.md` elsewhere does not. Known limit: should the
-    // project later drop its AGENTS.md, the section stays and imports a
-    // file that is gone (resync removes PROJECT.md, not the section).
-    if text.contains(&format!("## Project: {project}\n")) && text.contains(&format!("\n@{file}\n"))
-    {
-        return Ok(());
-    }
-    let section = format!(
-        "\n## Project: {project}\n\nYou were made from the `{project}` project. Its instructions \
-         follow; they add to the above and do not replace it. Tasks you make \
-         start from the project too.\n\n@{file}\n"
-    );
-    let mut out = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .with_context(|| format!("open {}", path.display()))?;
-    out.write_all(section.as_bytes())
-        .with_context(|| format!("write {}", path.display()))
 }
 
 /// Mark `dir` as task `id`'s directory.
@@ -1062,10 +990,6 @@ pub fn worktree_summary(rows: &[TaskWorktreeRecord]) -> String {
     format!("{} wt: {}", rows.len(), repos.join(", "))
 }
 
-/// Why a manager may not take a branch: its worktrees are read-only.
-pub const MANAGER_READ_ONLY: &str =
-    "a manager holds read-only worktrees; delegate the change to a worker (`plete task new`)";
-
 /// A worktree just added to a task.
 pub struct AddedWorktree {
     pub record: TaskWorktreeRecord,
@@ -1081,10 +1005,6 @@ pub struct AddedWorktree {
 /// branch it is detached at `origin/<default>`. With one, an existing local
 /// branch is checked out, one that exists only on origin is tracked, and
 /// anything else is created from `origin/<default>`.
-///
-/// A manager's worktrees are always detached and marked read-only, to read
-/// and review from: a lint that keeps an honest manager from writing code,
-/// not a guarantee (it runs unconfined, as the user).
 pub fn add_worktree(
     app: &App,
     task: &TaskRecord,
@@ -1109,12 +1029,9 @@ pub fn add_worktree(
         Some("") => bail!("branch name cannot be empty"),
         other => other,
     };
-    let read_only = match task.kind {
-        TaskKind::Manager if branch.is_some() => bail!("{MANAGER_READ_ONLY}"),
-        TaskKind::Manager => true,
-        TaskKind::Setup => bail!("the setup agent works on plete's own files, not in worktrees"),
-        TaskKind::Work | TaskKind::Assistant => false,
-    };
+    if task.kind == TaskKind::Setup {
+        bail!("the setup agent works on plete's own files, not in worktrees");
+    }
     if let Some(name) = name {
         validate_dir_name(name)?;
     }
@@ -1184,7 +1101,6 @@ pub fn add_worktree(
         stash_ref: None,
         pr_number: None,
         created_at: now_secs(),
-        read_only,
     };
     // A `plete task ls` running meanwhile reconciles: it can see the new
     // worktree in `git worktree list` before its row is written, and adopt
@@ -1675,16 +1591,11 @@ pub(crate) fn plural(n: usize, what: &str) -> String {
 /// whose directory has vanished is dropped, and git told to forget it.
 /// Archived tasks are left alone: their rows describe worktrees that are
 /// meant to be gone.
-///
-/// A worktree adopted into a manager is marked read-only, as one plete made
-/// for it would be. Returns a warning for each read-only worktree found on
-/// a branch: a manager checked one out itself.
-pub fn reconcile(app: &App) -> Result<Vec<String>> {
+pub fn reconcile(app: &App) -> Result<()> {
     let roots = canonical_tasks_roots(app);
     let tasks = app.db.list_tasks(Some(TaskState::Active))?;
     let by_slug: HashMap<&str, &TaskRecord> = tasks.iter().map(|t| (t.slug.as_str(), t)).collect();
     let mut prune = BTreeSet::new();
-    let mut warnings = Vec::new();
 
     for repo in app.db.list_repos(None)? {
         let trunk = PathBuf::from(&repo.trunk_path);
@@ -1708,18 +1619,6 @@ pub fn reconcile(app: &App) -> Result<Vec<String>> {
                 continue;
             }
             let row = app.db.get_task_worktree(&task.id, &dir_name)?;
-            let read_only = row
-                .as_ref()
-                .map_or(task.kind == TaskKind::Manager, |r| r.read_only);
-            if let (true, Some(branch)) = (read_only, &entry.branch) {
-                // The dir name is whatever the agent gave `git worktree add`.
-                warnings.push(format!(
-                    "{}/{} is read-only but on branch {}; {MANAGER_READ_ONLY}",
-                    task.slug,
-                    crate::commands::task::printable(&dir_name),
-                    crate::commands::task::printable(branch)
-                ));
-            }
             match row {
                 Some(mut row) if row.repo_id == repo.id && row.branch != entry.branch => {
                     // Someone switched branches in it. The branch it is on now
@@ -1741,7 +1640,6 @@ pub fn reconcile(app: &App) -> Result<Vec<String>> {
                         stash_ref: None,
                         pr_number: None,
                         created_at: now_secs(),
-                        read_only,
                     })?;
                 }
             }
@@ -1767,7 +1665,7 @@ pub fn reconcile(app: &App) -> Result<Vec<String>> {
     for trunk in prune {
         let _ = git::worktree_prune(&trunk);
     }
-    Ok(warnings)
+    Ok(())
 }
 
 /// `(slug, dir_name)` for a path inside a task directory: `dir_name` is the
@@ -1825,7 +1723,7 @@ pub fn archive(app: &App, task: &TaskRecord, recursive: bool) -> Result<Vec<Stri
     match task.kind {
         TaskKind::Assistant => bail!("the assistant cannot be archived"),
         TaskKind::Setup => bail!("the setup agent cannot be archived"),
-        TaskKind::Work | TaskKind::Manager => {}
+        TaskKind::Work => {}
     }
     if !recursive {
         return archive_one(app, task);
@@ -2286,7 +2184,7 @@ fn fan_out_of_parent(app: &App, task: &TaskRecord) -> Result<Option<u32>> {
 fn fan_out_of(app: &App, parent: &TaskRecord) -> Result<Option<u32>> {
     match parent.kind {
         TaskKind::Assistant => Ok(None),
-        TaskKind::Manager | TaskKind::Work => match parent.max_children {
+        TaskKind::Work => match parent.max_children {
             Some(n) => Ok(Some(n)),
             None => Ok(Some(app.config.manager_policy()?.max_children)),
         },
@@ -2465,7 +2363,7 @@ pub fn delete(app: &App, task: &TaskRecord, recursive: bool) -> Result<Vec<Strin
     match task.kind {
         TaskKind::Assistant => bail!("the assistant cannot be deleted"),
         TaskKind::Setup => bail!("the setup agent cannot be deleted"),
-        TaskKind::Work | TaskKind::Manager => {}
+        TaskKind::Work => {}
     }
     let nodes = match recursive {
         true => subtree_leaves_first(app, task)?,
@@ -2783,7 +2681,7 @@ pub fn plan_reparent(app: &App, caller: &Caller, task: &TaskRecord) -> Result<Mo
     match task.kind {
         TaskKind::Assistant => bail!("the assistant cannot be deleted"),
         TaskKind::Setup => bail!("the setup agent cannot be deleted"),
-        TaskKind::Work | TaskKind::Manager => {}
+        TaskKind::Work => {}
     }
     let children = app.db.children(&task.id)?;
     if children.is_empty() {
@@ -2848,13 +2746,11 @@ pub fn delete_reparenting(
 }
 
 /// Once `plan` is written: each moved task's new place, and what each
-/// node's grant dropped; every active manager in the subtrees gets its
-/// `BRIEF.md` again (its path and who it reports to changed); a running
-/// mover is handed its new brief now, without starting one that is not;
+/// node's grant dropped; a running mover is handed its new brief now, without starting one that is not;
 /// and each mover tells its new parent it moved there, in plete's words,
 /// naming its open question if it has one; then each open ask among the
 /// reports `kept` from a deleted task is delivered to the new parent
-/// that holds it now. Slugs only: a node may run this, and a manager
+/// that holds it now. Slugs only: a node may run this, and a task
 /// writes task names (C19). One line per thing said.
 fn after_move(app: &App, caller: &Caller, plan: &MovePlan, kept: &[i64]) -> Vec<String> {
     let mut lines = Vec::new();
@@ -2900,7 +2796,6 @@ fn after_move(app: &App, caller: &Caller, plan: &MovePlan, kept: &[i64]) -> Vec<
             dropped.join(", ")
         ));
     }
-    manager::write_briefs(app, &nodes);
 
     for (mover, from) in moved {
         if mover.state != TaskState::Active {
@@ -3203,7 +3098,6 @@ mod tests {
             stash_ref: None,
             pr_number: None,
             created_at: 0,
-            read_only: false,
         };
         assert_eq!(worktree_summary(&[]), "empty");
         assert_eq!(
@@ -3253,7 +3147,7 @@ mod tests {
             })
             .unwrap();
         let assistant = crate::assistant::ensure(&app).unwrap();
-        for (slug, kind) in [("m", TaskKind::Manager), ("w", TaskKind::Work)] {
+        for (slug, kind) in [("m", TaskKind::Work), ("w", TaskKind::Work)] {
             app.db
                 .insert_task(&TaskRecord {
                     id: format!("{slug}-id"),
@@ -3296,90 +3190,21 @@ mod tests {
     }
 
     #[test]
-    fn a_manager_gets_detached_read_only_worktrees_only() {
+    fn reconcile_adopts_a_worktree_made_by_hand_and_follows_its_branch() {
         let (_dir, app, trunk) = manager_lab();
-        let m = app.db.get_task("m-id").unwrap().unwrap();
-        let refused = add_worktree(&app, &m, "example.com/o/api", Some("fix"), None)
-            .err()
-            .unwrap()
-            .to_string();
-        assert_eq!(refused, MANAGER_READ_ONLY);
-        assert!(app.db.list_task_worktrees("m-id").unwrap().is_empty());
-        assert!(!git::branch_exists(&trunk, "fix").unwrap());
-
-        let added = add_worktree(&app, &m, "example.com/o/api", None, None).unwrap();
-        assert!(added.record.read_only);
-        assert_eq!(added.record.branch, None);
-        assert_eq!(git::head_branch(&added.path), None);
-        let row = app
-            .db
-            .get_task_worktree("m-id", &added.record.dir_name)
-            .unwrap()
-            .unwrap();
-        assert!(row.read_only);
-        assert_eq!(row.branch, None);
-
-        // A worker's are as before.
-        let w = app.db.get_task("w-id").unwrap().unwrap();
-        let added = add_worktree(&app, &w, "example.com/o/api", Some("fix"), None).unwrap();
-        assert!(!added.record.read_only);
-        assert_eq!(added.record.branch.as_deref(), Some("fix"));
-    }
-
-    #[test]
-    fn reconcile_adopts_a_managers_worktree_as_read_only_and_warns_on_a_branch() {
-        let (_dir, app, trunk) = manager_lab();
-        let by_hand = |slug: &str| {
-            let path = app.tasks_root().join(slug).join("hand");
-            hermetic_git(
-                &trunk,
-                &["worktree", "add", "-q", "--detach", path.to_str().unwrap()],
-            );
-            path
-        };
-        let m_hand = by_hand("m");
-        let w_hand = by_hand("w");
-        hermetic_git(&w_hand, &["switch", "-q", "-c", "w-branch"]);
-        assert_eq!(reconcile(&app).unwrap(), Vec::<String>::new());
-        let row = |id: &str| app.db.get_task_worktree(id, "hand").unwrap().unwrap();
-        assert!(row("m-id").read_only);
-        assert!(!row("w-id").read_only);
-
-        // The manager checks a branch out itself: kept read-only, and named.
-        hermetic_git(&m_hand, &["switch", "-q", "-c", "m-branch"]);
-        let warnings = reconcile(&app).unwrap();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("m/hand"), "{warnings:?}");
-        assert!(warnings[0].contains("m-branch"), "{warnings:?}");
-        assert!(warnings[0].contains(MANAGER_READ_ONLY), "{warnings:?}");
-        assert!(row("m-id").read_only);
-        assert_eq!(row("m-id").branch.as_deref(), Some("m-branch"));
-
-        // The dir name is the agent's to pick: no escape reaches a terminal.
-        let path = app.tasks_root().join("m").join("e\x1b[31mvil");
+        let path = app.tasks_root().join("w").join("hand");
         hermetic_git(
             &trunk,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "e\u{9b}2J-branch",
-                path.to_str().unwrap(),
-            ],
+            &["worktree", "add", "-q", "--detach", path.to_str().unwrap()],
         );
-        let warnings = reconcile(&app).unwrap();
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("m/e[31mvil") && w.contains("e2J-branch")),
-            "{warnings:?}"
-        );
-        assert!(
-            !warnings.iter().any(|w| w.chars().any(char::is_control)),
-            "{warnings:?}"
-        );
+        reconcile(&app).unwrap();
+        let row = || app.db.get_task_worktree("w-id", "hand").unwrap().unwrap();
+        assert_eq!(row().branch, None);
+
+        hermetic_git(&path, &["switch", "-q", "-c", "w-branch"]);
+        reconcile(&app).unwrap();
+        assert_eq!(row().branch.as_deref(), Some("w-branch"));
+        assert!(!row().created_branch);
     }
 
     /// A child of a manager with a project starts from it (and its repo,
@@ -3538,9 +3363,9 @@ mod tests {
         app.config.assistant.allow = vec!["task.create".into(), "worktree.add".into()];
         let m = app.db.get_task("m-id").unwrap().unwrap();
         app.db.set_grants(&m.id, &["task.create"]).unwrap();
-        let m2 = insert(&app, "m2", TaskKind::Manager, &m.id);
-        let m3 = insert(&app, "m3", TaskKind::Manager, &m2.id);
-        let gone = insert(&app, "gone", TaskKind::Manager, &m.id);
+        let m2 = insert(&app, "m2", TaskKind::Work, &m.id);
+        let m3 = insert(&app, "m3", TaskKind::Work, &m2.id);
+        let gone = insert(&app, "gone", TaskKind::Work, &m.id);
         app.db
             .set_task_state(&gone.id, TaskState::Archived)
             .unwrap();
@@ -3639,8 +3464,8 @@ mod tests {
     fn plan_child_takes_its_depth_cap_from_config() {
         let (_dir, mut app, _trunk) = manager_lab();
         let m = app.db.get_task("m-id").unwrap().unwrap();
-        let m2 = insert(&app, "m2", TaskKind::Manager, &m.id);
-        let m3 = insert(&app, "m3", TaskKind::Manager, &m2.id);
+        let m2 = insert(&app, "m2", TaskKind::Work, &m.id);
+        let m3 = insert(&app, "m3", TaskKind::Work, &m2.id);
         let user = Caller::User;
         plan_child(&app, &user, TaskKind::Work, "x", &under(&m3.slug), None).unwrap();
         app.config.managers = Some(crate::config::ManagersConfig {
@@ -3654,9 +3479,9 @@ mod tests {
             assert!(err.contains("`[tasks] max_depth` is 2"), "{err}");
         };
         refused(&app, TaskKind::Work, &m2.slug, "3 levels below");
-        refused(&app, TaskKind::Manager, &m2.slug, "3 levels below");
+        refused(&app, TaskKind::Work, &m2.slug, "3 levels below");
         plan_child(&app, &user, TaskKind::Work, "x", &under("m"), None).unwrap();
-        plan_child(&app, &user, TaskKind::Manager, "x", &briefed("m"), None).unwrap();
+        plan_child(&app, &user, TaskKind::Work, "x", &briefed("m"), None).unwrap();
         app.config.tasks.max_depth = Some(1);
         let err = plan_child(&app, &user, TaskKind::Work, "x", &under("m"), None).unwrap_err();
         assert!(
@@ -3671,7 +3496,7 @@ mod tests {
     fn a_budget_is_cut_by_every_task_above_in_both_units() {
         let (_dir, app, _trunk) = manager_lab();
         let m = app.db.get_task("m-id").unwrap().unwrap();
-        insert(&app, "m2", TaskKind::Manager, &m.id);
+        insert(&app, "m2", TaskKind::Work, &m.id);
         // m has 30 minutes and 5 turns left; m2 has no limit of its own.
         app.db.set_budget_max(&m.id, Some(3600), Some(20)).unwrap();
         app.db.charge(&m.id, 1800, 15).unwrap();
@@ -3707,92 +3532,29 @@ mod tests {
         }
     }
 
-    /// First of the checks: a manager needs a goal, refused before its
-    /// parent is resolved, so no assistant is made for it; a worker does
-    /// without.
+    /// A task's own fan-out limit is at most `[managers] max_children` and
+    /// is kept on its row; under the assistant it gets `default_budget` only
+    /// when asked.
     #[test]
-    fn plan_child_refuses_a_manager_without_a_goal_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().canonicalize().unwrap();
-        let app = App {
-            config: crate::config::load_or_create(&home).unwrap(),
-            db: crate::db::Database::open(&crate::config::index_path(&home)).unwrap(),
-            new_home: None,
-            home,
-        };
-        let user = Caller::User;
-        // Even an invalid name or a done-when with no goal is reported
-        // after it.
-        let d = Delegation {
-            done_when: Some("shipped".into()),
-            ..Default::default()
-        };
-        let err = plan_child(&app, &user, TaskKind::Manager, "Bad Name", &d, None).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "a manager needs --goal or --brief-file: it is what it works towards"
-        );
-        let err = plan_child(
-            &app,
-            &user,
-            TaskKind::Manager,
-            "x",
-            &under("assistant"),
-            None,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("needs --goal"), "{err:#}");
-        assert!(app.db.get_assistant_task().unwrap().is_none());
-        // A worker needs none.
-        plan_child(&app, &user, TaskKind::Work, "x", &under("assistant"), None).unwrap();
-    }
-
-    /// Last of the checks: a manager needs a harness with hooks and the
-    /// rest (M36); a worker does without.
-    #[test]
-    fn plan_child_refuses_a_manager_on_a_harness_without_hooks() {
-        let (_dir, mut app, _trunk) = manager_lab();
-        app.config.agent = Some("aider".into());
-        let d = briefed("assistant");
-        let err = plan_child(&app, &Caller::User, TaskKind::Manager, "x", &d, None).unwrap_err();
-        let err = err.to_string();
-        assert!(err.contains("hook events"), "{err}");
-        assert!(err.contains("deny rules"), "{err}");
-        plan_child(&app, &Caller::User, TaskKind::Work, "x", &d, None).unwrap();
-    }
-
-    /// A manager's own fan-out limit is at most `[managers] max_children`
-    /// and is kept on its row; under the assistant, unasked, it gets
-    /// `default_budget`. Its home has its role's files and its brief.
-    #[test]
-    fn a_manager_keeps_its_own_fan_out_limit_and_gets_the_default_budget() {
+    fn a_task_keeps_its_own_fan_out_limit_and_gets_the_default_budget_when_asked() {
         let (_dir, app, _trunk) = manager_lab();
         let policy = app.config.manager_policy().unwrap();
         let user = Caller::User;
-        let d = briefed("assistant");
+        let d = Delegation {
+            default_budget: true,
+            ..briefed("assistant")
+        };
         let above = policy.max_children + 1;
-        let err = plan_child(&app, &user, TaskKind::Manager, "x", &d, Some(above)).unwrap_err();
+        let err = plan_child(&app, &user, TaskKind::Work, "x", &d, Some(above)).unwrap_err();
         let err = err.to_string();
         assert!(err.contains(&format!("--max-children {above}")), "{err}");
         assert!(err.contains("`[tasks] max_children`"), "{err}");
 
-        let plan = plan_child(&app, &user, TaskKind::Manager, "x", &d, Some(2)).unwrap();
+        let plan = plan_child(&app, &user, TaskKind::Work, "x", &d, Some(2)).unwrap();
         assert_eq!(plan.record.max_children, Some(2));
         assert_eq!(plan.budget, Some(policy.default_budget));
         let (made, notes) = commit_child(&app, &plan, None).unwrap();
         assert!(notes.is_empty(), "{notes:?}");
-        // Its role in place of the worker's skill, and its brief.
-        let home = task_dir(&app, &made);
-        for rel in [
-            "AGENTS.md",
-            ".claude/skills/plete-manager/SKILL.md",
-            "notes/worklog.md",
-            "todo.md",
-            crate::manager::BRIEF_MD,
-        ] {
-            assert!(home.join(rel).is_file(), "{rel}");
-        }
-        assert!(!home.join(".claude/skills/plete").exists());
         let made = app.db.get_task(&made.id).unwrap().unwrap();
         assert_eq!(made.max_children, Some(2));
         assert_eq!(fan_out_of(&app, &made).unwrap(), Some(2));
@@ -3801,8 +3563,16 @@ mod tests {
             (row.max_secs, row.max_turns),
             (policy.default_budget.secs, policy.default_budget.turns)
         );
-        // A worker under the assistant gets none unasked.
-        let plan = plan_child(&app, &user, TaskKind::Work, "y", &d, None).unwrap();
+        // None unasked.
+        let plan = plan_child(
+            &app,
+            &user,
+            TaskKind::Work,
+            "y",
+            &briefed("assistant"),
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.budget, None);
     }
 
@@ -3991,7 +3761,7 @@ mod tests {
             run_state_by: None,
             max_children: None,
         };
-        let lead = record("lead-id", "plete-unit-lead", TaskKind::Manager, assistant);
+        let lead = record("lead-id", "plete-unit-lead", TaskKind::Work, assistant);
         app.db.insert_task(&lead).unwrap();
         let dir = task_dir(&app, &lead);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4046,7 +3816,7 @@ mod tests {
         app.db
             .set_grants(&m.id, &["task.create", "worktree.add"])
             .unwrap();
-        let sub = insert(&app, "sub", TaskKind::Manager, "m-id");
+        let sub = insert(&app, "sub", TaskKind::Work, "m-id");
         app.db
             .set_grants(&sub.id, &["pr.merge", "task.create", "worktree.add"])
             .unwrap();
@@ -4146,7 +3916,7 @@ mod tests {
             .set_run_state(&n.id, RunState::Paused, Some(&Setter::Node(m.id.clone())))
             .unwrap();
         let n = app.db.get_task(&n.id).unwrap().unwrap();
-        let fe = insert(&app, "fe", TaskKind::Manager, &root.id);
+        let fe = insert(&app, "fe", TaskKind::Work, &root.id);
         let e = plan_move(
             &app,
             &Caller::Node(fe.clone()),
@@ -4157,7 +3927,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            e.contains("task n is paused by manager m, which ranks above you"),
+            e.contains("task n is paused by task m, which ranks above you"),
             "{e}"
         );
         // The user outranks it, so the hold becomes the user's.
@@ -4174,8 +3944,8 @@ mod tests {
     fn a_task_moved_twice_in_a_second_tells_both_new_parents() {
         let (_dir, app, _trunk) = manager_lab();
         let root = app.db.get_assistant_task().unwrap().unwrap();
-        let fe = insert(&app, "fe", TaskKind::Manager, &root.id);
-        let be = insert(&app, "be", TaskKind::Manager, &root.id);
+        let fe = insert(&app, "fe", TaskKind::Work, &root.id);
+        let be = insert(&app, "be", TaskKind::Work, &root.id);
         let w = app.db.get_task("w-id").unwrap().unwrap();
         for to in [&fe, &be] {
             let w = app.db.get_task(&w.id).unwrap().unwrap();

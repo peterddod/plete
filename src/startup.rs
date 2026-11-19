@@ -72,7 +72,7 @@ pub fn may_auto_trust(config: &Config, home: &Path, who: Trust, dir: &Path) -> b
     let (tasks, reviews) = config.auto_trust();
     let in_tasks = dir.starts_with(config::tasks_root(home));
     match who {
-        Trust::Task(TaskKind::Work | TaskKind::Manager) => tasks && in_tasks,
+        Trust::Task(TaskKind::Work) => tasks && in_tasks,
         Trust::Review => reviews && in_tasks,
         Trust::Task(TaskKind::Assistant | TaskKind::Setup) => false,
     }
@@ -575,7 +575,7 @@ pub fn run(app: &App, task_id: &str, session: Option<&str>) -> Result<()> {
     )?;
     eprintln!("plete task-startup {slug}: {outcome:?}");
     let level = match &watched {
-        Watched::Task(task) => notify::level(task.kind),
+        Watched::Task(task) => notify::level(crate::tasks::role(app, task)),
         Watched::Review(_) => NotifyLevel::Review,
     };
     let tell = |why: Why, body: &str| {
@@ -1077,7 +1077,7 @@ mod tests {
         };
         let root = crate::manager::root(&app).unwrap();
         for (id, kind, parent) in [
-            ("m", TaskKind::Manager, root.id.as_str()),
+            ("m", TaskKind::Work, root.id.as_str()),
             ("w", TaskKind::Work, "m"),
         ] {
             app.db
@@ -1224,13 +1224,13 @@ mod tests {
         assert!(!may_auto_trust(
             &off,
             home,
-            Trust::Task(TaskKind::Manager),
+            Trust::Task(TaskKind::Work),
             &in_tasks
         ));
         assert!(may_auto_trust(
             &on,
             home,
-            Trust::Task(TaskKind::Manager),
+            Trust::Task(TaskKind::Work),
             &in_tasks
         ));
         // Never outside the tasks, nor for the assistant.
@@ -1243,7 +1243,7 @@ mod tests {
         assert!(!may_auto_trust(
             &on,
             home,
-            Trust::Task(TaskKind::Manager),
+            Trust::Task(TaskKind::Work),
             Path::new("/elsewhere")
         ));
         assert!(!may_auto_trust(

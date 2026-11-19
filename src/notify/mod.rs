@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{self, NotifyConfig, NotifyLevel};
 use crate::context::App;
-use crate::db::tasks::TaskKind;
+use crate::db::tasks::Role;
 use crate::worktrees::now_secs;
 
 pub const COMMAND_ENV: &str = "PLETE_NOTIFY_CMD";
@@ -163,12 +163,12 @@ impl std::fmt::Display for Down {
 
 impl std::error::Error for Down {}
 
-/// The level of a task of `kind`.
-pub fn level(kind: TaskKind) -> NotifyLevel {
-    match kind {
-        TaskKind::Assistant => NotifyLevel::Assistant,
-        TaskKind::Manager => NotifyLevel::Manager,
-        TaskKind::Work | TaskKind::Setup => NotifyLevel::Task,
+/// The level of a task of `role`.
+pub fn level(role: Role) -> NotifyLevel {
+    match role {
+        Role::Assistant => NotifyLevel::Assistant,
+        Role::Planner => NotifyLevel::Manager,
+        Role::Work | Role::Setup => NotifyLevel::Task,
     }
 }
 

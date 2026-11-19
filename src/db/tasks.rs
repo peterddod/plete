@@ -20,9 +20,6 @@ pub enum TaskKind {
     /// The global assistant: there is one, and it is kept out of the tasks
     /// list; see [`crate::assistant`].
     Assistant,
-    /// A node below the assistant that delegates rather than codes: it has
-    /// children of its own and holds its worktrees read-only.
-    Manager,
     /// The setup agent (`plete setup`): there is one, kept out of the tasks
     /// list like the assistant; see [`crate::setup`].
     Setup,
@@ -33,7 +30,6 @@ impl TaskKind {
         match self {
             TaskKind::Work => "work",
             TaskKind::Assistant => "assistant",
-            TaskKind::Manager => "manager",
             TaskKind::Setup => "setup",
         }
     }
@@ -42,11 +38,25 @@ impl TaskKind {
         match s {
             "work" => Ok(TaskKind::Work),
             "assistant" => Ok(TaskKind::Assistant),
-            "manager" => Ok(TaskKind::Manager),
+            // Rows from before v16; the migration converts them, this is belt
+            // and braces.
+            "manager" => Ok(TaskKind::Work),
             "setup" => Ok(TaskKind::Setup),
             other => Err(bad_enum("kind", other)),
         }
     }
+}
+
+/// Which of the config's per-kind keys a task takes: its kind's, with a
+/// planner (a task started as the `planner` profile) taking the managers' keys
+/// (`[models] manager`, `[permissions.manager]`, `[messages] render.managers`),
+/// as every manager now is one. Those keys go with the next release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Assistant,
+    Planner,
+    Work,
+    Setup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,9 +236,6 @@ pub struct TaskWorktreeRecord {
     pub stash_ref: Option<String>,
     pub pr_number: Option<u64>,
     pub created_at: i64,
-    /// Held by a manager, which reads and does not write; plete keeps it
-    /// detached.
-    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,7 +411,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
 }
 
 const TASK_WORKTREE_COLUMNS: &str = "id, task_id, repo_id, dir_name, branch, created_branch, \
-     head_oid, stash_ref, pr_number, created_at, read_only";
+     head_oid, stash_ref, pr_number, created_at";
 
 fn task_worktree_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskWorktreeRecord> {
     Ok(TaskWorktreeRecord {
@@ -418,7 +425,6 @@ fn task_worktree_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskWorkt
         stash_ref: row.get(7)?,
         pr_number: row.get::<_, Option<i64>>(8)?.map(|n| n as u64),
         created_at: row.get(9)?,
-        read_only: row.get::<_, i32>(10)? != 0,
     })
 }
 
@@ -753,7 +759,7 @@ fn move_refusal_in(conn: &Connection, rows: &MoveRows) -> Result<Option<String>>
         return Ok(Some(format!("{} is archived; it takes no tasks", to.slug)));
     }
     let takes = match to.kind {
-        TaskKind::Assistant | TaskKind::Manager => true,
+        TaskKind::Assistant => true,
         TaskKind::Work => to.parent_id.is_some(),
         TaskKind::Setup => false,
     };
@@ -1146,8 +1152,8 @@ impl Database {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO task_worktrees (task_id, repo_id, dir_name, branch, created_branch,
-                                         head_oid, stash_ref, pr_number, created_at, read_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                         head_oid, stash_ref, pr_number, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 wt.task_id,
                 wt.repo_id,
@@ -1158,19 +1164,17 @@ impl Database {
                 wt.stash_ref,
                 wt.pr_number.map(|n| n as i64),
                 wt.created_at,
-                i32::from(wt.read_only),
             ],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
-    /// Rewrite a worktree row's mutable fields (branch, archive state, PR,
-    /// read-only), keyed by its id.
+    /// Rewrite a worktree row's mutable fields (branch, archive state, PR),
+    /// keyed by its id.
     pub fn update_task_worktree(&self, wt: &TaskWorktreeRecord) -> Result<()> {
         self.conn().execute(
             "UPDATE task_worktrees
-             SET branch = ?2, created_branch = ?3, head_oid = ?4, stash_ref = ?5, pr_number = ?6,
-                 read_only = ?7
+             SET branch = ?2, created_branch = ?3, head_oid = ?4, stash_ref = ?5, pr_number = ?6
              WHERE id = ?1",
             params![
                 wt.id,
@@ -1179,7 +1183,6 @@ impl Database {
                 wt.head_oid,
                 wt.stash_ref,
                 wt.pr_number.map(|n| n as i64),
-                i32::from(wt.read_only),
             ],
         )?;
         Ok(())
@@ -2120,7 +2123,6 @@ mod tests {
             stash_ref: None,
             pr_number: None,
             created_at: 100,
-            read_only: false,
         }
     }
 
@@ -2144,7 +2146,7 @@ mod tests {
         let (_dir, db) = open();
         db.insert_task(&task("a", "first", 10)).unwrap();
         let mut review = task("b", "second", 30);
-        review.kind = TaskKind::Manager;
+        review.kind = TaskKind::Work;
         review.project = Some("web".into());
         db.insert_task(&review).unwrap();
         db.insert_task(&task("c", "third", 20)).unwrap();
@@ -2580,7 +2582,7 @@ mod tests {
         assistant.kind = TaskKind::Assistant;
         db.insert_task(&assistant).unwrap();
         let mut manager = task("m", "m", 1);
-        manager.kind = TaskKind::Manager;
+        manager.kind = TaskKind::Work;
         manager.parent_id = Some("a".into());
         db.insert_task(&manager).unwrap();
         let mut child = task("c", "child", 1);
@@ -2760,9 +2762,9 @@ mod tests {
     /// `w3`.
     fn tree(db: &Database) {
         node(db, "a", TaskKind::Assistant, None);
-        node(db, "m", TaskKind::Manager, Some("a"));
+        node(db, "m", TaskKind::Work, Some("a"));
         node(db, "w1", TaskKind::Work, Some("a"));
-        node(db, "n", TaskKind::Manager, Some("m"));
+        node(db, "n", TaskKind::Work, Some("m"));
         node(db, "w2", TaskKind::Work, Some("m"));
         node(db, "w3", TaskKind::Work, Some("n"));
     }
@@ -2775,7 +2777,7 @@ mod tests {
     fn the_tree_is_walked_in_order_and_at_depth() {
         let (_dir, db) = open();
         tree(&db);
-        assert_eq!(db.get_task("m").unwrap().unwrap().kind, TaskKind::Manager);
+        assert_eq!(db.get_task("m").unwrap().unwrap().kind, TaskKind::Work);
         assert_eq!(ids(&db.children("a").unwrap()), ["m", "w1"]);
         assert_eq!(db.child_count("m", false).unwrap(), 2);
         db.set_task_state("w2", TaskState::Archived).unwrap();
@@ -3326,10 +3328,10 @@ mod tests {
     fn a_move_is_refused_by_each_invariant_and_writes_nothing() {
         let (_dir, db) = open();
         tree(&db);
-        node(&db, "top", TaskKind::Manager, None);
+        node(&db, "top", TaskKind::Work, None);
         node(&db, "solo", TaskKind::Work, None);
-        node(&db, "fe", TaskKind::Manager, Some("a"));
-        node(&db, "old", TaskKind::Manager, Some("a"));
+        node(&db, "fe", TaskKind::Work, Some("a"));
+        node(&db, "old", TaskKind::Work, Some("a"));
         db.set_task_state("old", TaskState::Archived).unwrap();
         let refused = |rows: &MoveRows, why: &str| {
             let before: Vec<Option<String>> = ["w1", "w2", "n", "top"]
@@ -3397,20 +3399,5 @@ mod tests {
         db.set_run_state("w3", RunState::Paused, Some(&Setter::Node("m".into())))
             .unwrap();
         refused(&rows, "changed since");
-    }
-
-    #[test]
-    fn a_worktree_remembers_it_is_read_only() {
-        let (_dir, db) = open();
-        db.upsert_repo(&repo("github.com/acme/api")).unwrap();
-        db.insert_task(&task("t", "work", 1)).unwrap();
-        let mut wt = worktree("t", "api", None);
-        wt.read_only = true;
-        db.insert_task_worktree(&wt).unwrap();
-        let mut row = db.get_task_worktree("t", "api").unwrap().unwrap();
-        assert!(row.read_only);
-        row.read_only = false;
-        db.update_task_worktree(&row).unwrap();
-        assert!(!db.get_task_worktree("t", "api").unwrap().unwrap().read_only);
     }
 }

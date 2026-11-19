@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::db::tasks::TaskKind;
+use crate::db::tasks::Role;
 use crate::github::MergeMethod;
 use crate::manager::budget::{self, Limits};
 use crate::permissions;
@@ -979,13 +979,13 @@ impl ModelsConfig {
         *self == Self::default()
     }
 
-    /// The model for an agent of `kind`, if one is set.
-    pub fn for_kind(&self, kind: TaskKind) -> Option<&str> {
-        let model = match kind {
-            TaskKind::Work => &self.task,
-            TaskKind::Manager => &self.manager,
+    /// The model for an agent of `role`, if one is set.
+    pub fn for_role(&self, role: Role) -> Option<&str> {
+        let model = match role {
+            Role::Work => &self.task,
+            Role::Planner => &self.manager,
             // A chat with the user, as the assistant's are.
-            TaskKind::Assistant | TaskKind::Setup => &self.assistant,
+            Role::Assistant | Role::Setup => &self.assistant,
         };
         model.as_deref().map(str::trim).filter(|m| !m.is_empty())
     }
@@ -1119,18 +1119,18 @@ impl Config {
         }
     }
 
-    /// Whether what is queued for a task of `kind` is rendered quietly: the
-    /// assistant's and the managers', unless `[messages] render` says `full`
+    /// Whether what is queued for a task of `role` is rendered quietly: the
+    /// assistant's and the planners', unless `[messages] render` says `full`
     /// for them. A work task's never is.
-    pub fn quiet_for(&self, kind: TaskKind) -> bool {
-        match kind {
-            TaskKind::Assistant => {
+    pub fn quiet_for(&self, role: Role) -> bool {
+        match role {
+            Role::Assistant => {
                 self.messages.render.assistant.unwrap_or(Render::Quiet) == Render::Quiet
             }
-            TaskKind::Manager => {
+            Role::Planner => {
                 self.messages.render.managers.unwrap_or(Render::Quiet) == Render::Quiet
             }
-            TaskKind::Work | TaskKind::Setup => false,
+            Role::Work | Role::Setup => false,
         }
     }
 
@@ -1461,8 +1461,8 @@ pub fn assistant_dir(home: &Path) -> PathBuf {
 }
 
 /// The user's overrides of the templates plete writes into new homes:
-/// `root/` and `manager/` laid out as the assistant's and a manager's home
-/// are, and `worker/SKILL.md` for the skill every task gets.
+/// `root/` laid out as the assistant's home is, and `worker/SKILL.md` for the
+/// skill every task gets.
 pub fn templates_dir(home: &Path) -> PathBuf {
     home.join("templates")
 }
@@ -1719,8 +1719,8 @@ mod tests {
     #[test]
     fn quiet_rendering_is_for_the_assistant_and_managers_unless_set_full() {
         let read = |text: &str| toml::from_str::<Config>(text).unwrap();
-        let assistant = |c: &Config| c.quiet_for(TaskKind::Assistant);
-        let managers = |c: &Config| c.quiet_for(TaskKind::Manager);
+        let assistant = |c: &Config| c.quiet_for(Role::Assistant);
+        let managers = |c: &Config| c.quiet_for(Role::Planner);
         assert!(assistant(&Config::default()) && managers(&Config::default()));
         let digest = read("[messages]\ndigest_mins = 5\n");
         assert!(assistant(&digest) && managers(&digest));
@@ -1733,7 +1733,7 @@ mod tests {
         assert!(assistant(&managers_full) && !managers(&managers_full));
         // Work tasks are never quiet.
         for config in [Config::default(), full, managers_full] {
-            assert!(!config.quiet_for(TaskKind::Work));
+            assert!(!config.quiet_for(Role::Work));
         }
         for bad in [
             "render = { assistant = \"loud\" }",
@@ -1967,7 +1967,7 @@ mod tests {
     fn tasks_pr_and_models_parse_and_refuse_what_they_do_not_know() {
         let config = Config::default();
         assert_eq!(config.tasks.pr, None);
-        assert_eq!(config.models.for_kind(TaskKind::Work), None);
+        assert_eq!(config.models.for_role(Role::Work), None);
         let out = toml::to_string_pretty(&config).unwrap();
         assert!(
             !out.contains("[tasks]") && !out.contains("[models]"),
@@ -1979,9 +1979,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.tasks.pr, Some(PrMode::Ask));
-        assert_eq!(config.models.for_kind(TaskKind::Assistant), Some("opus"));
-        assert_eq!(config.models.for_kind(TaskKind::Manager), Some("sonnet"));
-        assert_eq!(config.models.for_kind(TaskKind::Work), Some("haiku"));
+        assert_eq!(config.models.for_role(Role::Assistant), Some("opus"));
+        assert_eq!(config.models.for_role(Role::Planner), Some("sonnet"));
+        assert_eq!(config.models.for_role(Role::Work), Some("haiku"));
         // Blank is unset.
         assert_eq!(config.models.review(), None);
         let back: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();

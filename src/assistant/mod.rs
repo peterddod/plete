@@ -33,7 +33,9 @@ use crate::cd;
 use crate::config;
 use crate::context::App;
 use crate::db::anchors::AnchorKind;
-use crate::db::tasks::{RunState, TaskKind, TaskRecord, TaskSessionRecord, TaskState};
+use crate::db::tasks::{
+    Role as ConfigRole, RunState, TaskKind, TaskRecord, TaskSessionRecord, TaskState,
+};
 use crate::identity;
 use crate::messages::{self, Agent, Delivered, Queued, Sender};
 use crate::permissions;
@@ -241,7 +243,7 @@ pub struct Opened {
 pub fn open(app: &App, task: &TaskRecord, how: Open) -> Result<Opened> {
     tmux::require()?;
     let spec = AgentSpec::from_config(&app.config)?
-        .with_model(app.config.models.for_kind(TaskKind::Assistant));
+        .with_model(app.config.models.for_role(ConfigRole::Assistant));
     if !(spec.supports_sessions() && spec.has_hooks()) {
         bail!(
             "the assistant runs in a harness whose sessions and hooks plete keeps track of, \
@@ -412,7 +414,7 @@ fn launch_argv(
         &task.id,
         wake,
     );
-    let hooks = runtime::with_config_rules(hooks, &app.config.permissions, TaskKind::Assistant);
+    let hooks = runtime::with_config_rules(hooks, &app.config.permissions, ConfigRole::Assistant);
     argv.extend(runtime::hook_args(
         &app.home,
         spec.harness,
@@ -624,7 +626,7 @@ fn deliver_pushed(
 ) -> Result<(Delivered, Option<String>)> {
     let task = ensure(app)?;
     let dir = tasks::task_dir(app, &task);
-    let meta = messages::number_if_quiet(app, TaskKind::Assistant, &dir, meta, text)?;
+    let meta = messages::number_if_quiet(app, ConfigRole::Assistant, &dir, meta, text)?;
     let sessions = sessions(app, &task)?;
     // Messages left for a session that has since ended go to this one.
     messages::Inbox::lock(&dir)?.release_orphans(|| {
@@ -1086,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_for_a_manager_is_numbered_only_when_managers_are_rendered_quietly() {
+    fn a_line_for_a_planner_is_numbered_only_when_managers_are_rendered_quietly() {
         let meta = || Some(Meta::new(RenderClass::Line, "watch", "github", "ev", None));
         let number = |app: &App, kind| {
             let dir = tempfile::tempdir().unwrap();
@@ -1095,10 +1097,13 @@ mod tests {
                 .unwrap()
         };
         let (_home, app) = quiet_app("");
-        assert_eq!(number(&app, TaskKind::Manager).r#ref.as_deref(), Some("m1"));
-        assert_eq!(number(&app, TaskKind::Work).r#ref, None);
+        assert_eq!(
+            number(&app, ConfigRole::Planner).r#ref.as_deref(),
+            Some("m1")
+        );
+        assert_eq!(number(&app, ConfigRole::Work).r#ref, None);
         let (_home, app) = quiet_app("[messages]\nrender = { managers = \"full\" }\n");
-        assert_eq!(number(&app, TaskKind::Manager).r#ref, None);
+        assert_eq!(number(&app, ConfigRole::Planner).r#ref, None);
     }
 
     #[test]
@@ -1114,17 +1119,19 @@ mod tests {
         };
         let (_home, app) = quiet_app("");
         let dir = tempfile::tempdir().unwrap();
-        let got = messages::number_if_quiet(&app, TaskKind::Assistant, dir.path(), meta(), "whole")
-            .unwrap()
-            .unwrap();
+        let got =
+            messages::number_if_quiet(&app, ConfigRole::Assistant, dir.path(), meta(), "whole")
+                .unwrap()
+                .unwrap();
         assert_eq!(got.r#ref.as_deref(), Some("m1"));
         assert_eq!(messages::read_delivered(dir.path())[0].message, "whole");
         // Rendered in full: today's behaviour, no ref and no file.
         let (_home, app) = quiet_app("[messages]\nrender = { assistant = \"full\" }\n");
         let dir = tempfile::tempdir().unwrap();
-        let got = messages::number_if_quiet(&app, TaskKind::Assistant, dir.path(), meta(), "whole")
-            .unwrap()
-            .unwrap();
+        let got =
+            messages::number_if_quiet(&app, ConfigRole::Assistant, dir.path(), meta(), "whole")
+                .unwrap()
+                .unwrap();
         assert_eq!(got.r#ref, None);
         assert!(!messages::delivered_path(dir.path()).exists());
         assert!(!app.home.join("run/messages.seq").exists());
@@ -1134,13 +1141,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(app.home.join("run")).unwrap();
         std::fs::write(app.home.join("run/messages.seq"), "garbage").unwrap();
-        let got = messages::number_if_quiet(&app, TaskKind::Assistant, dir.path(), meta(), "whole")
-            .unwrap()
-            .unwrap();
+        let got =
+            messages::number_if_quiet(&app, ConfigRole::Assistant, dir.path(), meta(), "whole")
+                .unwrap()
+                .unwrap();
         assert_eq!(got, meta().unwrap());
         // None stays none.
         assert_eq!(
-            messages::number_if_quiet(&app, TaskKind::Assistant, dir.path(), None, "x").unwrap(),
+            messages::number_if_quiet(&app, ConfigRole::Assistant, dir.path(), None, "x").unwrap(),
             None
         );
     }

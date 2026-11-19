@@ -544,7 +544,7 @@ mod tests {
         };
         let root = super::super::root(&app).unwrap();
         for (slug, kind, parent) in [
-            ("m", TaskKind::Manager, root.id.as_str()),
+            ("m", TaskKind::Work, root.id.as_str()),
             ("w", TaskKind::Work, "m"),
         ] {
             app.db
@@ -643,7 +643,7 @@ mod tests {
         let told = crate::notify::queued(&app.home);
         assert_eq!(told.len(), 1, "{told:?}");
         assert_eq!(told[0].why, crate::notify::Why::Stuck);
-        assert_eq!(told[0].title, "plete: manager m is stuck: budget used up");
+        assert_eq!(told[0].title, "plete: task m is stuck: budget used up");
         assert_eq!(told[0].task.as_deref(), Some("m"));
         assert_eq!(told[0].link.as_deref(), Some("plete://task/m"));
         assert_eq!(get(&app, "w").run_state, RunState::Run);

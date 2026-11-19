@@ -1140,7 +1140,6 @@ mod tests {
         assert_eq!(db.task_agent("m").unwrap().as_deref(), Some("planner"));
         assert_eq!(db.task_agent("w").unwrap(), None);
         assert_eq!(db.grants("m").unwrap(), ["manager.grant"]);
-        assert!(!db.list_task_worktrees("m").unwrap()[0].read_only);
         assert_eq!(
             db.get_task("w").unwrap().unwrap().parent_id.as_deref(),
             Some("m")
@@ -1410,7 +1409,6 @@ mod tests {
             assert_eq!(task.run_state_by, None, "{id}");
             assert_eq!(task.max_children, None, "{id}");
         }
-        assert!(!db.list_task_worktrees("c").unwrap()[0].read_only);
         // Exactly the parented tasks that could add worktrees keep that.
         for (id, grants) in [("a", vec![]), ("w", vec![]), ("c", vec!["worktree.add"])] {
             assert_eq!(db.grants(id).unwrap(), grants, "{id}");

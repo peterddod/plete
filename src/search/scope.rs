@@ -181,7 +181,7 @@ fn for_task(app: &App, task: &TaskRecord) -> Result<Vec<Source>> {
 /// Whether a task keeps documents in a folder of its own: work and manager
 /// tasks do; the assistant has its own source and the setup agent none.
 fn has_folder(task: &TaskRecord) -> bool {
-    matches!(task.kind, TaskKind::Work | TaskKind::Manager)
+    matches!(task.kind, TaskKind::Work)
 }
 
 /// The tool's own repositories that are in the store.
@@ -289,7 +289,7 @@ mod tests {
         repo(&app, "github.com/peterddod/plete");
         std::fs::create_dir_all(crate::config::projects_root(&app.home).join("proj")).unwrap();
         task(&app, "root", TaskKind::Assistant, None, None);
-        task(&app, "mgr", TaskKind::Manager, Some("root"), None);
+        task(&app, "mgr", TaskKind::Work, Some("root"), None);
         task(&app, "w1", TaskKind::Work, Some("mgr"), Some("proj"));
         task(&app, "w2", TaskKind::Work, Some("mgr"), None);
         app.db
@@ -304,7 +304,6 @@ mod tests {
                 stash_ref: None,
                 pr_number: None,
                 created_at: 0,
-                read_only: false,
             })
             .unwrap();
 

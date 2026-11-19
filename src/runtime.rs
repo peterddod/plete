@@ -19,7 +19,7 @@ use crate::cd;
 use crate::config::{AssistantConfig, PermissionsConfig, PrMode, PushPolicy, RoleRules};
 use crate::context::App;
 use crate::db::anchors::AnchorKind;
-use crate::db::tasks::{TaskKind, TaskRecord, TaskSessionRecord};
+use crate::db::tasks::{Role, TaskKind, TaskRecord, TaskSessionRecord};
 use crate::harness::{self, HookSetup};
 use crate::identity;
 use crate::manager::run::{self, StartGate, StartGuard};
@@ -105,7 +105,7 @@ pub fn ensure_running(
     match task.kind {
         TaskKind::Assistant => bail!("the assistant's sessions are opened with `plete chat`"),
         TaskKind::Setup => bail!("the setup agent is started with `plete setup`"),
-        TaskKind::Work | TaskKind::Manager => {}
+        TaskKind::Work => {}
     }
     // Running already: nothing starts, so there is nothing to admit, and a
     // held task's live pane is still there to attach to (M16). Attached to
@@ -171,7 +171,7 @@ pub fn ensure_running_admitted(
     match task.kind {
         TaskKind::Assistant => bail!("the assistant's sessions are opened with `plete chat`"),
         TaskKind::Setup => bail!("the setup agent is started with `plete setup`"),
-        TaskKind::Work | TaskKind::Manager => {}
+        TaskKind::Work => {}
     }
     let running = placement::runtime_for(task)?.start(app, task, session, prompt)?;
     // Started, however it was admitted: no longer waits on `max_live` or a
@@ -246,11 +246,6 @@ fn start_tmux(
 
     let mut warnings = Vec::new();
     let mut spec = AgentSpec::from_config(&app.config)?;
-    // Made under a harness that had them, it is not started unguarded on
-    // one configured since that lacks them.
-    if task.kind == TaskKind::Manager {
-        tasks::manager_harness(spec.harness)?;
-    }
     // The project's own arguments; a project since deleted or broken costs
     // only those, not the task.
     match projects::agent_args(app, task) {
@@ -318,14 +313,11 @@ fn start_tmux(
     // After the project's arguments, so a `--model` there wins too; the
     // profile's over `[models]`.
     // A planner, as every manager now is, takes `[models] manager`.
-    let kind = match profile.as_ref().is_some_and(|p| p.name == "planner") {
-        true => TaskKind::Manager,
-        false => task.kind,
-    };
+    let role = tasks::role(app, task);
     let model = profile
         .as_ref()
         .and_then(|p| p.settings.model.as_deref())
-        .or(app.config.models.for_kind(kind));
+        .or(app.config.models.for_role(role));
     let spec = spec.with_model(model);
     // Refused before anything is read for the launch, as it always was.
     if prompt.is_some() && spec.harness.prompt_args("").is_none() {
@@ -697,7 +689,6 @@ fn task_hooks(
     let mut allow = ALLOWED.map(str::to_string).to_vec();
     allow.extend(permissions::GH_READ_ONLY.iter().map(|c| c.to_string()));
     let held: Vec<String> = match task.kind {
-        TaskKind::Manager => permissions::effective(app, task)?,
         TaskKind::Work if task.parent_id.is_some() => permissions::effective(app, task)?,
         _ => Vec::new(),
     }
@@ -745,7 +736,11 @@ fn task_hooks(
         environment: None,
         wake: wake(app, harness),
     };
-    Ok(with_config_rules(hooks, &app.config.permissions, task.kind))
+    Ok(with_config_rules(
+        hooks,
+        &app.config.permissions,
+        tasks::role(app, task),
+    ))
 }
 
 /// What a work task under PR policy `mode` is let run, and denied: `auto`
@@ -759,20 +754,16 @@ fn pr_rules(mode: PrMode) -> (&'static [&'static str], &'static [&'static str]) 
     }
 }
 
-/// `hooks` with what `[permissions]` adds for an agent of `kind`: the rules
+/// `hooks` with what `[permissions]` adds for an agent of `role`: the rules
 /// of its role, after plete's own, and the classifier's context when
 /// `classifier_context` is on.
-pub fn with_config_rules(
-    hooks: HookSetup,
-    config: &PermissionsConfig,
-    kind: TaskKind,
-) -> HookSetup {
-    let rules = match kind {
-        TaskKind::Work => &config.task,
-        TaskKind::Manager => &config.manager,
-        TaskKind::Assistant => &config.assistant,
+pub fn with_config_rules(hooks: HookSetup, config: &PermissionsConfig, role: Role) -> HookSetup {
+    let rules = match role {
+        Role::Work => &config.task,
+        Role::Planner => &config.manager,
+        Role::Assistant => &config.assistant,
         // Its rules are its own ([`crate::setup::hooks`]), whatever config says.
-        TaskKind::Setup => return hooks,
+        Role::Setup => return hooks,
     };
     with_rules(hooks, config, rules)
 }
@@ -1267,7 +1258,7 @@ mod tests {
             parent_id: Some(root.id.clone()),
             ..root.clone()
         };
-        let (api, worker) = (row("api", TaskKind::Manager), row("wk", TaskKind::Work));
+        let (api, worker) = (row("api", TaskKind::Work), row("wk", TaskKind::Work));
         for (task, grant) in [
             (&api, ["task.create", "task.delete", "manager.create"]),
             (&worker, ["task.create", "task.send", "manager.create"]),
@@ -1323,27 +1314,17 @@ mod tests {
         assert!(hooks.allow.contains(&"gh pr create".to_string()));
         assert!(hooks.deny.contains(&"gh pr ready".to_string()));
         assert!(hooks.wake);
-        // `push = "branches"` lets a worker push to origin, but not a manager.
+        // `push = "branches"` lets a worker push to origin.
         app.config.permissions.push = Some(PushPolicy::Branches);
         let hooks = task_hooks(&app, &worker, claude, "/bin/plete".into()).unwrap();
         for push in permissions::PUSH_ALLOW {
             assert!(hooks.allow.contains(&push.to_string()), "{push}");
         }
-        let hooks = task_hooks(&app, &api, claude, "/bin/plete".into()).unwrap();
-        assert!(!hooks.allow.iter().any(|a| a.starts_with("git push")));
-        // Nothing is denied it unless `guards` is on.
-        assert!(!hooks.deny.contains(&"git push".to_string()));
         app.config.permissions.guards = Some(true);
-        let hooks = task_hooks(&app, &api, claude, "/bin/plete".into()).unwrap();
-        assert!(hooks.deny.contains(&"git push".to_string()));
         let hooks = task_hooks(&app, &worker, claude, "/bin/plete".into()).unwrap();
         assert!(hooks.deny.contains(&"git push --force".to_string()));
         app.config.permissions.guards = None;
         app.config.permissions.push = None;
-        // A manager is given neither.
-        let hooks = task_hooks(&app, &api, claude, "/bin/plete".into()).unwrap();
-        assert!(!hooks.allow.contains(&"gh pr create".to_string()));
-        assert!(!hooks.deny.contains(&"gh pr ready".to_string()));
         // `auto` from the config: no deny on `gh pr ready`.
         app.config.tasks.pr = Some(PrMode::Auto);
         let hooks = task_hooks(&app, &worker, claude, "/bin/plete".into()).unwrap();
@@ -1416,16 +1397,16 @@ mod tests {
         )
         .unwrap();
         let rules = |kind| with_config_rules(HookSetup::default(), &config.permissions, kind);
-        let task = rules(TaskKind::Work);
+        let task = rules(Role::Work);
         assert_eq!(task.extra_allow, ["Bash(cargo test:*)"]);
         assert_eq!(task.extra_deny, ["Bash(rm:*)"]);
         assert_eq!(
             task.environment.as_deref(),
             Some(permissions::CLASSIFIER_CONTEXT)
         );
-        assert_eq!(rules(TaskKind::Manager).extra_allow, ["Bash(make:*)"]);
-        assert!(rules(TaskKind::Manager).extra_deny.is_empty());
-        assert_eq!(rules(TaskKind::Assistant).extra_deny, ["WebFetch"]);
+        assert_eq!(rules(Role::Planner).extra_allow, ["Bash(make:*)"]);
+        assert!(rules(Role::Planner).extra_deny.is_empty());
+        assert_eq!(rules(Role::Assistant).extra_deny, ["WebFetch"]);
         let review = with_review_rules(
             HookSetup::default(),
             &toml::from_str::<crate::config::Config>(
@@ -1440,7 +1421,7 @@ mod tests {
         let plain = with_config_rules(
             HookSetup::default(),
             &PermissionsConfig::default(),
-            TaskKind::Work,
+            Role::Work,
         );
         assert!(plain.environment.is_none() && plain.extra_allow.is_empty());
         // plete's own denies stay whatever the config adds.
@@ -1453,7 +1434,7 @@ mod tests {
             "a",
             true,
         );
-        let hooks = with_config_rules(hooks, &config.permissions, TaskKind::Assistant);
+        let hooks = with_config_rules(hooks, &config.permissions, Role::Assistant);
         assert!(hooks.deny.contains(&"git push --force".to_string()));
         for read in permissions::GH_READ_ONLY {
             assert!(hooks.allow.contains(&read.to_string()), "{read}");

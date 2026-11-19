@@ -11630,12 +11630,12 @@ fn manager_new_without_a_goal_makes_no_assistant() {
     assert!(calls_of(&tmux, "new-session").is_empty());
 }
 
-/// A planner is a work task, so `manager new` is no longer refused up front
-/// on a harness without hooks and the rest (M36): the task is made, and the
-/// check comes when a task is made under it.
+/// A planner needs what a task with tasks under it needs, so `manager new`
+/// on a harness without hooks and the rest is refused up front (M36):
+/// nothing is made.
 #[cfg(unix)]
 #[test]
-fn manager_new_is_not_refused_on_a_harness_without_hooks() {
+fn manager_new_is_refused_on_a_harness_without_hooks() {
     let lab = StoreLab::new();
     std::fs::write(
         lab.home().join("config.toml"),
@@ -11648,35 +11648,11 @@ fn manager_new_is_not_refused_on_a_harness_without_hooks() {
     let tmux_env = tmux.to_string_lossy().to_string();
     let env = [("PLETE_TMUX", tmux_env.as_str())];
 
-    // Made as a planner task; this harness takes no first prompt, so its
-    // agent is not started, and the command says so and fails.
     let output = lab.plete_at(&["manager", "new", "api", "--goal", "g"], &lab.home(), &env);
     assert!(!output.status.success());
     let said = stderr_of(&output);
-    assert!(
-        said.contains("was made, but its agent did not start"),
-        "{said}"
-    );
-    assert!(lab.home().join("tasks/api").is_dir());
-    let kind: String = lab
-        .index()
-        .query_row("SELECT kind FROM tasks WHERE slug = 'api'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(kind, "work");
-    assert!(calls_of(&tmux, "new-session").is_empty());
-
-    // A task under it is what needs the hooks.
-    let output = lab.plete_at(
-        &["task", "new", "sub", "--parent", "api", "--goal", "g"],
-        &lab.home(),
-        &env,
-    );
-    assert!(!output.status.success());
-    let said = stderr_of(&output);
     assert!(said.contains("hook events"), "{said}");
-    assert!(!lab.home().join("tasks/sub").exists());
+    assert!(!lab.home().join("tasks/api").exists());
     assert!(calls_of(&tmux, "new-session").is_empty());
 }
 
@@ -15383,13 +15359,13 @@ fn agents_tab_makes_a_worker_under_a_node() {
     assert!(screen.wait_for_exit().success());
 }
 
-/// `n` on a node makes a manager (the form's kind) under it as the user:
+/// `n` on a node makes a planner (the form's kind) under it as the user:
 /// `plan_child`'s refusals stay on the form, and once made it starts at
 /// once with its brief. Under the assistant here: `n` on a task with tasks
 /// under it is still refused in the Agents tab.
 #[cfg(unix)]
 #[test]
-fn agents_tab_makes_a_manager_under_a_node() {
+fn agents_tab_makes_a_planner_under_a_node() {
     if !have_script() {
         eprintln!("no `script` to run a terminal with; skipping");
         return;
@@ -15405,11 +15381,11 @@ fn agents_tab_makes_a_manager_under_a_node() {
     screen.wait_for_text("└─ ▾ api");
     screen.type_keys(b"n");
     screen.wait_for_words("new task under the assistant");
-    // A manager, called sub, with no goal yet.
+    // A planner, called sub, with no goal yet.
     screen.type_keys(b" ");
-    screen.wait_for_text("‹ manager ›");
+    screen.wait_for_text("planner ›");
     screen.type_keys(b"\tsub\r");
-    screen.wait_for_words("a manager needs --goal or --brief-file");
+    screen.wait_for_words("a planner needs a goal");
     // A goal, and more than api holds to give.
     screen.type_keys(b"\tship the v2 api\t\t\ttask.archive\r");
     screen.wait_for_words("cannot grant `task.archive`: the assistant does not hold it");
@@ -15422,7 +15398,7 @@ fn agents_tab_makes_a_manager_under_a_node() {
     };
     assert_eq!(made(), 0);
     screen.type_keys(b"\x15task.create\r");
-    screen.wait_for_words("made manager sub under the assistant");
+    screen.wait_for_words("made planner sub under the assistant");
     screen.wait_for_words("started the agent with its brief in tmux session plete-sub");
 
     let (sub, parent) = lab
@@ -15436,6 +15412,15 @@ fn agents_tab_makes_a_manager_under_a_node() {
     assert_eq!(parent.as_deref(), Some(lab.assistant_id().as_str()));
     let (goal, _, by) = lab.brief_of(&sub).unwrap();
     assert_eq!((goal.as_str(), by.as_str()), ("ship the v2 api", "user"));
+    let (kind, agent) = lab
+        .index()
+        .query_row(
+            "SELECT kind, agent FROM tasks JOIN task_agents ON task_id = id WHERE id = ?1",
+            [&sub],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!((kind.as_str(), agent.as_str()), ("work", "planner"));
     let started: Vec<_> = calls_of(&tmux, "new-session")
         .into_iter()
         .filter(|c| c.iter().any(|a| a == "plete-sub"))
@@ -15446,7 +15431,7 @@ fn agents_tab_makes_a_manager_under_a_node() {
     // message; under it, the cursor is on the new node.
     screen.wait_for_words("cannot be identified");
     screen.esc();
-    screen.wait_for_words("└─ ▾ sub");
+    screen.wait_for_words("└─ sub");
     screen.type_keys(b"b");
     screen.wait_for_words("goal (from user): ship the v2 api");
     assert!(screen.shows("may: task.create"), "{}", screen.plain());
@@ -15538,7 +15523,7 @@ fn agents_tab_shows_a_queued_start() {
     screen.type_keys(b"n");
     screen.wait_for_text("new task under task api");
     screen.type_keys(b" \tlater\tdo it later\r");
-    screen.wait_for_words("made manager later under task api");
+    screen.wait_for_words("made planner later under task api");
     screen.wait_for_words("queued (tasks in the tree running: 2/1");
     assert!(!screen.plain().contains("plete:"), "{}", screen.plain());
     assert!(calls_of(&tmux, "new-session")
@@ -15823,26 +15808,17 @@ fn a_held_start_with_a_prompt_is_refused_on_an_agent_that_takes_none() {
     multi_session(&tmux);
     let tmux_env = tmux.to_string_lossy().to_string();
     let env = [("PLETE_TMUX", tmux_env.as_str()), ("PLETE_AGENT", "aider")];
-    let m = lab.new_task_with("m", &["--parent", "assistant"]);
-    lab.index()
-        .execute("UPDATE tasks SET kind = 'manager' WHERE id = ?1", [&m])
-        .unwrap();
-    succeeded(&lab.plete_at(&["manager", "pause", "m"], &lab.home(), &env));
-
-    let output = lab.plete_at(
-        &["task", "new", "kid", "--parent", "m", "--prompt", "go"],
+    // A task with tasks under it needs an agent with hooks, so kid is made
+    // under one, and held; the agent is changed after.
+    lab.new_task_with("m", &["--parent", "assistant"]);
+    let claude = [("PLETE_TMUX", tmux_env.as_str())];
+    succeeded(&lab.plete_at(&["task", "pause", "m"], &lab.home(), &claude));
+    succeeded(&lab.plete_at(
+        &["task", "new", "kid", "--parent", "m"],
         &lab.home(),
-        &env,
-    );
-    assert!(!output.status.success());
-    assert!(
-        stderr_of(&output).contains("takes no first prompt"),
-        "{}",
-        stderr_of(&output)
-    );
-    assert!(lab.home().join("tasks/kid").is_dir());
+        &claude,
+    ));
     let inbox = lab.home().join("tasks/kid/.plete/inbox.jsonl");
-    assert!(!inbox.exists());
 
     let output = lab.plete_at(&["task", "send", "kid", "hi"], &lab.home(), &env);
     assert!(!output.status.success());
@@ -16461,7 +16437,7 @@ fn a_brief_under_a_paused_manager_starts_once_it_is_resumed() {
     );
     succeeded(&output);
     assert!(
-        stderr_of(&output).contains("not started: task kid is paused under manager m"),
+        stderr_of(&output).contains("not started: task kid is paused under task m"),
         "{}",
         stderr_of(&output)
     );

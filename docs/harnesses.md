@@ -237,10 +237,7 @@ The list under `guards` is:
   holds pre-approved, read at each start). The assistant is never denied these: it holds them by
   default, and at worst the user approves them at the prompt. Only these
   commands are denied, not the same through `gh api` or `curl` (see
-  below);
-- for a manager (phase 2) only, under `guards`, `git commit`, `git push`, `git checkout -b`
-  and `git switch -c`: its worktrees are read-only, and workers make the
-  changes. `git branch` is not denied, so `git branch -a` still reads.
+  below).
 
 A repo's default branch is what plete recorded when it cloned or imported
 it: `origin/HEAD`, or, without one, the branch checked out then, which may

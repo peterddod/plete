@@ -230,7 +230,7 @@ fn checked(app: &App, src: &Source, body: &str) -> Result<(TaskRecord, String)> 
         );
     };
     match parent.kind {
-        TaskKind::Assistant | TaskKind::Manager => {}
+        TaskKind::Assistant => {}
         TaskKind::Work if parent.parent_id.is_some() => {}
         TaskKind::Work => bail!(
             "task {} is not under the assistant: only the tasks under it take reports",
@@ -342,7 +342,7 @@ fn deliver_to_with<'a>(
         TaskKind::Assistant => assistant::deliver(app, text, may_start, meta).map(|(d, _)| d),
         // Typed into its idle pane, queued while it is busy, and started
         // only with `may_start`; otherwise held in its inbox.
-        TaskKind::Manager | TaskKind::Work | TaskKind::Setup => messages::deliver(
+        TaskKind::Work | TaskKind::Setup => messages::deliver(
             &tasks::task_dir(app, to),
             agent(may_start).as_ref(),
             text,
@@ -402,7 +402,7 @@ fn escalate_with(
     refuse_unless_held(app, &row, &holder)?;
     let to = match holder.kind {
         TaskKind::Assistant => None,
-        TaskKind::Manager | TaskKind::Work | TaskKind::Setup => {
+        TaskKind::Work | TaskKind::Setup => {
             let parent = holder
                 .parent_id
                 .as_deref()
@@ -432,7 +432,7 @@ fn escalate_with(
             notifier(Event {
                 why: Why::NeedsUser,
                 kind: row.kind.as_str().into(),
-                level: Some(asker.level()),
+                level: Some(asker.level(app)),
                 task: Some(asker.slug().to_string()),
                 // Not `r<id>`, which its reaching the assistant may have
                 // been told under: that one would swallow this.
@@ -736,7 +736,7 @@ pub fn held(app: &App, by: &Caller) -> Result<Vec<TaskReportRecord>> {
         }
         Caller::Root => app.db.open_asks(Some(&manager::root(app)?.id)),
         Caller::Node(task) => match task.kind {
-            TaskKind::Assistant | TaskKind::Manager => app.db.open_asks(Some(&task.id)),
+            TaskKind::Assistant => app.db.open_asks(Some(&task.id)),
             // Its own open ask, and those it holds from tasks under it.
             TaskKind::Work => {
                 let mut asks: Vec<_> = manager::open_ask(app, task)?.into_iter().collect();
@@ -805,9 +805,9 @@ impl Asker {
         }
     }
 
-    fn level(&self) -> NotifyLevel {
+    fn level(&self, app: &App) -> NotifyLevel {
         match self {
-            Asker::Task(task) => notify::level(task.kind),
+            Asker::Task(task) => notify::level(tasks::role(app, task)),
             Asker::Review(_) => NotifyLevel::Review,
         }
     }
@@ -1144,7 +1144,7 @@ fn sweep_asks_with(
             notifier(Event {
                 why: Why::NeedsUser,
                 kind: row.kind.as_str().into(),
-                level: Some(asker.level()),
+                level: Some(asker.level(app)),
                 task: Some(asker.slug().to_string()),
                 // Neither `r<id>` (it reached the assistant) nor
                 // `r<id>/user` (it reached the user): either would swallow
@@ -1185,7 +1185,7 @@ fn reask_ask(
         return Ok(());
     };
     match holder.kind {
-        TaskKind::Manager | TaskKind::Work => {}
+        TaskKind::Work => {}
         // The assistant's asks told the user when they reached it; the
         // setup agent holds none.
         TaskKind::Assistant | TaskKind::Setup => return Ok(()),
@@ -1325,9 +1325,8 @@ fn idle_body(app: &App, id: &str, idle: i64) -> Result<String> {
 }
 
 /// What `task`'s parent asked of it, fenced, for its agent's session
-/// context: the brief, a manager's budget, what it may do, and how to
-/// report. A manager's `BRIEF.md` holds the same
-/// ([`manager::write_brief`]).
+/// context: the brief, a planner's budget, what it may do, and how to
+/// report.
 pub fn brief_context(app: &App, task: &TaskRecord) -> Result<String> {
     let parent = match &task.parent_id {
         Some(id) => app.db.get_task(id)?,
@@ -1343,9 +1342,9 @@ pub fn brief_context(app: &App, task: &TaskRecord) -> Result<String> {
             lines.push(format!("Done when: {done_when}"));
         }
     }
-    // A worker's budget is its manager's to watch; a manager plans to its
+    // A worker's budget is its parent's to watch; a planner plans to its
     // own.
-    if task.kind == TaskKind::Manager {
+    if crate::tasks::role(app, task) == crate::db::tasks::Role::Planner {
         let limits = app
             .db
             .budget(&task.id)?
@@ -1377,7 +1376,7 @@ pub fn brief_context(app: &App, task: &TaskRecord) -> Result<String> {
     may.push("report");
     lines.push(format!("You may: {}", may.join(", ")));
     let to = manager::label(&parent);
-    let parents = task.kind == TaskKind::Manager || may.contains(&"task.create");
+    let parents = may.contains(&"task.create");
     let own = match parents {
         true => "the tasks below you",
         false => "this task",
@@ -1663,12 +1662,14 @@ mod tests {
 
     /// `m`, a manager under the assistant, with `mw` under it.
     fn manager_lab() -> (tempfile::TempDir, App, TaskRecord, TaskRecord) {
-        let (dir, app, _) = lab();
+        let (dir, mut app, _) = lab();
+        app.config.assistant.allow = vec!["task.create".into()];
         let m = TaskRecord {
-            kind: TaskKind::Manager,
+            kind: TaskKind::Work,
             ..task("m", Some(assistant::ensure(&app).unwrap().id))
         };
         app.db.insert_task(&m).unwrap();
+        app.db.set_grants("m", &["task.create"]).unwrap();
         app.db.insert_task(&task("mw", Some("m".into()))).unwrap();
         let mw = app.db.get_task("mw").unwrap().unwrap();
         (dir, app, m, mw)
@@ -2051,15 +2052,23 @@ mod tests {
     #[test]
     fn a_task_under_a_manager_is_briefed_by_and_reports_to_it() {
         let (_dir, app, m, mw) = manager_lab();
-        assert_eq!(crate::manager::label(&m), "manager m");
+        // A planner is told its budget; a worker is not.
+        app.db.set_task_agent(&m.id, "planner").unwrap();
+        let planner = brief_context(&app, &m).unwrap();
+        assert!(
+            planner.contains("\nBudget: none of your own; those above you still count\n"),
+            "{planner}"
+        );
+        assert!(!brief_context(&app, &mw).unwrap().contains("Budget:"));
+        assert_eq!(crate::manager::label(&m), "task m");
         assert_eq!(crate::manager::label(&mw), "task mw");
         let brief = brief_context(&app, &mw).unwrap();
         assert!(
-            brief.starts_with("<plete-brief from=\"manager m\" path=\"assistant/m/mw\">\n"),
+            brief.starts_with("<plete-brief from=\"task m\" path=\"assistant/m/mw\">\n"),
             "{brief}"
         );
         assert!(
-            brief.contains("\nReport to manager m with `plete report"),
+            brief.contains("\nReport to task m with `plete report"),
             "{brief}"
         );
         let top = app.db.get_task("top").unwrap().unwrap();
@@ -2156,7 +2165,7 @@ mod tests {
         assert!(brief.contains("\nGoal: fix it\n"), "{brief}");
         assert!(brief.contains("\nYou may: report\n"), "{brief}");
         assert!(
-            brief.starts_with("<plete-brief from=\"manager m\" path=\"mw\">\n"),
+            brief.starts_with("<plete-brief from=\"task m\" path=\"mw\">\n"),
             "{brief}"
         );
     }
@@ -2167,9 +2176,9 @@ mod tests {
         let (dir, app, _) = lab();
         let root = assistant::ensure(&app).unwrap().id;
         for (slug, parent, kind) in [
-            ("api", root.as_str(), TaskKind::Manager),
-            ("fe", root.as_str(), TaskKind::Manager),
-            ("sub", "api", TaskKind::Manager),
+            ("api", root.as_str(), TaskKind::Work),
+            ("fe", root.as_str(), TaskKind::Work),
+            ("sub", "api", TaskKind::Work),
             ("ww", "sub", TaskKind::Work),
         ] {
             let node = TaskRecord {
@@ -2386,7 +2395,7 @@ mod tests {
         assert_eq!(queued[0].why, Why::NeedsUser);
         assert_eq!(queued[0].kind, "waiting");
         assert_eq!(queued[0].reference, Some(format!("r{id}")));
-        assert_eq!(queued[0].title, "plete: manager api is waiting on you");
+        assert_eq!(queued[0].title, "plete: task api is waiting on you");
         // Quiet, as an ask: held back. Under a manager, which is told, or
         // pushed: nothing.
         clear_told(&app);
@@ -2609,12 +2618,12 @@ mod tests {
         assert!(
             text.starts_with(&format!(
                 "<plete-report id=\"{id}\" from=\"task ww\" path=\"assistant/api/sub/ww\" \
-                 kind=\"question\" via=\"manager sub\" untrusted=\"true\">\nkeep v1?\n"
+                 kind=\"question\" via=\"task sub\" untrusted=\"true\">\nkeep v1?\n"
             )),
             "{text}"
         );
         assert_eq!(sent[1].0, "assistant");
-        assert!(sent[1].1.contains("via=\"manager api\""), "{}", sent[1].1);
+        assert!(sent[1].1.contains("via=\"task api\""), "{}", sent[1].1);
         // Between managers nothing; reaching the assistant, once.
         let passed: Vec<_> = notified.borrow_mut().drain(..).collect();
         assert_eq!(
@@ -2681,7 +2690,7 @@ mod tests {
         assert_eq!(answered.row.answered_by.as_deref(), Some("user"));
         assert_eq!(
             copied_to(&answered),
-            ["manager sub", "manager api", "the assistant"]
+            ["task sub", "task api", "the assistant"]
         );
         assert!(answered.copies.iter().all(|(_, r)| r.is_ok()));
         assert_eq!(sent.borrow().len(), 4);
@@ -2717,7 +2726,7 @@ mod tests {
         assert_eq!(held.to_id, escalated.row.to_id);
     }
 
-    /// Deleting manager api with `--reparent` hands the assistant the open
+    /// Deleting task api with `--reparent` hands the assistant the open
     /// ask api held, fenced `via="plete (moved)"`, though its asker has
     /// reported progress since; an ask the user holds is not delivered
     /// again, and an answer api gave shows as a deleted task's (C11).
@@ -2802,7 +2811,7 @@ mod tests {
         assert!(matches!(answered.to_asker, Ok(Delivered::Queued)));
         assert_eq!(
             copied_to(&answered),
-            ["manager sub", "manager api", "the assistant"]
+            ["task sub", "task api", "the assistant"]
         );
         let (to, text, may_start) = &sent[0];
         assert_eq!(
@@ -2869,7 +2878,7 @@ mod tests {
         assert_eq!(sent[0].0, "ww");
         assert_eq!(
             copied_to(&answered),
-            ["manager sub", "manager api", "the assistant"]
+            ["task sub", "task api", "the assistant"]
         );
 
         // A holder answers after progress too.
@@ -2886,7 +2895,7 @@ mod tests {
         let (answered, sent) = answer_by(&app, &node(&app, "api"), id, "keep it");
         assert_eq!(answered.row.answered_by.as_deref(), Some("api"));
         assert_eq!(sent[0].0, "ww");
-        assert_eq!(copied_to(&answered), ["manager sub"]);
+        assert_eq!(copied_to(&answered), ["task sub"]);
     }
 
     #[test]
@@ -2895,24 +2904,24 @@ mod tests {
         // The user steps in while api holds it: nobody above api saw it.
         let id = asked_and_passed(&app, &[node(&app, "sub")]);
         let (answered, _) = answer_by(&app, &Caller::User, id, "drop it");
-        assert_eq!(copied_to(&answered), ["manager sub", "manager api"]);
+        assert_eq!(copied_to(&answered), ["task sub", "task api"]);
 
         // api answers what it holds: only sub, below it, is copied.
         let id = asked_and_passed(&app, &[node(&app, "sub")]);
         let (answered, sent) = answer_by(&app, &node(&app, "api"), id, "drop it");
-        assert_eq!(copied_to(&answered), ["manager sub"]);
+        assert_eq!(copied_to(&answered), ["task sub"]);
         assert_eq!(answered.row.answered_by.as_deref(), Some("api"));
         assert!(sent[0]
             .1
-            .starts_with(&format!("<plete-answer to=\"{id}\" from=\"manager api\">")));
+            .starts_with(&format!("<plete-answer to=\"{id}\" from=\"task api\">")));
 
         // The assistant answers what it holds.
         let id = asked_and_passed(&app, &[node(&app, "sub"), node(&app, "api")]);
         let (answered, _) = answer_by(&app, &Caller::Root, id, "drop it");
-        assert_eq!(copied_to(&answered), ["manager sub", "manager api"]);
+        assert_eq!(copied_to(&answered), ["task sub", "task api"]);
         let root = assistant::ensure(&app).unwrap().id;
         assert_eq!(answered.row.answered_by, Some(root));
-        assert_eq!(answerer(&app, "api").unwrap(), "manager api");
+        assert_eq!(answerer(&app, "api").unwrap(), "task api");
         assert_eq!(answerer(&app, "gone").unwrap(), "a deleted task");
     }
 
@@ -2928,7 +2937,7 @@ mod tests {
             (answer.to_string(), escalate.to_string())
         };
         // Below the holder, beside it, and above it.
-        let held = format!("#{id} is held by manager api");
+        let held = format!("#{id} is held by task api");
         assert_eq!(refused(&node(&app, "sub")), (held.clone(), held.clone()));
         assert_eq!(refused(&node(&app, "fe")), (held.clone(), held.clone()));
         assert_eq!(refused(&Caller::Root), (held.clone(), held));
@@ -3037,7 +3046,7 @@ mod tests {
         )
         .unwrap();
         let (answered, sent) = answer_by(&app, &Caller::User, id, &worst);
-        assert_eq!(copied_to(&answered), ["manager sub", "manager api"]);
+        assert_eq!(copied_to(&answered), ["task sub", "task api"]);
         // The asker's own fits whole.
         messages::checked(&sent[0].1).unwrap();
         let copy = &sent[1].1;

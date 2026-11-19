@@ -15,7 +15,7 @@ use crate::agent::AgentSpec;
 use crate::assistant;
 use crate::commands::task::{end_and_resume, warn_all};
 use crate::context::App;
-use crate::db::tasks::{TaskKind, TaskRecord, TaskState};
+use crate::db::tasks::{Role, TaskRecord, TaskState};
 use crate::manager::run;
 use crate::messages::{self, Sender};
 use crate::permissions;
@@ -269,7 +269,7 @@ fn resume(app: &App, live: &Live, why: RepairWhy, now: i64) -> Result<()> {
 /// Queue `action` as a digest item for the assistant, if it is rendered
 /// quietly: it rides the next post, which this neither types nor starts.
 fn note_in_digest(app: &App, action: &str) -> Result<()> {
-    if !app.config.quiet_for(TaskKind::Assistant) {
+    if !app.config.quiet_for(Role::Assistant) {
         return Ok(());
     }
     let Some(task) = app.db.get_assistant_task()? else {

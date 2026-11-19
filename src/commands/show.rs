@@ -163,7 +163,7 @@ mod tests {
         };
         let root = assistant::ensure(&app).unwrap();
         for t in [
-            task("m", TaskKind::Manager, Some(&root.id)),
+            task("m", TaskKind::Work, Some(&root.id)),
             task("mw", TaskKind::Work, Some("m")),
             task("sib", TaskKind::Work, Some(&root.id)),
         ] {
@@ -242,7 +242,7 @@ mod tests {
         let (_home, app) = lab();
         let root = assistant::ensure(&app).unwrap();
         app.db
-            .insert_task(&task("m2", TaskKind::Manager, Some(&root.id)))
+            .insert_task(&task("m2", TaskKind::Work, Some(&root.id)))
             .unwrap();
         app.db
             .insert_task(&task("m2w", TaskKind::Work, Some("m2")))
