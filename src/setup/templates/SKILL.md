@@ -147,7 +147,7 @@ each agent at launch).
 
 ### 8. Watching GitHub
 
-- `[watch]`: `repos`, `projects`, `interval_secs`.
+- `[watch]`: `repos`, `projects`, `interval_secs`, `notifications_interval_secs`.
 - Offer `{name} watch install` (the user runs it) to poll in the background.
 
 ### 9. Notifications

@@ -245,6 +245,43 @@ pub fn pr_review(repo_dir: &Path, number: u64) -> Result<ReviewedPr> {
     serde_json::from_str(&text).context("parse gh pr view output")
 }
 
+/// One entry of a PR's `reviewRequests`: a user, or a team.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ReviewRequest {
+    /// `User` or `Team`.
+    #[serde(rename = "__typename", default)]
+    pub kind: String,
+    /// A user's login; empty for a team.
+    #[serde(default)]
+    pub login: String,
+    /// A team's slug; empty for a user.
+    #[serde(default)]
+    pub slug: String,
+}
+
+/// A PR with who wrote it and who is asked to review it.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestedPr {
+    #[serde(flatten)]
+    pub pr: PullRequest,
+    /// None when the author's account is gone.
+    #[serde(default)]
+    pub author: Option<Login>,
+    #[serde(default)]
+    pub review_requests: Vec<ReviewRequest>,
+}
+
+/// A PR by number, with its author and review requests.
+pub fn pr_requested(repo_dir: &Path, number: u64) -> Result<RequestedPr> {
+    let fields = format!("{PR_FIELDS},author,reviewRequests");
+    let text = gh_ok(
+        repo_dir,
+        &["pr", "view", &number.to_string(), "--json", &fields],
+    )?;
+    serde_json::from_str(&text).context("parse gh pr view output")
+}
+
 /// The PR for a local branch, if there is one.
 ///
 /// `pr/<n>` is how [`PullRequest::local_branch`] names a fork's PR, so that
@@ -1330,11 +1367,15 @@ pub struct NotificationRepo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notifications {
     /// Nothing has changed since the `If-Modified-Since` given.
-    NotModified,
+    NotModified {
+        /// GitHub's `X-Poll-Interval`: seconds before it may be asked again.
+        poll_interval: Option<u64>,
+    },
     /// The unread notifications, and the `Last-Modified` to ask with next.
     Changed {
         last_modified: Option<String>,
         threads: Vec<Notification>,
+        poll_interval: Option<u64>,
     },
 }
 
@@ -1354,6 +1395,7 @@ const NOTIFICATIONS_MAX_PAGES: usize = 10;
 pub fn notifications(dir: &Path, if_modified_since: Option<&str>) -> Result<Notifications> {
     let mut threads = Vec::new();
     let mut last_modified = None;
+    let mut poll_interval = None;
     for page in 1..=NOTIFICATIONS_MAX_PAGES {
         let endpoint = format!("notifications?per_page={NOTIFICATIONS_PER_PAGE}&page={page}");
         let mut args = vec!["api", "--include", endpoint.as_str()];
@@ -1369,11 +1411,16 @@ pub fn notifications(dir: &Path, if_modified_since: Option<&str>) -> Result<Noti
             bail!("{}", gh_error(&output));
         };
         match response.status {
-            304 if page == 1 => return Ok(Notifications::NotModified),
+            304 if page == 1 => {
+                return Ok(Notifications::NotModified {
+                    poll_interval: x_poll_interval(&response),
+                })
+            }
             200 => {}
             status => bail!("GitHub answered {status}: {}", gh_error(&output)),
         }
         if page == 1 {
+            poll_interval = x_poll_interval(&response);
             last_modified = response
                 .header("last-modified")
                 .filter(|v| header_value_ok(v))
@@ -1389,7 +1436,13 @@ pub fn notifications(dir: &Path, if_modified_since: Option<&str>) -> Result<Noti
     Ok(Notifications::Changed {
         last_modified,
         threads,
+        poll_interval,
     })
+}
+
+/// The `X-Poll-Interval` of a response, in seconds.
+fn x_poll_interval(response: &Included) -> Option<u64> {
+    response.header("x-poll-interval")?.parse().ok()
 }
 
 /// A header value safe to send back: printable ASCII on one line.
@@ -1672,6 +1725,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_prs_review_requests() {
+        let json = r#"{"author":{"id":"x","is_bot":false,"login":"ada","name":"Ada"},"baseRefName":"main","headRefName":"feat","headRefOid":"5f13","isCrossRepository":false,"isDraft":false,"number":10,"reviewDecision":"","reviewRequests":[{"__typename":"User","login":"me"},{"__typename":"Team","name":"Core Team","slug":"core"}],"state":"OPEN","title":"T","url":"u"}"#;
+        let pr: RequestedPr = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.pr.number, 10);
+        assert_eq!(pr.author.unwrap().login, "ada");
+        let [user, team] = &pr.review_requests[..] else {
+            panic!("{:?}", pr.review_requests);
+        };
+        assert_eq!((user.kind.as_str(), user.login.as_str()), ("User", "me"));
+        assert_eq!((team.kind.as_str(), team.slug.as_str()), ("Team", "core"));
+        assert_eq!(team.login, "");
+        // No requests and no author still parse.
+        let bare = json.replace(r#""author""#, r#""x""#);
+        let bare = bare.replace(r#""reviewRequests""#, r#""y""#);
+        let pr: RequestedPr = serde_json::from_str(&bare).unwrap();
+        assert!(pr.author.is_none() && pr.review_requests.is_empty());
+    }
+
+    #[test]
     fn parses_gh_pr_view_output() {
         let json = r#"{"baseRefName":"main","headRefName":"feat","headRefOid":"5f13","headRepositoryOwner":{"login":"x"},"isCrossRepository":false,"isDraft":true,"number":10,"reviewDecision":"","state":"OPEN","title":"T","url":"u"}"#;
         let pr: PullRequest = serde_json::from_str(json).unwrap();
@@ -1797,6 +1869,7 @@ mod tests {
             response.header("last-modified"),
             Some("Sat, 10 Oct 2026 12:05:00 GMT")
         );
+        assert_eq!(x_poll_interval(&response), Some(60));
         let threads = parse_notifications(response.body).unwrap();
         assert_eq!(threads.len(), 6);
         assert_eq!(threads[0].id, "100");
@@ -1809,6 +1882,9 @@ mod tests {
             parse_included("HTTP/2.0 304 Not Modified\r\nX-Poll-Interval: 60\r\n\r\n").unwrap();
         assert_eq!(response.status, 304);
         assert_eq!(response.body, "");
+        assert_eq!(x_poll_interval(&response), Some(60));
+        let bare = parse_included("HTTP/2.0 304 Not Modified\r\nX-Poll-Interval: soon\r\n\r\n");
+        assert_eq!(x_poll_interval(&bare.unwrap()), None);
         assert!(parse_included("gh: HTTP 401").is_none());
         assert!(parse_included("").is_none());
         // A thread in a shape plete does not know is skipped.

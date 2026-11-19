@@ -570,7 +570,7 @@ pub enum EventKind {
 }
 
 /// What a rule does with the events it matches: `action = "assistant"`,
-/// `"task"`, `"notify"` or `"manager:<slug>"` in config.toml.
+/// `"task"`, `"review"`, `"notify"` or `"manager:<slug>"` in config.toml.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleAction {
     /// Hand it to the assistant, which decides what to do within what it is
@@ -579,6 +579,10 @@ pub enum RuleAction {
     /// Send it to the task whose pull request it is about; to the assistant
     /// when no task has it.
     Task,
+    /// For a review request, start the review as `plete review <pr>` does,
+    /// opening nothing, and tell the user how to open it. Any other event
+    /// is notified, as is a request that is not the user's to review.
+    Review,
     /// A desktop notification, nothing more.
     Notify,
     /// Hand it to the manager with this slug, which acts within its own
@@ -594,12 +598,13 @@ impl RuleAction {
         match text {
             "assistant" => return Ok(RuleAction::Assistant),
             "task" => return Ok(RuleAction::Task),
+            "review" => return Ok(RuleAction::Review),
             "notify" => return Ok(RuleAction::Notify),
             _ => {}
         }
         let Some(slug) = text.strip_prefix("manager:") else {
             bail!(
-                "unknown rule action `{text}`: expected assistant, task, notify or manager:<slug>"
+                "unknown rule action `{text}`: expected assistant, task, review, notify or manager:<slug>"
             );
         };
         let slug = slug.trim();
@@ -615,6 +620,7 @@ impl std::fmt::Display for RuleAction {
         match self {
             RuleAction::Assistant => f.write_str("assistant"),
             RuleAction::Task => f.write_str("task"),
+            RuleAction::Review => f.write_str("review"),
             RuleAction::Notify => f.write_str("notify"),
             RuleAction::Manager(slug) => write!(f, "manager:{slug}"),
         }
@@ -646,17 +652,45 @@ pub struct WatchConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<ProjectRef>,
 
-    /// Seconds between polls (default: 120); `0` stops the tasks list
-    /// polling.
+    /// Seconds between polls of your open PRs' checks and the projects
+    /// (default: 120); `0` stops the tasks list polling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<u64>,
+
+    /// Seconds between asks for notifications (default: 60); `0` for no
+    /// faster than `interval_secs`. GitHub's own `X-Poll-Interval` is the
+    /// floor, whatever this says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications_interval_secs: Option<u64>,
 }
 
 pub const DEFAULT_WATCH_INTERVAL_SECS: u64 = 120;
+pub const DEFAULT_NOTIFICATIONS_INTERVAL_SECS: u64 = 60;
 
 impl WatchConfig {
     pub fn interval_secs(&self) -> u64 {
         self.interval_secs.unwrap_or(DEFAULT_WATCH_INTERVAL_SECS)
+    }
+
+    /// Seconds between asks for notifications: `interval_secs` when
+    /// `notifications_interval_secs` is 0.
+    pub fn notifications_interval_secs(&self) -> u64 {
+        match self
+            .notifications_interval_secs
+            .unwrap_or(DEFAULT_NOTIFICATIONS_INTERVAL_SECS)
+        {
+            0 => self.interval_secs(),
+            secs => secs,
+        }
+    }
+
+    /// How often `plete watch --once` is to run: the smaller of the two
+    /// intervals; 0 when `interval_secs` is 0.
+    pub fn tick_secs(&self) -> u64 {
+        match self.interval_secs() {
+            0 => 0,
+            secs => secs.min(self.notifications_interval_secs()),
+        }
     }
 }
 
@@ -2189,6 +2223,9 @@ action = "task"
             }]
         );
         assert_eq!(watch.interval_secs(), 60);
+        // Notifications default to a minute, the tick to the smaller.
+        assert_eq!(watch.notifications_interval_secs(), 60);
+        assert_eq!(watch.tick_secs(), 60);
         let rules = &config.assistant.rules;
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].on, [EventKind::ReviewRequested]);
@@ -2212,6 +2249,24 @@ action = "task"
     }
 
     #[test]
+    fn the_watch_tick_is_the_smaller_interval() {
+        let watch = |text: &str| toml::from_str::<WatchConfig>(text).unwrap();
+        let w = WatchConfig::default();
+        assert_eq!((w.notifications_interval_secs(), w.tick_secs()), (60, 60));
+        let w = watch("interval_secs = 300\nnotifications_interval_secs = 90\n");
+        assert_eq!((w.notifications_interval_secs(), w.tick_secs()), (90, 90));
+        // 0 is no faster than `interval_secs`: today's behaviour.
+        let w = watch("interval_secs = 120\nnotifications_interval_secs = 0\n");
+        assert_eq!((w.notifications_interval_secs(), w.tick_secs()), (120, 120));
+        // Slower than the rest: the rest sets the tick.
+        let w = watch("interval_secs = 120\nnotifications_interval_secs = 600\n");
+        assert_eq!(w.tick_secs(), 120);
+        // No polling at all.
+        let w = watch("interval_secs = 0\n");
+        assert_eq!(w.tick_secs(), 0);
+    }
+
+    #[test]
     fn a_rule_may_name_a_manager_by_slug() {
         let text = "[[assistant.rules]]\non = [\"ci_failed\"]\naction = \"manager:backend\"\n";
         let config: Config = toml::from_str(text).unwrap();
@@ -2224,7 +2279,7 @@ action = "task"
         assert!(out.contains("action = \"manager:backend\""), "{out}");
         let again: Config = toml::from_str(&out).unwrap();
         assert_eq!(again.assistant.rules, config.assistant.rules);
-        for action in ["assistant", "task", "notify"] {
+        for action in ["assistant", "task", "review", "notify"] {
             assert_eq!(RuleAction::parse(action).unwrap().to_string(), action);
         }
 

@@ -187,10 +187,10 @@ fn run(command: Option<Commands>, wake: Option<waiter::WakeEnv>) -> Result<()> {
             assistant::brief::run(&app, all)?
         }
         Commands::InstallShell => commands::install_shell::run()?,
-        Commands::Watch { once, command } => {
+        Commands::Watch { once, due, command } => {
             let app = context::App::open()?;
             match (once, command) {
-                (true, _) => watch::run_once(&app)?,
+                (true, _) => watch::run_once(&app, due)?,
                 (false, Some(WatchCommands::Install)) => watch::install(&app)?,
                 (false, Some(WatchCommands::Uninstall)) => watch::uninstall()?,
                 (false, None | Some(WatchCommands::Status)) => watch::status(&app)?,

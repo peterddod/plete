@@ -7,13 +7,23 @@
 //!   pass, and which of those PRs have since been merged or closed;
 //! - the items of each GitHub Project in `[watch] projects`.
 //!
-//! Each poll also archives the reviews whose PR has been merged or closed,
-//! once their agent is idle ([`crate::review::sweep`]).
+//! Notifications run on a faster cadence than the rest: `[watch]
+//! notifications_interval_secs` (60), never sooner than GitHub's
+//! `X-Poll-Interval`, against `interval_secs` (120) for the PRs' checks and
+//! the projects. The timer runs `plete watch --once --due` every tick (the
+//! smaller of the two), and with `--due` each source is asked only when its
+//! own interval has passed ([`poll`]); a tick with nothing due asks GitHub
+//! nothing. A bare `plete watch --once` asks every source, as it always did.
+//!
+//! Each poll that asks for the PRs' checks also archives the reviews whose
+//! PR has been merged or closed, once their agent is idle
+//! ([`crate::review::sweep`]).
 //!
 //! What is new since the last poll — by `$PLETE_HOME/watch.json` — becomes an
 //! [`Event`] of one [`EventKind`], and the first `[[assistant.rules]]` that
 //! matches it decides where it goes: to the assistant, to the task whose
-//! pull request it is about, to a manager the rule names by slug, or to a
+//! pull request it is about, to a manager the rule names by slug, to a
+//! review that `action = "review"` starts for a review request, or to a
 //! desktop notification, which is also where an event no rule matches goes.
 //! The first poll of each source only notes what is there, so turning the
 //! watcher on is not a flood.
@@ -23,8 +33,8 @@
 //! goes near a shell; what the assistant or a manager then does is held to
 //! its permissions by plete, whatever the event says.
 //!
-//! `plete watch install` has launchd run `plete watch --once` every
-//! `interval_secs` on macOS; elsewhere it prints a systemd user timer to
+//! `plete watch install` has launchd run `plete watch --once --due` every
+//! tick on macOS; elsewhere it prints a systemd user timer to
 //! install by hand. The tasks list starts a poll in the background too,
 //! while it is open, when config.toml has a `[watch]` section.
 
@@ -38,9 +48,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::assistant;
-use crate::config::{
-    self, Config, EventKind, ProjectRef, Rule, RuleAction, WatchConfig, DEFAULT_WATCH_INTERVAL_SECS,
-};
+use crate::config::{self, Config, EventKind, ProjectRef, Rule, RuleAction, WatchConfig};
 use crate::context::App;
 use crate::db::reviews::ReviewRecord;
 use crate::db::tasks::{Role, TaskKind, TaskRecord, TaskState};
@@ -282,6 +290,18 @@ pub struct WatchState {
     /// fingerprint of everything about the item.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, BTreeMap<String, String>>,
+    /// When notifications were last asked for, in unix seconds; missing
+    /// is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications_at: Option<i64>,
+    /// GitHub's last `X-Poll-Interval`: seconds notifications may not be
+    /// asked for again within.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<u64>,
+    /// When the PRs' checks and the projects were last polled; missing is
+    /// due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broad_at: Option<i64>,
 }
 
 /// One of the user's open PRs as last seen.
@@ -386,15 +406,88 @@ impl Source for Gh<'_> {
 #[derive(Debug, Default)]
 pub struct Polled {
     pub events: Vec<Event>,
+    /// Notifications were asked for.
+    pub asked: bool,
     pub errors: Vec<String>,
+    /// The PRs' checks and the projects were polled too, not only the
+    /// notifications.
+    pub broad: bool,
+}
+
+/// A timer fires a little early now and then, and times are whole seconds:
+/// an interval counts as passed this many seconds short. It applies to
+/// GitHub's `X-Poll-Interval` as well, since a 60 s timer that fired at 59 s
+/// would otherwise miss every other tick; a 304 is free, and a few seconds'
+/// haste is not what the header guards against.
+const SLACK_SECS: i64 = 5;
+
+fn passed(since: Option<i64>, now: i64, interval: u64) -> bool {
+    match since {
+        None => true,
+        // The clock moved back: ask rather than wait it out.
+        Some(at) if at > now => true,
+        Some(at) => now - at + SLACK_SECS >= interval as i64,
+    }
+}
+
+/// Whether notification `n`, new since last seen, is one the user's PRs'
+/// checks must be fresh to tell of: CI, or a PR's state change.
+fn needs_checks(state: &WatchState, n: &Notification, watched: &dyn Fn(&str) -> bool) -> bool {
+    let Some(seen) = &state.seen else {
+        return false;
+    };
+    if seen.get(&n.id) == Some(&n.updated_at) || !watched(&n.repository.full_name) {
+        return false;
+    }
+    matches!(
+        read_reason(&n.reason, &n.subject.kind, &n.subject.title),
+        Reading::Kind(EventKind::CiFailed | EventKind::CiPassed) | Reading::StateChange
+    )
+}
+
+/// Whether the PRs' checks and the projects are due: `interval_secs` has
+/// passed since they were last polled.
+fn broad_due(watch: &WatchConfig, state: &WatchState, now: i64) -> bool {
+    passed(state.broad_at, now, watch.interval_secs())
+}
+
+/// Whether notifications are due: the configured interval, and GitHub's
+/// last `X-Poll-Interval` if longer, has passed since they were last asked
+/// for.
+fn notifications_due(watch: &WatchConfig, state: &WatchState, now: i64) -> bool {
+    let every = watch
+        .notifications_interval_secs()
+        .max(state.poll_interval.unwrap_or(0));
+    passed(state.notifications_at, now, every)
 }
 
 /// Ask `source` what is new since `state`, and bring `state` up to date. A
 /// source that fails keeps what it had, and is asked again next time.
-pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, now: i64) -> Polled {
+pub fn poll(
+    source: &dyn Source,
+    watch: &WatchConfig,
+    state: &mut WatchState,
+    now: i64,
+    due: bool,
+) -> Polled {
     let mut out = Polled::default();
     let watched =
         |repo: &str| watch.repos.is_empty() || watch.repos.iter().any(|p| repo_matches(p, repo));
+
+    // Notifications are fetched first, and told of after the checks. A CI
+    // or state-change notification is for the checks to tell of when the PR
+    // is the user's, and the checks may be stale: a PR opened since they
+    // were polled would be told of twice. So such a notification brings the
+    // checks forward.
+    let fetched = (!due || notifications_due(watch, state, now)).then(|| {
+        state.notifications_at = Some(now);
+        source.notifications(state.last_modified.as_deref())
+    });
+    out.asked = fetched.is_some();
+    let broad = !due
+        || broad_due(watch, state, now)
+        || matches!(&fetched, Some(Ok(Notifications::Changed { threads, .. }))
+            if threads.iter().any(|n| needs_checks(state, n, &watched)));
 
     // Checks first: a merge or close of one of the user's own PRs is told
     // from these, and not again from its notification.
@@ -403,37 +496,44 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
         .iter()
         .flat_map(|c| c.keys().cloned())
         .collect();
-    match source.my_open_prs() {
-        Ok(prs) => {
-            let prs: Vec<MyPr> = prs.into_iter().filter(|p| watched(&p.repo)).collect();
-            own.extend(prs.iter().map(|p| pr_key(&p.repo, p.number)));
-            let diff = diff_checks(state.checks.as_ref(), &prs, now);
-            out.events.extend(diff.events);
-            let mut checks = diff.checks;
-            for gone in diff.departed {
-                match source.pull_state(&gone.repo, gone.number) {
-                    Ok(pull) => out
-                        .events
-                        .extend(closed_event(checked_event(&gone, now), &pull)),
-                    // Kept, to be asked about again next time.
-                    Err(e) => {
-                        out.errors
-                            .push(format!("{} #{}: {e:#}", gone.repo, gone.number));
-                        checks.insert(pr_key(&gone.repo, gone.number), gone);
+    if broad {
+        match source.my_open_prs() {
+            Ok(prs) => {
+                let prs: Vec<MyPr> = prs.into_iter().filter(|p| watched(&p.repo)).collect();
+                own.extend(prs.iter().map(|p| pr_key(&p.repo, p.number)));
+                let diff = diff_checks(state.checks.as_ref(), &prs, now);
+                out.events.extend(diff.events);
+                let mut checks = diff.checks;
+                for gone in diff.departed {
+                    match source.pull_state(&gone.repo, gone.number) {
+                        Ok(pull) => out
+                            .events
+                            .extend(closed_event(checked_event(&gone, now), &pull)),
+                        // Kept, to be asked about again next time.
+                        Err(e) => {
+                            out.errors
+                                .push(format!("{} #{}: {e:#}", gone.repo, gone.number));
+                            checks.insert(pr_key(&gone.repo, gone.number), gone);
+                        }
                     }
                 }
+                state.checks = Some(checks);
             }
-            state.checks = Some(checks);
+            Err(e) => out.errors.push(format!("your pull requests: {e:#}")),
         }
-        Err(e) => out.errors.push(format!("your pull requests: {e:#}")),
     }
 
-    match source.notifications(state.last_modified.as_deref()) {
-        Ok(Notifications::NotModified) => {}
-        Ok(Notifications::Changed {
+    match fetched {
+        None => {}
+        Some(Ok(Notifications::NotModified { poll_interval })) => {
+            state.poll_interval = poll_interval.or(state.poll_interval);
+        }
+        Some(Ok(Notifications::Changed {
             last_modified,
             threads,
-        }) => {
+            poll_interval,
+        })) => {
+            state.poll_interval = poll_interval.or(state.poll_interval);
             let first = state.seen.is_none();
             let before = state.seen.take().unwrap_or_default();
             let mut seen = BTreeMap::new();
@@ -476,13 +576,13 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
             state.seen = Some(seen);
             state.last_modified = last_modified;
         }
-        Err(e) => out.errors.push(format!("notifications: {e:#}")),
+        Some(Err(e)) => out.errors.push(format!("notifications: {e:#}")),
     }
 
     // Projects are watched because they were named, whatever their items'
     // repositories.
     let mut projects = BTreeMap::new();
-    for project in &watch.projects {
+    for project in watch.projects.iter().filter(|_| broad) {
         let key = format!("{}/{}", project.owner, project.number);
         if !valid_owner(&project.owner) {
             out.errors.push(format!(
@@ -505,7 +605,13 @@ pub fn poll(source: &dyn Source, watch: &WatchConfig, state: &mut WatchState, no
             }
         }
     }
-    state.projects = projects;
+    if broad {
+        state.projects = projects;
+        // Stamped whether or not a source failed: a failing one is asked
+        // again after `interval_secs`, not on every tick.
+        state.broad_at = Some(now);
+    }
+    out.broad = broad;
 
     // One PR's news told twice — its notification and its checks — is told
     // once.
@@ -900,6 +1006,8 @@ pub enum Sent {
     /// A review's agent, by the review's slug.
     Review(String),
     Manager(String),
+    /// A review started for a review request, by the review's slug.
+    ReviewStarted(String),
     Notified,
 }
 
@@ -910,6 +1018,7 @@ impl Sent {
             Sent::Task(slug) => format!("task {slug}"),
             Sent::Review(slug) => format!("review {slug}"),
             Sent::Manager(slug) => format!("manager {slug}"),
+            Sent::ReviewStarted(slug) => format!("review {slug} (started)"),
             Sent::Notified => "notified".to_string(),
         }
     }
@@ -924,9 +1033,16 @@ pub fn dispatch(app: &App, rules: &[Rule], events: &[Event]) -> Vec<Sent> {
     let mut held = vec![false; events.len()];
     let mut for_assistant = Vec::new();
     let mut for_managers: BTreeMap<String, Vec<(usize, &Event)>> = BTreeMap::new();
+    // The signed-in login, asked for once and only if a review rule needs it.
+    let mut me: Option<Result<String, String>> = None;
     for (i, event) in events.iter().enumerate() {
         match decide(rules, event) {
             RuleAction::Notify => {}
+            RuleAction::Review => match auto_review(app, event, &mut me) {
+                AutoReview::Started(slug) => sent[i] = Sent::ReviewStarted(slug),
+                AutoReview::Notify => {}
+                AutoReview::Assistant => for_assistant.push((i, event)),
+            },
             RuleAction::Assistant => for_assistant.push((i, event)),
             RuleAction::Manager(slug) => for_managers.entry(slug).or_default().push((i, event)),
             RuleAction::Task => match owning_task(app, event) {
@@ -1060,6 +1176,174 @@ pub fn dispatch(app: &App, rules: &[Rule], events: &[Event]) -> Vec<Sent> {
         .collect();
     notify_events(app, &notified);
     sent
+}
+
+/// What `action = "review"` made of an event.
+enum AutoReview {
+    /// The review is started or queued, and the user told: by this slug.
+    Started(String),
+    /// Nothing was started; the ordinary notification stands.
+    Notify,
+    /// It could not be done; the assistant has the event.
+    Assistant,
+}
+
+/// How the user is asked to review a PR.
+#[derive(Debug, PartialEq, Eq)]
+enum Via {
+    Direct,
+    Team,
+}
+
+/// Whether `me` is to review `pr`, or why not. Of a team request, GitHub's
+/// `review_requested` notification is the evidence that `me` is on it:
+/// membership is not looked up, which takes `read:org`.
+fn review_wanted(pr: &github::RequestedPr, me: &str) -> Result<Via, String> {
+    if pr.pr.state != "OPEN" {
+        return Err(format!("it is {}", pr.pr.state.to_ascii_lowercase()));
+    }
+    if pr.pr.is_draft {
+        return Err("it is a draft".to_string());
+    }
+    if pr
+        .author
+        .as_ref()
+        .is_some_and(|a| a.login.eq_ignore_ascii_case(me))
+    {
+        return Err("it is your own".to_string());
+    }
+    let requests = &pr.review_requests;
+    if requests
+        .iter()
+        .any(|r| r.kind != "Team" && r.login.eq_ignore_ascii_case(me))
+    {
+        return Ok(Via::Direct);
+    }
+    match requests.iter().any(|r| r.kind == "Team") {
+        true => Ok(Via::Team),
+        false => Err("no review is asked of you now".to_string()),
+    }
+}
+
+/// Carry out a review rule for `event`; see [`AutoReview`].
+fn auto_review(app: &App, event: &Event, me: &mut Option<Result<String, String>>) -> AutoReview {
+    let place = event.place();
+    match start_review(app, event, me) {
+        Ok(Some(slug)) => AutoReview::Started(slug),
+        Ok(None) => AutoReview::Notify,
+        Err(e) => {
+            eprintln!(
+                "plete: could not start a review for {place}: {e:#}; handing it to the assistant"
+            );
+            AutoReview::Assistant
+        }
+    }
+}
+
+/// Start the review of the PR a review request is for, as `plete review`
+/// does, opening nothing, and tell the user how to open it. `Ok(None)`: not
+/// started, for a reason said on stderr. A repository not in plete's store
+/// is an error: it is not cloned for this.
+///
+/// The start goes through `messages::deliver`, whose `ReviewAgent` admits
+/// through [`run::admit_review`] whoever calls: a review over `[review]
+/// max_live` waits for a slot, as for the assistant, not as for the user at
+/// a terminal.
+fn start_review(
+    app: &App,
+    event: &Event,
+    me: &mut Option<Result<String, String>>,
+) -> Result<Option<String>> {
+    let place = event.place();
+    let (EventKind::ReviewRequested, Some(number)) = (event.kind, event.number) else {
+        eprintln!("plete: a review rule is for review requests only; {place} is notified");
+        return Ok(None);
+    };
+    let Some(repo) = app
+        .db
+        .list_repos(None)?
+        .into_iter()
+        .find(|r| repo_id_is(&r.id, &event.repo))
+    else {
+        bail!("{} is not in plete's store", event.repo);
+    };
+    let trunk = Path::new(&repo.trunk_path);
+    let login = me
+        .get_or_insert_with(|| github::current_user(trunk).map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(|e| anyhow::anyhow!("could not tell who you are on GitHub: {e}"))?;
+    let requested = github::pr_requested(trunk, number)?;
+    let via = match review_wanted(&requested, &login) {
+        Ok(via) => via,
+        Err(why) => {
+            eprintln!("plete: not reviewing {place}: {why}; it is notified");
+            return Ok(None);
+        }
+    };
+    let pr = &requested.pr;
+    let checkout = crate::review::review_for(app, &repo, pr, None)?;
+    let review = &checkout.review;
+    // As `plete review` has it: once its agent has been asked, the
+    // deprecated job beside it is not run, and one never asked is not
+    // started over by it.
+    let has_agent = crate::review::asked(&crate::review::folded(app, review)).is_some();
+    if app.config.review.command().is_some() && !has_agent {
+        eprintln!(
+            "plete: not reviewing {place}: [review] command is deprecated and not run by a \
+             watch rule; remove it to have the agent review; it is notified"
+        );
+        return Ok(None);
+    }
+    let asking = crate::review::ask_agent(app, review, pr, &checkout.path, false, None)?;
+    let (line, delivered) = match asking {
+        crate::review::Asking::Asked { line, delivered } => (line, delivered),
+        crate::review::Asking::Declined(why) => {
+            eprintln!("plete: not reviewing {place}: {why}; it is notified");
+            return Ok(None);
+        }
+    };
+    let slug = &review.slug;
+    let how = match via {
+        Via::Direct => "for a review request",
+        Via::Team => "for a team's review request",
+    };
+    let action = format!(
+        "started review {slug} of {} #{number} {how} (watch rule)",
+        event.repo
+    );
+    if let Err(e) = crate::permissions::append(
+        &crate::permissions::actions_log(&app.home),
+        "review.start",
+        &action,
+        crate::permissions::Outcome::Done,
+        None,
+    ) {
+        eprintln!("plete: warning: could not log the review started: {e:#}");
+    }
+    let waiting = matches!(delivered, Delivered::StartQueued { .. });
+    let link = Some(event.url.clone()).filter(|u| notify::openable_url(u));
+    notify::event(
+        app,
+        notify::Event {
+            kind: "review".into(),
+            level: Some(config::NotifyLevel::Review),
+            task: Some(slug.clone()),
+            // Each head of the PR is told once.
+            reference: Some(format!("requested:{}@{}", review.id, pr.head_ref_oid)),
+            title: match waiting {
+                true => format!("plete: review queued for {} #{number}", event.repo),
+                false => format!("plete: reviewing {} #{number}", event.repo),
+            },
+            subtitle: Some(event.title.clone()).filter(|t| !t.is_empty()),
+            body: format!(
+                "{line}\nplete review open {slug}\nplete review diff {slug}\nplete review explore {slug}"
+            ),
+            pr: link.clone(),
+            link,
+            ..notify::Event::default()
+        },
+    );
+    Ok(Some(slug.clone()))
 }
 
 /// Tell the user of each of the user's PRs whose checks just failed for
@@ -1286,7 +1570,7 @@ fn trim_log(home: &Path) {
 
 /// `plete watch --once`: poll, send what is new where the rules say, and
 /// remember what was seen. Quietly does nothing while another poll runs.
-pub fn run_once(app: &App) -> Result<()> {
+pub fn run_once(app: &App, due: bool) -> Result<()> {
     let Some(_lock) = try_lock(&app.home)? else {
         eprintln!("plete: another plete watch is running");
         return Ok(());
@@ -1297,7 +1581,7 @@ pub fn run_once(app: &App) -> Result<()> {
     let watch = app.config.watch.clone().unwrap_or_default();
     let path = config::watch_state_path(&app.home);
     let mut state = load_state(&path);
-    let polled = poll(&Gh { dir: &app.home }, &watch, &mut state, now);
+    let polled = poll(&Gh { dir: &app.home }, &watch, &mut state, now, due);
     let sent = dispatch(app, &app.config.assistant.rules, &polled.events);
     tell_stuck_ci(app, &polled.events, &state);
     state.last_run = Some(now_secs());
@@ -1314,10 +1598,14 @@ pub fn run_once(app: &App) -> Result<()> {
     if let Err(e) = reports::sweep_asks(app, now_secs()) {
         eprintln!("plete: warning: could not look for unanswered asks: {e:#}");
     }
-    // A reviewed PR merged or closed archives its review, once idle.
-    match crate::review::sweep(app) {
-        Ok(lines) => lines.iter().for_each(|l| eprintln!("plete: {l}")),
-        Err(e) => eprintln!("plete: warning: could not look for finished reviews: {e:#}"),
+    // A reviewed PR merged or closed archives its review, once idle. It
+    // asks GitHub about each, so only when the checks and projects were
+    // polled too.
+    if polled.broad {
+        match crate::review::sweep(app) {
+            Ok(lines) => lines.iter().for_each(|l| eprintln!("plete: {l}")),
+            Err(e) => eprintln!("plete: warning: could not look for finished reviews: {e:#}"),
+        }
     }
     // A session whose wake channel stopped is resumed for a new watcher.
     if let Err(e) = crate::wake::sweep_wake(app, now_secs(), true) {
@@ -1354,7 +1642,20 @@ pub fn run_once(app: &App) -> Result<()> {
     if let Err(e) = log_events(&app.home, &logged) {
         eprintln!("plete: warning: {e:#}");
     }
-    eprintln!("plete: {}", summary(&sent));
+    // A tick that found nothing and polled no more is not worth a log line.
+    if !sent.is_empty() || polled.broad {
+        eprintln!("plete: {}", summary(&sent));
+    } else if due && !polled.asked {
+        // Not under the timer, whose tick is when notifications fall due
+        // (unless GitHub asks for longer).
+        eprintln!(
+            "plete: nothing is due yet (notifications every {}s, the rest every {}s)",
+            watch
+                .notifications_interval_secs()
+                .max(state.poll_interval.unwrap_or(0)),
+            watch.interval_secs()
+        );
+    }
     if polled.errors.is_empty() {
         return Ok(());
     }
@@ -1396,7 +1697,7 @@ pub fn maybe_background(home: &Path, new_home: Option<&Path>, config: &Config) {
         return;
     };
     let now = now_secs();
-    if !store::is_due(last_claim(home), now, watch.interval_secs()) {
+    if !store::is_due(last_claim(home), now, watch.tick_secs()) {
         return;
     }
     // Held: a poll is running. Taken: released straight away for the one
@@ -1438,7 +1739,9 @@ fn launch(home: &Path, new_home: Option<&Path>) -> Result<()> {
 /// assistant, nor the task whose terminal opened the tasks list.
 fn once_command(home: &Path, new_home: Option<&Path>, exe: &Path) -> Command {
     let mut cmd = Command::new("nohup");
-    cmd.arg(exe).args(["watch", "--once"]).current_dir(home);
+    cmd.arg(exe)
+        .args(["watch", "--once", "--due"])
+        .current_dir(home);
     crate::env::set_home(&mut cmd, home, new_home);
     crate::env::remove_both(&mut cmd, crate::permissions::ASSISTANT_ENV);
     crate::env::remove_both(&mut cmd, crate::tasks::TASK_ID_ENV);
@@ -1490,6 +1793,7 @@ pub fn plist(
 		<string>{exe}</string>
 		<string>watch</string>
 		<string>--once</string>
+		<string>--due</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>{interval}</integer>
@@ -1549,7 +1853,7 @@ pub fn systemd_units(
         "[Unit]\nDescription=plete: poll GitHub for the assistant and your tasks\n\n\
          [Service]\nType=oneshot\nEnvironment={env}\nEnvironment={new_env}\n{new_home}\
          Environment=JEET_BACKGROUND=1\nEnvironment=PLETE_BACKGROUND=1\n\
-         ExecStart={exe} watch --once\n",
+         ExecStart={exe} watch --once --due\n",
         env = systemd_word(&format!("JEET_HOME={}", home.display())),
         new_env = systemd_word(&format!("PLETE_HOME={}", home.display())),
         exe = systemd_word(&exe.to_string_lossy()),
@@ -1565,11 +1869,12 @@ pub fn systemd_units(
     ]
 }
 
-fn interval(app: &App) -> u64 {
-    app.config
-        .watch
-        .as_ref()
-        .map_or(DEFAULT_WATCH_INTERVAL_SECS, WatchConfig::interval_secs)
+/// How often the timer runs `plete watch --once`.
+fn tick(app: &App) -> u64 {
+    app.config.watch.as_ref().map_or_else(
+        || WatchConfig::default().tick_secs(),
+        WatchConfig::tick_secs,
+    )
 }
 
 /// The plist of the launchd job `label`.
@@ -1645,7 +1950,7 @@ pub(crate) fn first_line(bytes: &[u8]) -> String {
 
 /// `plete watch install`.
 pub fn install(app: &App) -> Result<()> {
-    let interval = interval(app);
+    let interval = tick(app);
     if interval == 0 {
         bail!("`[watch] interval_secs` is 0; set how often to poll GitHub first");
     }
@@ -1761,14 +2066,19 @@ pub fn status(app: &App) -> Result<()> {
         None => "does not poll (no `[watch]` in config.toml)",
     };
     println!("tasks list:  {tasks_list}");
-    println!("every:       {}s", interval(app));
+    let watch = app.config.watch.clone().unwrap_or_default();
+    println!(
+        "every:       {}s (notifications {}s, the rest {}s)",
+        tick(app),
+        watch.notifications_interval_secs(),
+        watch.interval_secs()
+    );
     let state = load_state(&config::watch_state_path(&app.home));
     let last = match state.last_run {
         Some(at) => format!("{} ({})", assistant::date(at), crate::agent::age_label(at)),
         None => "never".into(),
     };
     println!("last poll:   {last}");
-    let watch = app.config.watch.clone().unwrap_or_default();
     let repos = match watch.repos.is_empty() {
         true => "all".to_string(),
         false => watch.repos.join(", "),
@@ -1812,7 +2122,7 @@ mod tests {
         }
         assert!(envs.contains(&(std::ffi::OsStr::new("PLETE_HOME"), Some(home.as_os_str()))));
         let args: Vec<_> = cmd.get_args().collect();
-        assert_eq!(args, ["/bin/plete", "watch", "--once"]);
+        assert_eq!(args, ["/bin/plete", "watch", "--once", "--due"]);
     }
 
     /// GitHub as fixtures say, noting what it was asked.
@@ -1823,6 +2133,8 @@ mod tests {
         pulls: BTreeMap<String, PullState>,
         items: RefCell<Vec<Vec<serde_json::Value>>>,
         asked_since: RefCell<Vec<Option<String>>>,
+        prs_asked: std::cell::Cell<usize>,
+        items_asked: std::cell::Cell<usize>,
     }
 
     impl Source for Fake {
@@ -1832,10 +2144,13 @@ mod tests {
                 .push(since.map(str::to_string));
             match self.notifications.borrow_mut().pop() {
                 Some(answer) => answer,
-                None => Ok(Notifications::NotModified),
+                None => Ok(Notifications::NotModified {
+                    poll_interval: None,
+                }),
             }
         }
         fn my_open_prs(&self) -> Result<Vec<MyPr>> {
+            self.prs_asked.set(self.prs_asked.get() + 1);
             Ok(self.prs.borrow_mut().pop().unwrap_or_default())
         }
         fn pull_state(&self, repo: &str, number: u64) -> Result<PullState> {
@@ -1845,6 +2160,7 @@ mod tests {
                 .context("no such pull request")
         }
         fn project_items(&self, _: &str, _: u64) -> Result<Vec<serde_json::Value>> {
+            self.items_asked.set(self.items_asked.get() + 1);
             Ok(self.items.borrow_mut().pop().unwrap_or_default())
         }
     }
@@ -1853,6 +2169,7 @@ mod tests {
         Ok(Notifications::Changed {
             last_modified: Some(last_modified.into()),
             threads: github::parse_notifications(&fixture(file)).unwrap(),
+            poll_interval: None,
         })
     }
 
@@ -1884,7 +2201,7 @@ mod tests {
         let mut state = WatchState::default();
 
         // The first poll only notes what is there.
-        let first = poll(&fake, &watch, &mut state, 1000);
+        let first = poll(&fake, &watch, &mut state, 1000, true);
         assert!(first.events.is_empty(), "{:?}", first.events);
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         assert_eq!(state.seen.as_ref().unwrap().len(), 3);
@@ -1900,7 +2217,7 @@ mod tests {
                 }),
             },
         );
-        let second = poll(&fake, &watch, &mut state, 2000);
+        let second = poll(&fake, &watch, &mut state, 2000, true);
         assert!(second.errors.is_empty(), "{:?}", second.errors);
         assert_eq!(
             *fake.asked_since.borrow(),
@@ -1945,14 +2262,167 @@ mod tests {
             checks: Some(BTreeMap::new()),
             ..WatchState::default()
         };
-        let before = state.clone();
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000);
+        let mut before = state.clone();
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
         assert!(polled.events.is_empty());
+        assert_eq!(state.notifications_at, Some(1000));
+        assert_eq!(state.broad_at, Some(1000));
+        before.notifications_at = Some(1000);
+        before.broad_at = Some(1000);
         assert_eq!(
             *fake.asked_since.borrow(),
             [Some("Sat, 10 Oct 2026 12:00:00 GMT".to_string())]
         );
         assert_eq!(state, before);
+    }
+
+    fn state_polled_at(at: i64) -> WatchState {
+        WatchState {
+            last_modified: Some("then".into()),
+            seen: Some(BTreeMap::new()),
+            checks: Some(BTreeMap::from([(
+                "acme/api#1".to_string(),
+                PrCheck {
+                    repo: "acme/api".into(),
+                    number: 1,
+                    title: "t".into(),
+                    url: String::new(),
+                    branch: String::new(),
+                    sha: "a".into(),
+                    state: "SUCCESS".into(),
+                    failures: 0,
+                },
+            )])),
+            projects: BTreeMap::from([("acme/3".into(), BTreeMap::new())]),
+            notifications_at: Some(at),
+            broad_at: Some(at),
+            ..WatchState::default()
+        }
+    }
+
+    #[test]
+    fn a_tick_inside_the_interval_asks_only_for_notifications() {
+        let fake = Fake::default();
+        // Asked, the fake would say the one open PR is gone.
+        let watch = WatchConfig {
+            projects: vec![ProjectRef {
+                owner: "acme".into(),
+                number: 3,
+            }],
+            ..WatchConfig::default()
+        };
+        let mut state = state_polled_at(1000);
+        let before = state.clone();
+        // 60 s on: notifications are due (60 s), the rest (120 s) is not.
+        let polled = poll(&fake, &watch, &mut state, 1060, true);
+        assert!(!polled.broad);
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        assert_eq!((fake.prs_asked.get(), fake.items_asked.get()), (0, 0));
+        assert_eq!(state.checks, before.checks);
+        assert_eq!(state.projects, before.projects);
+        assert_eq!(state.broad_at, Some(1000));
+        assert_eq!(state.notifications_at, Some(1060));
+        // A tick that early again asks nothing at all.
+        let polled = poll(&fake, &watch, &mut state, 1070, true);
+        assert!(!polled.broad && polled.events.is_empty());
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        assert_eq!((fake.prs_asked.get(), fake.items_asked.get()), (0, 0));
+        // At 120 s everything is due again.
+        let polled = poll(&fake, &watch, &mut state, 1120, true);
+        assert!(polled.broad);
+        assert_eq!((fake.prs_asked.get(), fake.items_asked.get()), (1, 1));
+        assert_eq!(state.broad_at, Some(1120));
+        assert_eq!(fake.asked_since.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_timer_a_few_seconds_early_is_not_missed() {
+        let fake = Fake::default();
+        let mut state = state_polled_at(1000);
+        poll(&fake, &WatchConfig::default(), &mut state, 1056, true);
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        poll(&fake, &WatchConfig::default(), &mut state, 1060, true);
+        assert_eq!(fake.asked_since.borrow().len(), 1, "4 s after is too soon");
+        assert_eq!(fake.prs_asked.get(), 0);
+    }
+
+    /// CI on a PR opened since the checks were last polled is told once:
+    /// the notification brings the checks forward, and they tell of it.
+    #[test]
+    fn a_ci_notification_for_a_new_own_pr_is_told_once() {
+        let fake = Fake::default();
+        fake.prs
+            .borrow_mut()
+            .push(vec![pr("acme/api", 2, "b", Some("FAILURE"))]);
+        let threads = github::parse_notifications(
+            r#"[{"id":"500","reason":"ci_activity","updated_at":"2026-10-10T12:30:00Z",
+            "subject":{"title":"CI workflow run failed for branch-2 branch","type":"CheckSuite"},
+            "repository":{"full_name":"acme/api","html_url":"https://github.com/acme/api"}}]"#,
+        )
+        .unwrap();
+        fake.notifications
+            .borrow_mut()
+            .push(Ok(Notifications::Changed {
+                last_modified: None,
+                threads,
+                poll_interval: None,
+            }));
+        let mut state = state_polled_at(1000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1060, true);
+        assert!(polled.broad);
+        assert_eq!(fake.prs_asked.get(), 1);
+        assert_eq!(kinds(&polled.events), [(EventKind::CiFailed, Some(2))]);
+        // The next broad tick has nothing more to say of it.
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1180, true);
+        assert!(polled.events.is_empty(), "{:?}", polled.events);
+    }
+
+    #[test]
+    fn notifications_wait_out_githubs_poll_interval() {
+        let fake = Fake::default();
+        let mut state = state_polled_at(1000);
+        state.poll_interval = Some(300);
+        poll(&fake, &WatchConfig::default(), &mut state, 1100, true);
+        assert!(fake.asked_since.borrow().is_empty());
+        poll(&fake, &WatchConfig::default(), &mut state, 1300, true);
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        // What GitHub says next is kept; a 304 answer carries it too.
+        fake.notifications
+            .borrow_mut()
+            .push(Ok(Notifications::NotModified {
+                poll_interval: Some(90),
+            }));
+        poll(&fake, &WatchConfig::default(), &mut state, 1600, true);
+        assert_eq!(state.poll_interval, Some(90));
+    }
+
+    #[test]
+    fn a_poll_not_asked_for_what_is_due_asks_everything() {
+        let fake = Fake::default();
+        let mut state = state_polled_at(1000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1010, false);
+        assert!(polled.broad && polled.asked);
+        assert_eq!(fake.prs_asked.get(), 1);
+        assert_eq!(state.broad_at, Some(1010));
+    }
+
+    #[test]
+    fn old_state_polls_everything() {
+        let fake = Fake::default();
+        let mut state = WatchState {
+            last_run: Some(999),
+            last_modified: Some("then".into()),
+            seen: Some(BTreeMap::new()),
+            checks: Some(BTreeMap::new()),
+            ..WatchState::default()
+        };
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
+        assert!(polled.broad);
+        assert_eq!(fake.asked_since.borrow().len(), 1);
+        assert_eq!(
+            (state.notifications_at, state.broad_at),
+            (Some(1000), Some(1000))
+        );
     }
 
     #[test]
@@ -1966,7 +2436,7 @@ mod tests {
             seen: Some(BTreeMap::new()),
             ..WatchState::default()
         };
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
         assert_eq!(polled.errors.len(), 1);
         assert!(polled.errors[0].starts_with("notifications: "));
         assert_eq!(state.last_modified.as_deref(), Some("then"));
@@ -1984,8 +2454,8 @@ mod tests {
             ..WatchConfig::default()
         };
         let mut state = WatchState::default();
-        poll(&fake, &watch, &mut state, 1000);
-        let polled = poll(&fake, &watch, &mut state, 2000);
+        poll(&fake, &watch, &mut state, 1000, true);
+        let polled = poll(&fake, &watch, &mut state, 2000, true);
         assert_eq!(kinds(&polled.events), [(EventKind::Mention, Some(7))]);
     }
 
@@ -2145,8 +2615,8 @@ mod tests {
             changed("notifications_before.json", "a"),
         ]);
         let mut state = WatchState::default();
-        poll(&fake, &WatchConfig::default(), &mut state, 1000);
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000);
+        poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000, true);
         let closing: Vec<(EventKind, Option<u64>)> = kinds(&polled.events)
             .into_iter()
             .filter(|(k, _)| matches!(k, EventKind::PrMerged | EventKind::PrClosed))
@@ -2168,10 +2638,10 @@ mod tests {
             .borrow_mut()
             .extend([vec![], vec![], vec![pr("acme/api", 42, "a", None)]]);
         let mut state = WatchState::default();
-        poll(&fake, &WatchConfig::default(), &mut state, 1000);
+        poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
 
         // Gone, and GitHub cannot say how: kept, and said so.
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000, true);
         assert!(polled.events.is_empty(), "{:?}", polled.events);
         assert_eq!(polled.errors.len(), 1, "{:?}", polled.errors);
         assert!(state.checks.as_ref().unwrap().contains_key("acme/api#42"));
@@ -2185,7 +2655,7 @@ mod tests {
                 merged_by: None,
             },
         );
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 3000);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 3000, true);
         assert!(polled.errors.is_empty(), "{:?}", polled.errors);
         assert_eq!(kinds(&polled.events), [(EventKind::PrMerged, Some(42))]);
         assert!(state.checks.as_ref().unwrap().is_empty());
@@ -2208,8 +2678,8 @@ mod tests {
             changed("notifications_before.json", "a"),
         ]);
         let mut state = WatchState::default();
-        poll(&fake, &WatchConfig::default(), &mut state, 1000);
-        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000);
+        poll(&fake, &WatchConfig::default(), &mut state, 1000, true);
+        let polled = poll(&fake, &WatchConfig::default(), &mut state, 2000, true);
         let ci: Vec<(EventKind, Option<u64>)> = kinds(&polled.events)
             .into_iter()
             .filter(|(k, _)| matches!(k, EventKind::CiFailed | EventKind::CiPassed))
@@ -2345,6 +2815,103 @@ mod tests {
         assert_eq!(
             decide(&[], &event(EventKind::CiFailed, "a/b")),
             RuleAction::Notify
+        );
+    }
+
+    #[test]
+    fn a_review_rule_may_be_limited_to_repos() {
+        let rules = [
+            rule(
+                &[EventKind::ReviewRequested],
+                &["acme/*"],
+                RuleAction::Review,
+            ),
+            rule(&[EventKind::ReviewRequested], &[], RuleAction::Assistant),
+        ];
+        let decide_for = |repo| decide(&rules, &event(EventKind::ReviewRequested, repo));
+        assert_eq!(decide_for("acme/api"), RuleAction::Review);
+        assert_eq!(decide_for("other/api"), RuleAction::Assistant);
+    }
+
+    fn requested(json_extra: &str) -> github::RequestedPr {
+        let json = format!(
+            r#"{{"number":3,"title":"T","url":"u","state":"OPEN","headRefName":"f","baseRefName":"main",
+            "author":{{"login":"Ada"}},"reviewRequests":[]{json_extra}}}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn a_review_is_wanted_for_a_request_to_the_user_or_a_team() {
+        let with = |requests: &str| {
+            let mut pr = requested("");
+            pr.review_requests = serde_json::from_str(requests).unwrap();
+            pr
+        };
+        let direct = with(r#"[{"__typename":"User","login":"Me"}]"#);
+        assert_eq!(review_wanted(&direct, "me"), Ok(Via::Direct));
+        let team = with(r#"[{"__typename":"Team","name":"Core","slug":"core"}]"#);
+        assert_eq!(review_wanted(&team, "me"), Ok(Via::Team));
+        // Both: the direct request is what is said.
+        let both =
+            with(r#"[{"__typename":"Team","slug":"core"},{"__typename":"User","login":"me"}]"#);
+        assert_eq!(review_wanted(&both, "me"), Ok(Via::Direct));
+        // Someone else's request, or none: withdrawn or answered.
+        let other = with(r#"[{"__typename":"User","login":"bob"}]"#);
+        assert!(review_wanted(&other, "me").is_err());
+        assert!(review_wanted(&with("[]"), "me").is_err());
+
+        let mut pr = direct.clone();
+        pr.pr.is_draft = true;
+        assert!(review_wanted(&pr, "me").unwrap_err().contains("draft"));
+        let mut pr = direct.clone();
+        pr.pr.state = "MERGED".into();
+        assert!(review_wanted(&pr, "me").unwrap_err().contains("merged"));
+        let mut pr = direct.clone();
+        pr.pr.state = "CLOSED".into();
+        assert!(review_wanted(&pr, "me").is_err());
+        // Its author is the user, whatever the case.
+        assert!(review_wanted(&direct, "ada").unwrap_err().contains("own"));
+        let mut pr = team;
+        pr.author = None;
+        assert_eq!(review_wanted(&pr, "me"), Ok(Via::Team));
+    }
+
+    #[test]
+    fn a_review_rule_that_cannot_apply_does_not_start_a_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let app = App {
+            config: crate::config::load_or_create(&home).unwrap(),
+            db: crate::db::Database::open(&crate::config::index_path(&home)).unwrap(),
+            new_home: None,
+            home,
+        };
+        let mut me = None;
+        // Not a review request: notified, nothing asked of GitHub.
+        let ev = event(EventKind::Comment, "acme/api");
+        assert!(start_review(&app, &ev, &mut me).unwrap().is_none());
+        // A repository plete does not have is an error, for the assistant.
+        let ev = event(EventKind::ReviewRequested, "acme/api");
+        let err = start_review(&app, &ev, &mut me).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not in plete's store"),
+            "{err:#}"
+        );
+        assert!(matches!(
+            auto_review(&app, &ev, &mut me),
+            AutoReview::Assistant
+        ));
+        assert!(me.is_none(), "who the user is was not asked for");
+    }
+
+    #[test]
+    fn a_started_review_reads_as_one() {
+        let sent = Sent::ReviewStarted("review-api-3".into());
+        assert_eq!(sent.describe(), "review review-api-3 (started)");
+        assert_eq!(
+            summary(&[sent, Sent::Notified]),
+            "2 new GitHub events: 1 notified, 1 to review review-api-3 (started)"
         );
     }
 
@@ -2495,9 +3062,19 @@ mod tests {
             seen: Some(BTreeMap::from([("1".into(), "t".into())])),
             checks: Some(BTreeMap::new()),
             projects: BTreeMap::from([("acme/3".into(), BTreeMap::new())]),
+            notifications_at: Some(7),
+            poll_interval: Some(60),
+            broad_at: Some(6),
         };
         save_state(&path, &state).unwrap();
         assert_eq!(load_state(&path), state);
+        // State from before the fast tick has none of the three: all due.
+        std::fs::write(&path, r#"{"last_run":5,"seen":{}}"#).unwrap();
+        let old = load_state(&path);
+        assert_eq!(
+            (old.notifications_at, old.poll_interval, old.broad_at),
+            (None, None, None)
+        );
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_state(&path), WatchState::default());
     }
@@ -2589,6 +3166,7 @@ mod tests {
 		<string>/opt/plete &amp; co/plete</string>
 		<string>watch</string>
 		<string>--once</string>
+		<string>--due</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>120</integer>
@@ -2634,7 +3212,7 @@ mod tests {
              [Service]\nType=oneshot\nEnvironment=\"JEET_HOME=/home/me/100%% \\\"j\\\"\"\n\
              Environment=\"PLETE_HOME=/home/me/100%% \\\"j\\\"\"\n\
              Environment=JEET_BACKGROUND=1\nEnvironment=PLETE_BACKGROUND=1\n\
-             ExecStart=\"/home/me/bin/plete\" watch --once\n"
+             ExecStart=\"/home/me/bin/plete\" watch --once --due\n"
         );
         assert_eq!(timer_name, "plete-watch.timer");
         assert_eq!(

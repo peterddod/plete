@@ -228,6 +228,11 @@ pub enum Commands {
         /// Poll once and exit: what launchd and the tasks list run
         #[arg(long)]
         once: bool,
+        /// With --once, ask each source only when its interval has passed
+        /// (`[watch]`'s `notifications_interval_secs` and `interval_secs`):
+        /// what the timer and the tasks list run
+        #[arg(long, requires = "once")]
+        due: bool,
         #[command(subcommand)]
         command: Option<WatchCommands>,
     },
@@ -949,7 +954,7 @@ pub enum SetupCommands {
 
 #[derive(Subcommand)]
 pub enum WatchCommands {
-    /// Poll every `[watch] interval_secs` in the background: a launchd job
+    /// Poll in the background, every `[watch]` tick (the smaller of `interval_secs` and `notifications_interval_secs`): a launchd job
     /// on macOS; elsewhere, print a systemd user timer to set up
     Install,
 
