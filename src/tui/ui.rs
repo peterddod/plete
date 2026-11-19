@@ -27,7 +27,23 @@ const KEY_WIDTH: usize = 13;
 /// The listing title's fixed text, around the filter that matched nothing.
 const NO_MATCH_TITLE: &str = " nothing matches \"\" ";
 
+/// One explorer over the whole frame, as it is drawn on its own: under the
+/// spinner, and for callers that know nothing of panes.
 pub fn draw(frame: &mut Frame, explorer: &mut Explorer) {
+    draw_in(frame, frame.area(), explorer, true, None);
+}
+
+/// One explorer into `area`. `focused` picks bright borders over dim ones, and
+/// `marker` ("pane 1/2") goes in the title when only one pane fits on screen.
+/// Everything recorded for the mouse is absolute, so `area` can sit anywhere;
+/// overlays stay centred on the whole frame.
+pub fn draw_in(
+    frame: &mut Frame,
+    area: Rect,
+    explorer: &mut Explorer,
+    focused: bool,
+    marker: Option<&str>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -36,9 +52,9 @@ pub fn draw(frame: &mut Frame, explorer: &mut Explorer) {
             Constraint::Length(2),
             Constraint::Length(1),
         ])
-        .split(frame.area());
+        .split(area);
 
-    let (path_row, pr_area) = draw_header(frame, chunks[0], explorer);
+    let (path_row, pr_area) = draw_header(frame, chunks[0], explorer, focused, marker);
     explorer.pr_area = pr_area;
     // Remember where things landed so a click next frame can be mapped back to
     // the row or the path segment under it. A path line the header had no room
@@ -83,6 +99,7 @@ pub fn draw(frame: &mut Frame, explorer: &mut Explorer) {
                 cursor,
                 diffs,
                 root,
+                focused,
             },
             list,
         );
@@ -131,7 +148,13 @@ pub(super) fn draw_working(frame: &mut Frame, working: &str) {
 /// Draw the header, returning the screen row the breadcrumb landed on — or
 /// none when the terminal was too short to keep the path line — and the cells
 /// the PR number was drawn into, when there is one on screen to click.
-fn draw_header(frame: &mut Frame, area: Rect, explorer: &Explorer) -> (Option<u16>, Option<Rect>) {
+fn draw_header(
+    frame: &mut Frame,
+    area: Rect,
+    explorer: &Explorer,
+    focused: bool,
+    marker: Option<&str>,
+) -> (Option<u16>, Option<Rect>) {
     let worktree_spans = vec![
         Span::styled("worktree ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -230,16 +253,28 @@ fn draw_header(frame: &mut Frame, area: Rect, explorer: &Explorer) -> (Option<u1
         ])
     };
 
-    let heading = match &explorer.repo {
+    let mut heading = match &explorer.repo {
         Some(repo) => format!(" plete · {} ", repo.id),
         None => format!(" plete · task {} ", explorer.root_label),
     };
-    let mut block = Block::default().borders(Borders::ALL).title(Span::styled(
-        heading.clone(),
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    ));
+    if let Some(marker) = marker {
+        heading = format!("{}· {marker} ", heading);
+    }
+    // The pane without the keyboard goes quiet: border and title both.
+    let (border, title) = match focused {
+        true => (Style::default(), Style::default().fg(Color::Green)),
+        false => (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border)
+        .title(Span::styled(
+            heading.clone(),
+            title.add_modifier(Modifier::BOLD),
+        ));
     // The PR goes in the top border, right-aligned, rather than at the end of
     // the worktree line: that line is the first thing a long branch name
     // pushes off the edge. Only when both titles fit whole — a PR number
@@ -369,6 +404,8 @@ struct Listing<'a> {
     cursor: Option<usize>,
     diffs: &'a DiffMap,
     root: &'a std::path::Path,
+    /// Whether this pane has the keyboard; the other one is drawn dim.
+    focused: bool,
 }
 
 /// `+12 -3`, as the listing shows it: only the halves that are not zero, and
@@ -419,6 +456,7 @@ fn draw_listing(frame: &mut Frame, area: Rect, listing: Listing, list_state: &mu
         cursor,
         diffs,
         root,
+        focused,
     } = listing;
     let width = area.width.saturating_sub(4) as usize;
     // Sizes and diffs both line up in columns, so each is as wide as its widest
@@ -487,7 +525,15 @@ fn draw_listing(frame: &mut Frame, area: Rect, listing: Listing, list_state: &mu
     list_state.select(cursor);
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(match focused {
+                    true => Style::default(),
+                    false => Style::default().fg(Color::DarkGray),
+                })
+                .title(title),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -1096,7 +1142,7 @@ pub(super) fn draw_review_body(
 }
 
 /// The key list, as it is both rendered and measured.
-const HELP: [(&str, &str); 28] = [
+const HELP: [(&str, &str); 30] = [
     (
         "a-z, 0-9, …",
         "type to filter this level (live, no key needed)",
@@ -1132,6 +1178,11 @@ const HELP: [(&str, &str); 28] = [
         "ctrl-n",
         "find a file by a few of its letters: ⏎ shows it in the tree",
     ),
+    (
+        "ctrl-v",
+        "split into two panes, or close the other (esc closes one)",
+    ),
+    ("ctrl-l", "focus the other pane"),
     ("ctrl-w", "worktrees of this repository: switch to one"),
     ("", "  in the panel: o open its PR, r refresh, esc close"),
     (

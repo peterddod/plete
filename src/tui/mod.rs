@@ -16,6 +16,7 @@ pub mod chat;
 pub mod command;
 pub mod keys;
 mod managers;
+mod panes;
 mod projects_tab;
 pub mod review;
 mod reviews;
@@ -146,8 +147,9 @@ pub fn explore(
     refresh_diffs(&mut explorer);
     start_pr_lookup(&mut explorer);
 
-    event_loop(app, terminal, &mut explorer)?;
-    Ok(explorer.exit.clone())
+    let mut workspace = panes::Workspace::new(explorer);
+    event_loop(app, terminal, &mut workspace)?;
+    Ok(workspace.into_focused().exit)
 }
 
 /// [`term::with_progress`], drawing the explorer under the spinner.
@@ -173,38 +175,102 @@ fn with_progress<T: Send>(
 /// How often a running review is checked on, so the header notices it end.
 const JOB_CHECK: Duration = Duration::from_secs(3);
 
-fn event_loop(app: &App, terminal: &mut Tui, explorer: &mut Explorer) -> Result<()> {
+fn event_loop(app: &App, terminal: &mut Tui, workspace: &mut panes::Workspace) -> Result<()> {
     let mut last_job_check = Instant::now();
-    while !explorer.should_quit {
-        terminal.draw(|frame| ui::draw(frame, explorer))?;
+    // Quitting is always the focused pane's doing: it is the only one that
+    // takes keys, and its exit is the one plete leaves with.
+    while !workspace.focused().should_quit {
+        terminal.draw(|frame| workspace.draw(frame))?;
         // Block on input unless something in the background may change what
-        // is on screen: the PR lookup, or a review that is still running.
-        let job_running = explorer
-            .review_job
-            .as_ref()
-            .is_some_and(|job| job.state() == JobState::Running);
-        if (explorer.pr_updates.is_some() || job_running)
-            && !event::poll(Duration::from_millis(200))?
-        {
-            take_pr_update(app, explorer);
-            if job_running && last_job_check.elapsed() >= JOB_CHECK {
+        // is on screen, in any pane: the PR lookup, or a review that is still
+        // running.
+        let job_running = workspace.panes().iter().any(|explorer| {
+            explorer
+                .review_job
+                .as_ref()
+                .is_some_and(|job| job.state() == JobState::Running)
+        });
+        let looking = workspace.panes().iter().any(|e| e.pr_updates.is_some());
+        if (looking || job_running) && !event::poll(Duration::from_millis(200))? {
+            let check_jobs = last_job_check.elapsed() >= JOB_CHECK;
+            for explorer in workspace.panes_mut() {
+                take_pr_update(app, explorer);
+                let running = explorer
+                    .review_job
+                    .as_ref()
+                    .is_some_and(|job| job.state() == JobState::Running);
+                if running && check_jobs {
+                    load_review_job(app, explorer);
+                }
+            }
+            if job_running && check_jobs {
                 last_job_check = Instant::now();
-                load_review_job(app, explorer);
             }
             continue;
         }
         let outcome = match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
-                handle_key(app, terminal, explorer, key)
+                handle_pane_key(app, terminal, workspace, key)
             }
-            Event::Mouse(mouse) => handle_mouse(terminal, explorer, mouse),
+            Event::Mouse(mouse) => handle_pane_mouse(terminal, workspace, mouse),
             _ => continue,
         };
         if let Err(e) = outcome {
-            explorer.set_status(format!("error: {e}"));
+            workspace.focused_mut().set_status(format!("error: {e}"));
         }
     }
     Ok(())
+}
+
+/// Keys that belong to the panes go to the workspace; the rest to the
+/// focused explorer. Neither ctrl-q nor ctrl-c is among them.
+fn handle_pane_key(
+    app: &App,
+    terminal: &mut Tui,
+    workspace: &mut panes::Workspace,
+    key: KeyEvent,
+) -> Result<()> {
+    let focused = workspace.focused();
+    let routed = panes::route(
+        key,
+        workspace.is_split(),
+        focused.overlay.is_none(),
+        focused.filter.is_empty(),
+    );
+    let Some(routed) = routed else {
+        return handle_key(app, terminal, workspace.focused_mut(), key);
+    };
+    workspace.apply(routed, |from| {
+        let mut other = panes::sibling(from)?;
+        refresh_diffs(&mut other);
+        start_pr_lookup(&mut other);
+        Ok(other)
+    })
+}
+
+/// A click in the pane that does not have the keyboard moves it there and does
+/// nothing else, so a stray click while reaching for the other pane never
+/// opens a folder. The wheel scrolls whichever pane it is over.
+fn handle_pane_mouse(
+    terminal: &mut Tui,
+    workspace: &mut panes::Workspace,
+    mouse: MouseEvent,
+) -> Result<()> {
+    // A panel in front owns the pointer too, whichever pane it is over.
+    if workspace.focused().overlay.is_some() {
+        return Ok(());
+    }
+    let Some(over) = workspace.pane_at(mouse.column, mouse.row) else {
+        return Ok(());
+    };
+    if over != workspace.focus() && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+        workspace.set_focus(over);
+        return Ok(());
+    }
+    match workspace.panes_mut().get_mut(over) {
+        Some(explorer) => handle_mouse(terminal, explorer, mouse),
+        None => Ok(()),
+    }
 }
 
 fn handle_key(app: &App, terminal: &mut Tui, explorer: &mut Explorer, key: KeyEvent) -> Result<()> {
