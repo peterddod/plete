@@ -226,6 +226,8 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 | `ctrl-a` | the task's coding agent, in its tmux session — started if it is not running |
 | `ctrl-t` | go to: `r` the worktree root (or back to the worktree you left), `t` the task's directory, `p` the task's project folder, `w` the worktrees |
 | `ctrl-n` | find a file by a few of its letters: `⏎` shows it in the tree |
+| `ctrl-v` | split into two explorers side by side, or close the other one |
+| `ctrl-l` | focus the other pane |
 | `ctrl-w` | the repository's worktrees: `⏎` switches to one, `o` opens its PR |
 | `ctrl-f` | diff the highlighted file or folder against the default branch |
 | `ctrl-p` | the pull request: `o` open, `a` approve, `c` comment, `x` request changes, `d` diff, `v` review output |
@@ -233,8 +235,15 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 | `ctrl-d` | toggle hidden dotfiles |
 | `ctrl-r` | refresh the listing and the counters |
 | `ctrl-q` | quit, leaving your shell in the directory you were browsing |
-| `esc` | quit without moving your shell (unless it moved out from under you) |
+| `esc` | quit without moving your shell (unless it moved out from under you); with two panes, close the focused one |
 | `F1` or `ctrl-g` | the key list, in plete |
+
+`ctrl-v` opens a second explorer on the same folder; browse another worktree
+in it, or the same one somewhere else. From 100 columns the two sit side by
+side, the focused one with the bright border; narrower, only the focused pane
+shows (marked `pane 1/2`) and `ctrl-l` swaps them. A click in the other pane
+focuses it. `esc` on an empty filter closes the focused pane; `ctrl-q` quits
+from either.
 
 `ctrl-n` searches the files under the root — git's view of them in a
 repository (tracked, plus untracked that are not ignored), everything

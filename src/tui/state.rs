@@ -373,6 +373,10 @@ pub struct Explorer {
     /// task from there. The away worktree does this when there is one; a
     /// canvas opened on its own has none.
     pub left_task: Option<PathBuf>,
+    /// Whether a second explorer is open beside this one. Set by the
+    /// workspace, which owns that fact; the legend and the help panel read it
+    /// from here so they need not be handed it.
+    pub split: bool,
 }
 
 /// Two presses on the same cell inside this window are one double-click.
@@ -424,6 +428,7 @@ impl Explorer {
             back: None,
             away_from: None,
             left_task: None,
+            split: false,
         };
         explorer.set_root(explorer.root.clone())?;
         // A start that names the root's folders by another path (`/tmp` for
