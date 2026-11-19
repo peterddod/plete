@@ -148,7 +148,7 @@ impl Workspace {
                 self.areas.push(Rect::default());
                 self.focus = 1;
             }
-            PaneKey::Other => self.focus = 1 - self.focus,
+            PaneKey::Other => self.set_focus(1 - self.focus),
             PaneKey::Close => {
                 self.close(self.focus);
                 self.focused_mut().set_status("closed a pane");
@@ -168,9 +168,17 @@ impl Workspace {
         })
     }
 
+    /// Move the keyboard to `pane`, reading its folders again: a command in
+    /// the other pane may have moved or removed what it lists.
     pub fn set_focus(&mut self, pane: usize) {
-        if pane < self.panes.len() {
-            self.focus = pane;
+        if pane >= self.panes.len() || pane == self.focus {
+            return;
+        }
+        self.focus = pane;
+        let explorer = &mut self.panes[pane];
+        let keep = explorer.selected_entry().map(|e| e.path.clone());
+        if let Err(e) = explorer.reload(keep.as_deref()) {
+            explorer.set_status(format!("error: {e:#}"));
         }
     }
 
@@ -197,6 +205,7 @@ impl Workspace {
                 self.areas[i] = area;
                 ui::draw_in(frame, area, &mut self.panes[i], i == self.focus, None);
             }
+            ui::draw_on_top(frame, &self.panes[self.focus]);
             return;
         }
         // Too narrow for both: the focused one, and a marker saying there is
@@ -210,6 +219,7 @@ impl Workspace {
             true,
             Some(&marker),
         );
+        ui::draw_on_top(frame, &self.panes[self.focus]);
     }
 }
 
@@ -395,5 +405,30 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())
             .collect();
         assert!(top.contains("pane 1/2"), "{top}");
+    }
+
+    /// A panel opened in the left pane is drawn over both, not cut in half by
+    /// the right pane being drawn after it.
+    #[test]
+    fn a_panel_in_the_left_pane_is_drawn_over_the_right() {
+        use super::super::state::Overlay;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = fixture();
+        let mut ws = Workspace::new(explorer(dir.path()));
+        split(&mut ws);
+        ws.apply(PaneKey::Other, sibling).unwrap();
+        assert_eq!(ws.focus(), 0);
+        ws.focused_mut().overlay = Some(Overlay::Help { scroll: 0 });
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| ws.draw(frame)).unwrap();
+        let here = super::super::keys::explorer_hints(&ws.panes()[0]);
+        let (area, _) = ui::help_geometry(Rect::new(0, 0, 120, 40), &here);
+        assert!(area.x + area.width > 60, "the panel reaches the right pane");
+        let buffer = terminal.backend().buffer();
+        let right = area.x + area.width - 1;
+        assert_eq!(buffer[(right, area.y)].symbol(), "┐");
+        assert_eq!(buffer[(right, area.y + area.height - 1)].symbol(), "┘");
     }
 }

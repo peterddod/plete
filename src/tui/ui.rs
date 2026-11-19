@@ -31,12 +31,13 @@ const NO_MATCH_TITLE: &str = " nothing matches \"\" ";
 /// spinner, and for callers that know nothing of panes.
 pub fn draw(frame: &mut Frame, explorer: &mut Explorer) {
     draw_in(frame, frame.area(), explorer, true, None);
+    draw_on_top(frame, explorer);
 }
 
 /// One explorer into `area`. `focused` picks bright borders over dim ones, and
 /// `marker` ("pane 1/2") goes in the title when only one pane fits on screen.
-/// Everything recorded for the mouse is absolute, so `area` can sit anywhere;
-/// overlays stay centred on the whole frame.
+/// Everything recorded for the mouse is absolute, so `area` can sit anywhere.
+/// Panels are not drawn here but by [`draw_on_top`], centred on the frame.
 pub fn draw_in(
     frame: &mut Frame,
     area: Rect,
@@ -117,7 +118,12 @@ pub fn draw_in(
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(hints, chunks[3]);
+}
 
+/// What goes over every pane: the explorer's open panel and the banner of a
+/// job it is running. Drawn after all the panes, or the one drawn next would
+/// paint over the half of a panel that reaches across into it.
+pub fn draw_on_top(frame: &mut Frame, explorer: &Explorer) {
     if let Some(overlay) = &explorer.overlay {
         draw_overlay(frame, explorer, overlay);
     }
