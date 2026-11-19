@@ -10,8 +10,8 @@
 
 pub mod actions;
 pub mod diff;
-mod highlight;
-mod render;
+pub(crate) mod highlight;
+pub(crate) mod render;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};

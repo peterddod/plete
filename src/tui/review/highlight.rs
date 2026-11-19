@@ -57,6 +57,8 @@ impl FileHighlight {
 const MAX_LINE: usize = 2_000;
 /// Lines in a file's diff past which it is not highlighted.
 const MAX_LINES: usize = 20_000;
+/// Lines in a viewed file past which it is not highlighted.
+const MAX_TEXT_LINES: usize = 20_000;
 
 /// Highlight `file`'s diff. The two sides are separate texts, so each is
 /// read as its own stream — context and added lines as the head has them,
@@ -200,7 +202,20 @@ const ALIASES: [(&str, &str); 7] = [
 /// The language of `file`: by its whole name (`Makefile`), by extension, or
 /// by a first line such as `#!/bin/sh` when the diff starts at the top.
 fn syntax_for<'a>(syntaxes: &'a SyntaxSet, file: &FileDiff) -> Option<&'a SyntaxReference> {
-    let path = file.path();
+    let by_first_line = || {
+        let first = file.hunks.first()?.lines.first()?;
+        let at_top = first.new == Some(1) || (first.new.is_none() && first.old == Some(1));
+        at_top
+            .then(|| syntaxes.find_syntax_by_first_line(&first.text))
+            .flatten()
+    };
+    syntax_by_path(syntaxes, file.path())
+        .or_else(by_first_line)
+        .filter(|s| s.name != syntaxes.find_syntax_plain_text().name)
+}
+
+/// The language a path's name says it is: the whole name or the extension.
+fn syntax_by_path<'a>(syntaxes: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxReference> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let extension = name.rsplit_once('.').map(|(_, ext)| ext);
     let by_name = syntaxes.find_syntax_by_extension(name);
@@ -214,18 +229,40 @@ fn syntax_for<'a>(syntaxes: &'a SyntaxSet, file: &FileDiff) -> Option<&'a Syntax
             .find_syntax_by_extension(ext)
             .or_else(|| syntaxes.find_syntax_by_extension(&ext.to_ascii_lowercase()))
     });
-    let by_first_line = || {
-        let first = file.hunks.first()?.lines.first()?;
-        let at_top = first.new == Some(1) || (first.new.is_none() && first.old == Some(1));
-        at_top
-            .then(|| syntaxes.find_syntax_by_first_line(&first.text))
-            .flatten()
+    by_name.or(by_extension)
+}
+
+/// Highlight a whole file's text for the explorer's viewer: one list of runs
+/// per line, by byte range into that line. Empty lists throughout for a
+/// language syntect does not know, or text too long to be worth the time —
+/// the viewer draws those plain.
+pub fn highlight_text(path: &str, text: &str) -> Vec<Vec<Run>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let plain = || vec![Vec::new(); lines.len()];
+    if lines.len() > MAX_TEXT_LINES || lines.iter().any(|l| l.len() > MAX_LINE) {
+        return plain();
+    }
+    let syntaxes = syntaxes();
+    let syntax = syntax_by_path(syntaxes, path)
+        .or_else(|| {
+            lines
+                .first()
+                .and_then(|l| syntaxes.find_syntax_by_first_line(l))
+        })
+        .filter(|s| s.name != syntaxes.find_syntax_plain_text().name);
+    let Some(syntax) = syntax else {
+        return plain();
     };
-    let plain = syntaxes.find_syntax_plain_text().name.as_str();
-    by_name
-        .or(by_extension)
-        .or_else(by_first_line)
-        .filter(|s| s.name != plain)
+    let mut state = HighlightLines::new(syntax, theme());
+    let mut out = Vec::with_capacity(lines.len());
+    for line in &lines {
+        match runs_of(&mut state, syntaxes, line) {
+            Some(runs) => out.push(runs),
+            // syntect gave up on the file: better plain than half-done.
+            None => return plain(),
+        }
+    }
+    out
 }
 
 /// GitHub's dark syntax colours, after Primer's: what each kind of token is
@@ -512,6 +549,20 @@ mod tests {
         let found = colours(&line.text, highlight.line(0, at).unwrap());
         assert!(found.contains(&("impl", Some(KEYWORD))), "{found:?}");
         assert!(found.contains(&("Store", Some(TYPE))), "{found:?}");
+    }
+
+    #[test]
+    fn highlights_plain_text_by_file_name() {
+        let text = "fn main() {\n    let n: u64 = 1;\n}\n";
+        let lines = highlight_text("src/main.rs", text);
+        assert_eq!(lines.len(), 3);
+        let first = colours("fn main() {", &lines[0]);
+        assert!(first.contains(&("fn", Some(KEYWORD))), "{first:?}");
+        let second = colours("    let n: u64 = 1;", &lines[1]);
+        assert!(second.contains(&("u64", Some(KEYWORD))), "{second:?}");
+        // Unknown languages come back as one empty list per line.
+        let plain = highlight_text("notes.nosuchlang", "a\nb\n");
+        assert_eq!(plain, vec![Vec::<Run>::new(), Vec::new()]);
     }
 
     #[test]

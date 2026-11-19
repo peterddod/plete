@@ -53,7 +53,7 @@ pub fn explorer_hints(explorer: &Explorer) -> Vec<Hint> {
         match explorer.selected_entry() {
             Some(_) if open => hints.push(hint("⏎", "close")),
             Some(entry) if entry.is_dir => hints.push(hint("⏎", "open")),
-            Some(_) => hints.push(hint("⏎", "edit")),
+            Some(_) => hints.extend([hint("⏎", "show"), hint("^e", "edit")]),
             None => {}
         }
         hints.push(hint("↑↓", "move"));
@@ -123,6 +123,39 @@ pub fn explorer_hints(explorer: &Explorer) -> Vec<Hint> {
         hint("Home/End", "top/bottom"),
     ]);
     hints
+}
+
+/// Every key a file pane answers to. The list is short enough to be the whole
+/// bottom line, so there is no help window behind it to point at.
+pub fn file_hints() -> Vec<Hint> {
+    // The ones that matter most first: a narrow pane drops from the end.
+    vec![
+        hint("↑↓", "move"),
+        hint("e", "edit"),
+        hint("esc", "close"),
+        hint("^l", "other pane"),
+        hint("^q", "quit"),
+        hint("PgUp/Dn", "page"),
+        hint("Home/End", "top/bottom"),
+        hint("←→", "scroll"),
+    ]
+}
+
+/// The hints that fit `width`, each whole or not at all, with nothing after
+/// them: unlike [`hint_line`], no `F1` to end on.
+pub fn file_hint_line(hints: &[Hint], width: usize) -> String {
+    let mut line = String::new();
+    for text in hints.iter().map(Hint::text) {
+        let next = match line.is_empty() {
+            true => text,
+            false => format!("{line}  {text}"),
+        };
+        if next.width() > width {
+            break;
+        }
+        line = next;
+    }
+    line
 }
 
 /// The hints that fit `width` on one line, closed by `F1 help` when all of
@@ -220,7 +253,7 @@ mod tests {
 
         explorer.select_last();
         assert_eq!(explorer.selected_entry().unwrap().name, "README.md");
-        assert!(has(&explorer, "⏎", "edit"));
+        assert!(has(&explorer, "⏎", "show") && has(&explorer, "^e", "edit"));
         assert!(!keys(&explorer).contains(&"→") && !keys(&explorer).contains(&"/"));
 
         // A filter that matches nothing leaves nothing to act on.
