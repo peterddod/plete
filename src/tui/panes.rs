@@ -256,7 +256,7 @@ impl Workspace {
     pub fn show_file(&mut self, path: PathBuf) {
         let narrow = self.narrow();
         let view = FileView::open(path, self.focused().root.clone());
-        let status = format!("showing {} · e edit · ^l to scroll", view.title());
+        let status = format!("showing {} · ^e edit · ^l to scroll", view.title());
         let shown = match self.is_split() {
             true => {
                 let at = 1 - self.focus;
@@ -643,7 +643,7 @@ mod tests {
         assert!(ws.focused().split);
         assert_eq!(
             ws.focused().status_line,
-            "showing a.txt · e edit · ^l to scroll"
+            "showing a.txt · ^e edit · ^l to scroll"
         );
 
         // Another file replaces the view instead of adding a pane.

@@ -333,15 +333,14 @@ fn edit_file(
     let rel = display_relative(workspace.focused(), file);
     if tmux::inside() {
         let cwd = workspace.focused().cwd.clone();
-        match tmux::split_editor(&cwd, &argv, file) {
-            Ok(()) => workspace
+        // A `$TMUX` left over from a server that is gone, or no tmux on the
+        // path, must not leave the file uneditable: run it here instead.
+        if tmux::split_editor(&cwd, &argv, file).is_ok() {
+            workspace
                 .focused_mut()
-                .set_status(format!("opened {rel} in a tmux split")),
-            Err(e) => workspace
-                .focused_mut()
-                .set_status(format!("could not open editor: {e:#}")),
+                .set_status(format!("opened {rel} in a tmux split"));
+            return Ok(());
         }
-        return Ok(());
     }
     let cwd = workspace.focused().cwd.clone();
     let file_arg = vec![file.to_string_lossy().to_string()];

@@ -9,6 +9,7 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -34,6 +35,9 @@ const HSTEP: usize = 8;
 /// Lines the wheel scrolls by.
 const WHEEL: usize = 3;
 
+/// How soon a changed file may be read again.
+const REREAD: Duration = Duration::from_secs(1);
+
 pub struct FileView {
     pub path: PathBuf,
     root: PathBuf,
@@ -51,6 +55,9 @@ pub struct FileView {
     /// When the file was last changed, as of the last read, so an edit made
     /// elsewhere — in a tmux split, say — can be noticed.
     modified: Option<std::time::SystemTime>,
+    /// When it was last read, so a file rewritten all the time — a log, an
+    /// agent at work — is read at most once a second, not once per key.
+    read_at: Option<Instant>,
     /// Rows of text that fit, as of the last draw.
     height: usize,
     /// Where the text was drawn, for the mouse.
@@ -71,6 +78,7 @@ impl FileView {
             highlight: None,
             pending: None,
             modified: None,
+            read_at: None,
             height: 20,
             area: Rect::default(),
             palette: Palette::detect(),
@@ -89,6 +97,9 @@ impl FileView {
     /// Read the file again if it changed since it was read. A stat per
     /// event is cheap; re-highlighting an unchanged file on every one is not.
     pub fn reload_if_changed(&mut self) -> bool {
+        if self.read_at.is_some_and(|at| at.elapsed() < REREAD) {
+            return false;
+        }
         if modified(&self.path) == self.modified {
             return false;
         }
@@ -98,7 +109,10 @@ impl FileView {
 
     fn load(&mut self) {
         self.modified = modified(&self.path);
-        self.highlight = None;
+        self.read_at = Some(Instant::now());
+        // The old colours stay until the new ones come: a few lines tinted for
+        // a moment by their neighbours' old runs beats the file going plain on
+        // every change. A run past the end of its line is simply not drawn.
         self.pending = None;
         self.lines.clear();
         self.refused = None;
@@ -195,9 +209,9 @@ impl FileView {
             true => (self.scroll + WHEEL).min(max),
             false => self.scroll.saturating_sub(WHEEL),
         };
-        self.cursor = self
-            .cursor
-            .clamp(self.scroll, (self.scroll + self.height).saturating_sub(1));
+        // A pane squeezed to no rows still has one for the cursor to be on.
+        let last = self.scroll + self.height.max(1) - 1;
+        self.cursor = self.cursor.clamp(self.scroll, last);
         self.settle();
     }
 
@@ -584,7 +598,23 @@ mod tests {
             .unwrap()
             .set_modified(later)
             .unwrap();
+        // Read under a second ago: left alone, however it changed.
+        assert!(!view.reload_if_changed());
+        view.read_at = None;
         assert!(view.reload_if_changed());
         assert_eq!(view.len(), 2);
+    }
+
+    /// The wheel in a pane squeezed to no rows does not panic.
+    #[test]
+    fn the_wheel_survives_a_pane_with_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        std::fs::write(&path, "x\n".repeat(100)).unwrap();
+        let mut view = FileView::open(path, dir.path().to_path_buf());
+        view.wheel(true);
+        view.height = 0;
+        view.wheel(true);
+        view.wheel(false);
     }
 }

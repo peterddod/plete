@@ -132,7 +132,7 @@ pub fn file_hints() -> Vec<Hint> {
     vec![
         hint("↑↓", "move"),
         hint("e", "edit"),
-        hint("esc", "close"),
+        hint("esc q", "close"),
         hint("^l", "other pane"),
         hint("^q", "quit"),
         hint("PgUp/Dn", "page"),
