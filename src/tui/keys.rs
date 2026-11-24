@@ -75,7 +75,12 @@ pub fn explorer_hints(explorer: &Explorer) -> Vec<Hint> {
         if filtering {
             hints.extend([hint("⌫", "delete"), hint("esc", "clear")]);
         } else {
-            hints.push(hint("esc", "quit"));
+            // With two panes, esc takes the focused one away before it
+            // takes plete away.
+            hints.push(match explorer.split {
+                true => hint("esc", "close pane"),
+                false => hint("esc", "quit"),
+            });
         }
     }
     // esc leaves the shell where it was; ^q moves it here.
@@ -105,9 +110,12 @@ pub fn explorer_hints(explorer: &Explorer) -> Vec<Hint> {
             hint("^w", "worktrees"),
         ]);
     }
+    hints.extend([hint("^t", "go to"), hint("^n", "find")]);
+    match explorer.split {
+        true => hints.extend([hint("^v", "unsplit"), hint("^l", "other pane")]),
+        false => hints.push(hint("^v", "split")),
+    }
     hints.extend([
-        hint("^t", "go to"),
-        hint("^n", "find"),
         hint("^a", "agent"),
         hint("^d", "hidden"),
         hint("^r", "refresh"),
@@ -293,6 +301,23 @@ mod tests {
         assert!(!has(&explorer, "⇥", "complete"), "{:?}", explorer.filter);
         explorer.set_filter("zzz".into());
         assert!(!has(&explorer, "⇥", "complete"));
+    }
+
+    #[test]
+    fn splitting_changes_esc_and_adds_the_pane_keys() {
+        let dir = fixture();
+        let mut explorer = explorer_at(dir.path(), true);
+        assert!(has(&explorer, "^v", "split") && !keys(&explorer).contains(&"^l"));
+        assert!(has(&explorer, "esc", "quit"));
+
+        explorer.split = true;
+        assert!(has(&explorer, "^v", "unsplit") && has(&explorer, "^l", "other pane"));
+        assert!(has(&explorer, "esc", "close pane") && !has(&explorer, "esc", "quit"));
+
+        // A filter is cleared before a pane is closed.
+        explorer.push_filter('s');
+        assert!(has(&explorer, "esc", "clear") && !has(&explorer, "esc", "close pane"));
+        assert!(has(&explorer, "^v", "unsplit"));
     }
 
     fn sample() -> Vec<Hint> {
