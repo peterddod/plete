@@ -733,6 +733,46 @@ pub fn split_window(name: &str, cwd: &Path, env: &[(&str, &str)], argv: &[String
     Ok(())
 }
 
+/// Whether this process runs inside a tmux pane.
+pub fn inside() -> bool {
+    std::env::var_os("TMUX").is_some_and(|v| !v.is_empty())
+}
+
+/// The arguments of the `tmux split-window` that runs an editor on `file`
+/// beside the pane plete is in: no `-t`, so tmux splits the pane the command
+/// comes from, and no `-d`, so the editor gets the keyboard.
+pub fn editor_split_args(cwd: &Path, editor: &[String], file: &Path) -> Vec<String> {
+    let mut args: Vec<String> = ["split-window", "-h", "-c"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    args.push(cwd.to_string_lossy().into_owned());
+    args.push("--".to_string());
+    args.extend(editor.iter().cloned());
+    args.push(file.to_string_lossy().into_owned());
+    args
+}
+
+/// Open `file` in `editor` in a new tmux pane next to the one this process
+/// runs in. `editor` is run directly, never through a shell.
+pub fn split_editor(cwd: &Path, editor: &[String], file: &Path) -> Result<()> {
+    if editor.is_empty() {
+        bail!("no editor to run in a tmux split");
+    }
+    let output = command()
+        .args(editor_split_args(cwd, editor, file))
+        .stdin(Stdio::null())
+        .bounded_output()
+        .context("run tmux")?;
+    if !output.status.success() {
+        bail!(
+            "tmux could not split a pane: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Make window `id` the one its session shows.
 pub fn select_window(id: &str) -> Result<()> {
     let output = command()
@@ -1472,6 +1512,27 @@ fn parse_plete_pane_pids(listing: &str) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_editor_split_runs_beside_the_current_pane() {
+        let editor = vec!["code".to_string(), "--wait".to_string()];
+        let args = editor_split_args(Path::new("/w"), &editor, Path::new("/w/a b.rs"));
+        assert_eq!(
+            args,
+            [
+                "split-window",
+                "-h",
+                "-c",
+                "/w",
+                "--",
+                "code",
+                "--wait",
+                "/w/a b.rs"
+            ]
+        );
+        // Splitting the pane plete is in means no target and no -d.
+        assert!(!args.iter().any(|a| a == "-t" || a == "-d"));
+    }
 
     #[test]
     fn a_session_is_found_under_either_prefix() {

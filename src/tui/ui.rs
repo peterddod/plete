@@ -1148,7 +1148,7 @@ pub(super) fn draw_review_body(
 }
 
 /// The key list, as it is both rendered and measured.
-const HELP: [(&str, &str); 30] = [
+const HELP: [(&str, &str); 31] = [
     (
         "a-z, 0-9, …",
         "type to filter this level (live, no key needed)",
@@ -1167,7 +1167,8 @@ const HELP: [(&str, &str); 30] = [
         "← / ⌫",
         "close an open folder, else go out (⌫ once the filter is empty)",
     ),
-    ("⏎", "folder: open or close it · file: open in your editor"),
+    ("⏎", "folder: open or close it · file: show it beside"),
+    ("ctrl-e", "open the file in your editor (tmux: a split)"),
     (
         "click",
         "a folder to open or close it, a path crumb to jump",
@@ -1180,10 +1181,7 @@ const HELP: [(&str, &str); 30] = [
         "ctrl-t",
         "go to: the worktree root, task root, project root, or worktrees",
     ),
-    (
-        "ctrl-n",
-        "find a file by a few of its letters: ⏎ shows it in the tree",
-    ),
+    ("ctrl-n", "find a file by a few of its letters: ⏎ shows it"),
     (
         "ctrl-v",
         "split into two panes, or close the other (esc closes one)",

@@ -25,6 +25,7 @@ pub mod tasks;
 mod tasks_ui;
 pub mod term;
 pub mod ui;
+mod viewer;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -182,18 +183,20 @@ fn event_loop(app: &App, terminal: &mut Tui, workspace: &mut panes::Workspace) -
     while !workspace.focused().should_quit {
         terminal.draw(|frame| workspace.draw(frame))?;
         // Block on input unless something in the background may change what
-        // is on screen, in any pane: the PR lookup, or a review that is still
-        // running.
-        let job_running = workspace.panes().iter().any(|explorer| {
+        // is on screen, in any pane: the PR lookup, a review that is still
+        // running, or a file's syntax colours.
+        let job_running = workspace.explorers().any(|explorer| {
             explorer
                 .review_job
                 .as_ref()
                 .is_some_and(|job| job.state() == JobState::Running)
         });
-        let looking = workspace.panes().iter().any(|e| e.pr_updates.is_some());
-        if (looking || job_running) && !event::poll(Duration::from_millis(200))? {
+        let looking = workspace.explorers().any(|e| e.pr_updates.is_some());
+        let colouring = workspace.awaiting_highlights();
+        if (looking || job_running || colouring) && !event::poll(Duration::from_millis(200))? {
             let check_jobs = last_job_check.elapsed() >= JOB_CHECK;
-            for explorer in workspace.panes_mut() {
+            workspace.poll_highlights();
+            for explorer in workspace.explorers_mut() {
                 take_pr_update(app, explorer);
                 let running = explorer
                     .review_job
@@ -208,7 +211,11 @@ fn event_loop(app: &App, terminal: &mut Tui, workspace: &mut panes::Workspace) -
             }
             continue;
         }
-        let outcome = match event::read()? {
+        let event = event::read()?;
+        // Coming back from an editor in a tmux split is the first event after
+        // it: whatever the user did there shows before this one is acted on.
+        workspace.refresh_files();
+        let outcome = match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 handle_pane_key(app, terminal, workspace, key)
             }
@@ -223,22 +230,41 @@ fn event_loop(app: &App, terminal: &mut Tui, workspace: &mut panes::Workspace) -
 }
 
 /// Keys that belong to the panes go to the workspace; the rest to the
-/// focused explorer. Neither ctrl-q nor ctrl-c is among them.
+/// focused pane. Neither ctrl-q nor ctrl-c is among them.
 fn handle_pane_key(
     app: &App,
     terminal: &mut Tui,
     workspace: &mut panes::Workspace,
     key: KeyEvent,
 ) -> Result<()> {
+    let on_file = workspace.focused_file_mut().is_some();
+    // A file pane has no filter and no panel, so only the keys matter.
     let focused = workspace.focused();
     let routed = panes::route(
         key,
         workspace.is_split(),
-        focused.overlay.is_none(),
-        focused.filter.is_empty(),
+        on_file || focused.overlay.is_none(),
+        on_file || focused.filter.is_empty(),
     );
     let Some(routed) = routed else {
-        return handle_key(app, terminal, workspace.focused_mut(), key);
+        if on_file {
+            return handle_file_key(app, terminal, workspace, key);
+        }
+        // What ⏎ on a file used to do, for when the viewer is not wanted.
+        let explorer = workspace.focused();
+        let ctrl_e = key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::CONTROL;
+        if ctrl_e && explorer.overlay.is_none() && !explorer.in_command_mode() {
+            return match explorer.selected_entry().filter(|e| !e.is_dir) {
+                Some(entry) => {
+                    let path = entry.path.clone();
+                    edit_file(app, terminal, workspace, &path)
+                }
+                None => Ok(()),
+            };
+        }
+        let outcome = handle_key(app, terminal, workspace.focused_mut(), key);
+        workspace.open_requested();
+        return outcome;
     };
     workspace.apply(routed, |from| {
         let mut other = panes::sibling(from)?;
@@ -246,6 +272,88 @@ fn handle_pane_key(
         start_pr_lookup(&mut other);
         Ok(other)
     })
+}
+
+/// Keys in a file pane: scrolling, `e` to edit, `q` to close it. The ones
+/// that quit are the explorer's, so they act on the explorer beside it.
+fn handle_file_key(
+    app: &App,
+    terminal: &mut Tui,
+    workspace: &mut panes::Workspace,
+    key: KeyEvent,
+) -> Result<()> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') => workspace.focused_mut().quit_in_place(),
+            KeyCode::Char('q') => workspace.focused_mut().quit_here(),
+            _ => {}
+        }
+        return Ok(());
+    }
+    match key.code {
+        KeyCode::Char('q') => {
+            return workspace.apply(panes::PaneKey::Close, panes::sibling);
+        }
+        KeyCode::Char('e') => {
+            let Some(file) = workspace.focused_file_mut().map(|f| f.path.clone()) else {
+                return Ok(());
+            };
+            return edit_file(app, terminal, workspace, &file);
+        }
+        _ => {}
+    }
+    let Some(file) = workspace.focused_file_mut() else {
+        return Ok(());
+    };
+    match key.code {
+        KeyCode::Up => file.move_cursor(-1),
+        KeyCode::Down => file.move_cursor(1),
+        KeyCode::PageUp => file.page(false),
+        KeyCode::PageDown => file.page(true),
+        KeyCode::Home => file.first(),
+        KeyCode::End => file.last(),
+        KeyCode::Left => file.scroll_x(false),
+        KeyCode::Right => file.scroll_x(true),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `e` and ctrl-e: open `file` in `$EDITOR`. Inside tmux that is a split
+/// beside plete, which keeps running; the file view is not read again (⏎ on
+/// the file shows it afresh). Outside tmux plete steps aside until the editor
+/// returns, then reads the file views and folders again.
+fn edit_file(
+    app: &App,
+    terminal: &mut Tui,
+    workspace: &mut panes::Workspace,
+    file: &Path,
+) -> Result<()> {
+    let argv = agent::editor_argv(&app.config)?;
+    let rel = display_relative(workspace.focused(), file);
+    if tmux::inside() {
+        let cwd = workspace.focused().cwd.clone();
+        // A `$TMUX` left over from a server that is gone, or no tmux on the
+        // path, must not leave the file uneditable: run it here instead.
+        if tmux::split_editor(&cwd, &argv, file).is_ok() {
+            workspace
+                .focused_mut()
+                .set_status(format!("opened {rel} in a tmux split"));
+            return Ok(());
+        }
+    }
+    let cwd = workspace.focused().cwd.clone();
+    let file_arg = vec![file.to_string_lossy().to_string()];
+    let outcome = suspended(terminal, || agent::run_in(&argv, &cwd, &file_arg))?;
+    workspace.refresh();
+    refresh_diffs(workspace.focused_mut());
+    let explorer = workspace.focused_mut();
+    match outcome {
+        Ok(0) => explorer.set_status(format!("closed {rel}")),
+        Ok(code) => explorer.set_status(format!("editor exited with status {code}")),
+        Err(e) => explorer.set_status(format!("could not open editor: {e}")),
+    }
+    Ok(())
 }
 
 /// A click in the pane that does not have the keyboard moves it there and does
@@ -268,7 +376,16 @@ fn handle_pane_mouse(
         return Ok(());
     }
     match workspace.panes_mut().get_mut(over) {
-        Some(explorer) => handle_mouse(terminal, explorer, mouse),
+        Some(panes::Pane::Explorer(explorer)) => handle_mouse(terminal, explorer, mouse),
+        Some(panes::Pane::File(file)) => {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => file.wheel(false),
+                MouseEventKind::ScrollDown => file.wheel(true),
+                MouseEventKind::Down(MouseButton::Left) => file.click(mouse.row),
+                _ => {}
+            }
+            Ok(())
+        }
         None => Ok(()),
     }
 }
@@ -429,7 +546,7 @@ fn handle_browse_key(
             explorer.set_status("")
         }
         KeyCode::Enter if explorer.in_command_mode() => run_command(app, terminal, explorer)?,
-        KeyCode::Enter => enter_selected(app, terminal, explorer)?,
+        KeyCode::Enter => enter_selected(explorer)?,
 
         // Anything else printable is filter input.
         KeyCode::Char(c)
@@ -520,9 +637,9 @@ fn execute_command(
     Ok(())
 }
 
-/// ⏎ on the highlighted row: folders open or close in place, files go to the
-/// editor.
-fn enter_selected(app: &App, terminal: &mut Tui, explorer: &mut Explorer) -> Result<()> {
+/// ⏎ on the highlighted row: folders open or close in place, files are shown
+/// in the other pane (the workspace picks the request up after the key).
+fn enter_selected(explorer: &mut Explorer) -> Result<()> {
     let Some(entry) = explorer.selected_entry().cloned() else {
         explorer.set_status(nothing_to_act_on(explorer));
         return Ok(());
@@ -531,7 +648,7 @@ fn enter_selected(app: &App, terminal: &mut Tui, explorer: &mut Explorer) -> Res
         explorer.toggle_selected()?;
         explorer.set_status("");
     } else {
-        open_editor(app, terminal, explorer, &entry.path)?;
+        explorer.show = Some(entry.path);
     }
     Ok(())
 }
@@ -888,7 +1005,13 @@ fn handle_overlay_key(
                 };
                 let rel = rel.clone();
                 let said = match explorer.reveal(&rel) {
-                    Ok(true) => format!("found {rel} · ⏎ opens it"),
+                    Ok(true) => {
+                        // A folder is only revealed; a file is shown too.
+                        if explorer.selected_entry().is_some_and(|e| !e.is_dir) {
+                            explorer.show = Some(explorer.root.join(&rel));
+                        }
+                        format!("found {rel}")
+                    }
                     Ok(false) if !explorer.root.join(&rel).exists() => {
                         format!("{rel} no longer exists")
                     }

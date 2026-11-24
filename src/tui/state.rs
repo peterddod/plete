@@ -359,6 +359,9 @@ pub struct Explorer {
     /// The background PR lookup, answering for the root it was started for —
     /// a switch while it runs makes its answer stale, not wrong.
     pub pr_updates: Option<Receiver<(PathBuf, PrLookup)>>,
+    /// A file the explorer wants shown in the other pane. The explorer cannot
+    /// open panes itself; the workspace takes this after each key.
+    pub show: Option<PathBuf>,
     /// Where the PR number was drawn in the header, so a click can open it.
     pub pr_area: Option<Rect>,
     /// The `plete review` job for this worktree's PR, if one was started.
@@ -423,6 +426,7 @@ impl Explorer {
             diffs: DiffMap::default(),
             pr: PrLookup::Missing,
             pr_updates: None,
+            show: None,
             pr_area: None,
             review_job: None,
             back: None,
