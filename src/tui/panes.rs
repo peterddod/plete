@@ -12,9 +12,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
 
+use super::review::actions::Job;
+use super::review::render::{self, Palette};
+use super::review::Viewer;
 use super::state::Explorer;
 use super::ui;
 use super::viewer::FileView;
+use super::NOT_A_REPOSITORY;
 
 /// Narrower than this and two panes would each be too thin to browse in, so
 /// only the focused one is drawn.
@@ -85,47 +89,55 @@ pub fn sibling(from: &Explorer) -> Result<Explorer> {
     Ok(other)
 }
 
-/// What a pane shows: a tree to browse, or one file, read-only.
+/// What a pane shows: a tree to browse, one file read-only, or a diff.
 // There are never more than two, so the size gap costs nothing worth a Box
 // at every place an explorer goes in or comes out.
 #[allow(clippy::large_enum_variant)]
 pub enum Pane {
     Explorer(Explorer),
     File(FileView),
+    Diff(Viewer),
 }
 
 impl Pane {
     pub fn explorer(&self) -> Option<&Explorer> {
         match self {
             Pane::Explorer(explorer) => Some(explorer),
-            Pane::File(_) => None,
+            Pane::File(_) | Pane::Diff(_) => None,
         }
     }
 
     pub fn explorer_mut(&mut self) -> Option<&mut Explorer> {
         match self {
             Pane::Explorer(explorer) => Some(explorer),
-            Pane::File(_) => None,
+            Pane::File(_) | Pane::Diff(_) => None,
         }
     }
 
     pub fn file(&self) -> Option<&FileView> {
         match self {
             Pane::File(file) => Some(file),
-            Pane::Explorer(_) => None,
+            Pane::Explorer(_) | Pane::Diff(_) => None,
         }
     }
 
     pub fn file_mut(&mut self) -> Option<&mut FileView> {
         match self {
             Pane::File(file) => Some(file),
-            Pane::Explorer(_) => None,
+            Pane::Explorer(_) | Pane::Diff(_) => None,
+        }
+    }
+
+    pub fn diff_mut(&mut self) -> Option<&mut Viewer> {
+        match self {
+            Pane::Diff(viewer) => Some(viewer),
+            Pane::Explorer(_) | Pane::File(_) => None,
         }
     }
 }
 
 /// One or two panes and which of them has the keyboard. There is always an
-/// explorer among them: a file is only ever shown beside one, and closing
+/// explorer among them: a file or a diff is only ever shown beside one, and closing
 /// either pane leaves the explorer — see [`Workspace::apply`].
 pub struct Workspace {
     panes: Vec<Pane>,
@@ -157,14 +169,14 @@ impl Workspace {
     fn explorer_index(&self) -> usize {
         match self.panes[self.focus] {
             Pane::Explorer(_) => self.focus,
-            Pane::File(_) => 1 - self.focus,
+            Pane::File(_) | Pane::Diff(_) => 1 - self.focus,
         }
     }
 
     pub fn focused(&self) -> &Explorer {
         match &self.panes[self.explorer_index()] {
             Pane::Explorer(explorer) => explorer,
-            Pane::File(_) => unreachable!("a workspace always has an explorer"),
+            _ => unreachable!("a workspace always has an explorer"),
         }
     }
 
@@ -172,13 +184,18 @@ impl Workspace {
         let at = self.explorer_index();
         match &mut self.panes[at] {
             Pane::Explorer(explorer) => explorer,
-            Pane::File(_) => unreachable!("a workspace always has an explorer"),
+            _ => unreachable!("a workspace always has an explorer"),
         }
     }
 
     /// The file view that has the keyboard, if the focus is on one.
     pub fn focused_file_mut(&mut self) -> Option<&mut FileView> {
         self.panes[self.focus].file_mut()
+    }
+
+    /// The diff viewer that has the keyboard, if the focus is on one.
+    pub fn focused_diff_mut(&mut self) -> Option<&mut Viewer> {
+        self.panes[self.focus].diff_mut()
     }
 
     #[cfg(test)]
@@ -202,16 +219,29 @@ impl Workspace {
         let at = self.explorer_index();
         match self.panes.swap_remove(at) {
             Pane::Explorer(explorer) => explorer,
-            Pane::File(_) => unreachable!("a workspace always has an explorer"),
+            _ => unreachable!("a workspace always has an explorer"),
         }
+    }
+
+    /// Which pane-level key `key` is, given what the focused pane is doing.
+    /// A file has no filter or panel; a diff owns the keyboard while one of its
+    /// boxes is open; an explorer, while a panel is.
+    pub fn route_key(&mut self, key: KeyEvent) -> Option<PaneKey> {
+        let split = self.is_split();
+        let (browsing, filter_empty) = match &self.panes[self.focus] {
+            Pane::File(_) => (true, true),
+            Pane::Diff(viewer) => (!viewer.overlay_open(), true),
+            Pane::Explorer(explorer) => (explorer.overlay.is_none(), explorer.filter.is_empty()),
+        };
+        route(key, split, browsing, filter_empty)
     }
 
     /// Act on a pane-level key. `make` builds the second pane from the focused
     /// explorer; it is only called when there is room for one.
     ///
-    /// Closing never leaves a file alone: ctrl-v and esc in a file pane close
-    /// that file, and from the explorer beside a file they close the file
-    /// too — the explorer is the one that stays whichever pane is asked to go.
+    /// Closing never leaves a file or a diff alone: ctrl-v and esc in its pane
+    /// close it, and from the explorer beside it they close it too — the
+    /// explorer is the one that stays whichever pane is asked to go.
     pub fn apply(
         &mut self,
         key: PaneKey,
@@ -221,8 +251,8 @@ impl Workspace {
             PaneKey::Split if self.is_split() => {
                 // Like closing a split in an editor from the window you are
                 // staying in: focus does not move.
-                let on_file = self.panes[self.focus].file().is_some();
-                self.close(if on_file { self.focus } else { 1 - self.focus });
+                let on_view = self.panes[self.focus].explorer().is_none();
+                self.close(if on_view { self.focus } else { 1 - self.focus });
                 self.focused_mut().set_status("closed the other pane");
             }
             PaneKey::Split => {
@@ -234,11 +264,13 @@ impl Workspace {
             }
             PaneKey::Other => self.set_focus(1 - self.focus),
             PaneKey::Close => {
-                let gone = match self.panes.get(1 - self.focus) {
-                    Some(Pane::File(_)) if self.panes[self.focus].file().is_none() => {
-                        1 - self.focus
-                    }
-                    _ => self.focus,
+                let beside_view = self
+                    .panes
+                    .get(1 - self.focus)
+                    .is_some_and(|other| other.explorer().is_none());
+                let gone = match beside_view && self.panes[self.focus].explorer().is_some() {
+                    true => 1 - self.focus,
+                    false => self.focus,
                 };
                 self.close(gone);
                 self.focused_mut().set_status("closed a pane");
@@ -254,17 +286,58 @@ impl Workspace {
     /// browsing goes on, except where the screen is too narrow to draw both
     /// and the file would be out of sight.
     pub fn show_file(&mut self, path: PathBuf) {
-        let narrow = self.narrow();
         let view = FileView::open(path, self.focused().root.clone());
         let status = format!("showing {} · ^e edit · ^l to scroll", view.title());
+        self.show_beside(Pane::File(view), status);
+    }
+
+    /// Show the diff of `path`, a file or folder, in the pane beside the
+    /// focused explorer, as [`Self::show_file`] does a file — if there is
+    /// anything to show: otherwise the explorer's status says why not.
+    pub fn show_diff(&mut self, path: PathBuf) {
+        let explorer = self.focused_mut();
+        let Some(default_branch) = explorer.repo.as_ref().map(|r| r.default_branch.clone()) else {
+            explorer.set_status(NOT_A_REPOSITORY);
+            return;
+        };
+        let Some(base) = explorer.diffs.merge_base.clone() else {
+            explorer.set_status(format!(
+                "no common history with {default_branch} to diff against"
+            ));
+            return;
+        };
+        let root = explorer.root.clone();
+        let rel = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
+        let whole = rel.as_os_str().is_empty();
+        let changed = match whole {
+            true => !explorer.diffs.is_empty(),
+            false => explorer.diffs.get(&root, &path).is_some(),
+        };
+        let shown = match whole {
+            true => "this worktree".to_string(),
+            false => rel.display().to_string(),
+        };
+        if !changed {
+            explorer.set_status(format!("no changes in {shown} against {default_branch}"));
+            return;
+        }
+        let mut viewer = Viewer::local(root, base, rel, Palette::detect());
+        viewer.spawn(Job::Load);
+        let status = format!("diff of {shown} · t difftool · ^l to scroll");
+        self.show_beside(Pane::Diff(viewer), status);
+    }
+
+    /// Put `pane` beside the focused explorer, replacing whatever was there.
+    fn show_beside(&mut self, pane: Pane, status: String) {
+        let narrow = self.narrow();
         let shown = match self.is_split() {
             true => {
                 let at = 1 - self.focus;
-                self.panes[at] = Pane::File(view);
+                self.panes[at] = pane;
                 at
             }
             false => {
-                self.panes.push(Pane::File(view));
+                self.panes.push(pane);
                 self.areas.push(Rect::default());
                 1
             }
@@ -295,19 +368,23 @@ impl Workspace {
         }
     }
 
-    /// Show the file the focused explorer asked for, if it asked.
+    /// Show the file or diff the focused explorer asked for, if it asked.
     pub fn open_requested(&mut self) {
         if let Some(path) = self.focused_mut().show.take() {
             self.show_file(path);
         }
+        if let Some(path) = self.focused_mut().diff.take() {
+            self.show_diff(path);
+        }
     }
 
-    /// Read every file view and folder again, after an editor may have
+    /// Read every file view, diff and folder again, after an editor may have
     /// changed them.
     pub fn refresh(&mut self) {
         for pane in &mut self.panes {
             match pane {
                 Pane::File(file) => file.reload(),
+                Pane::Diff(viewer) => viewer.reload(),
                 Pane::Explorer(explorer) => {
                     let keep = explorer.selected_entry().map(|e| e.path.clone());
                     if let Err(e) = explorer.reload(keep.as_deref()) {
@@ -323,6 +400,20 @@ impl Workspace {
         self.panes
             .iter()
             .any(|p| p.file().is_some_and(FileView::awaiting))
+    }
+
+    /// Whether a diff is still waiting on git or on its colours.
+    pub fn diffs_working(&self) -> bool {
+        self.panes
+            .iter()
+            .any(|p| matches!(p, Pane::Diff(v) if v.working()))
+    }
+
+    /// Take in whatever the diff viewers' background threads have finished.
+    pub fn pump_diffs(&mut self) {
+        for viewer in self.panes.iter_mut().filter_map(Pane::diff_mut) {
+            viewer.pump();
+        }
     }
 
     /// Read again any file shown that has changed since, as after an edit in
@@ -403,6 +494,7 @@ impl Workspace {
         match &mut self.panes[at] {
             Pane::Explorer(explorer) => ui::draw_in(frame, area, explorer, focused, marker),
             Pane::File(file) => file.draw(frame, area, focused, marker),
+            Pane::Diff(viewer) => render::draw_in(frame, area, viewer, focused, marker),
         }
     }
 }
@@ -727,5 +819,184 @@ mod tests {
         assert_eq!(ws.focus(), 1);
         terminal.draw(|frame| ws.draw(frame)).unwrap();
         assert!(ws.focused_file_mut().is_some());
+    }
+
+    /// A repository on `main` with `a.txt` edited since, `b.txt` as committed.
+    fn repo_fixture() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(ok.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("b.txt"), "three\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo changed\n").unwrap();
+        dir
+    }
+
+    fn repo_explorer(root: &Path) -> Explorer {
+        let repo = crate::db::RepoRecord {
+            id: "github.com/acme/widget".into(),
+            trunk_path: root.to_string_lossy().to_string(),
+            remote_url: "https://github.com/acme/widget.git".into(),
+            default_branch: "main".into(),
+        };
+        let mut explorer = Explorer::new(
+            Some(repo),
+            root.to_path_buf(),
+            "main".into(),
+            "trunk".into(),
+            WorktreeStatus::default(),
+            root.to_path_buf(),
+        )
+        .unwrap();
+        super::super::refresh_diffs(&mut explorer);
+        explorer
+    }
+
+    /// ctrl-f on `name`, the way the key handler leaves it for the workspace.
+    fn ask_diff(ws: &mut Workspace, root: &Path, name: &str) {
+        ws.focused_mut().diff = Some(root.join(name));
+        ws.open_requested();
+    }
+
+    fn settle(ws: &mut Workspace) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while ws.diffs_working() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            ws.pump_diffs();
+        }
+        ws.pump_diffs();
+    }
+
+    fn screen(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn ctrl_f_opens_a_diff_beside_the_explorer_showing_the_hunk() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = repo_fixture();
+        let mut ws = Workspace::new(repo_explorer(dir.path()));
+        ask_diff(&mut ws, dir.path(), "a.txt");
+        assert!(ws.is_split() && ws.focus() == 0);
+        assert!(matches!(ws.panes()[1], Pane::Diff(_)));
+        assert_eq!(
+            ws.focused().status_line,
+            "diff of a.txt · t difftool · ^l to scroll"
+        );
+
+        settle(&mut ws);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| ws.draw(frame)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("diff of a.txt"), "{text}");
+        assert!(text.contains("two changed"), "{text}");
+        assert!(text.contains("difftool"), "{text}");
+        assert_eq!(ws.pane_at(100, 5), Some(1));
+        // Another diff replaces the pane instead of adding one.
+        ask_diff(&mut ws, dir.path(), "a.txt");
+        assert_eq!(ws.panes().len(), 2);
+    }
+
+    #[test]
+    fn nothing_to_diff_says_so_and_opens_no_pane() {
+        let dir = repo_fixture();
+        let mut ws = Workspace::new(repo_explorer(dir.path()));
+        ask_diff(&mut ws, dir.path(), "b.txt");
+        assert!(!ws.is_split());
+        assert_eq!(ws.focused().status_line, "no changes in b.txt against main");
+
+        // Not a repository: the same words the key's other checks use.
+        let plain = fixture();
+        let mut ws = Workspace::new(explorer(plain.path()));
+        ask_diff(&mut ws, plain.path(), "README.md");
+        assert!(!ws.is_split());
+        assert_eq!(ws.focused().status_line, NOT_A_REPOSITORY);
+
+        // No common history with the base: nothing to measure from.
+        let mut lone = repo_explorer(dir.path());
+        lone.diffs.merge_base = None;
+        let mut ws = Workspace::new(lone);
+        ask_diff(&mut ws, dir.path(), "a.txt");
+        assert!(!ws.is_split());
+        assert_eq!(
+            ws.focused().status_line,
+            "no common history with main to diff against"
+        );
+    }
+
+    #[test]
+    fn esc_in_the_focused_diff_closes_it() {
+        let dir = repo_fixture();
+        let mut ws = Workspace::new(repo_explorer(dir.path()));
+        ask_diff(&mut ws, dir.path(), "a.txt");
+        ws.apply(PaneKey::Other, sibling).unwrap();
+        assert!(ws.focused_diff_mut().is_some());
+        assert_eq!(ws.route_key(esc()), Some(PaneKey::Close));
+        ws.apply(PaneKey::Close, sibling).unwrap();
+        assert!(!ws.is_split() && ws.focus() == 0);
+        assert!(ws.panes()[0].explorer().is_some());
+        assert!(!ws.focused().split);
+
+        // From the explorer beside it, esc closes the diff, not the explorer.
+        ask_diff(&mut ws, dir.path(), "a.txt");
+        ws.apply(PaneKey::Close, sibling).unwrap();
+        assert_eq!(ws.panes().len(), 1);
+        assert!(ws.panes()[0].explorer().is_some());
+    }
+
+    #[test]
+    fn a_diff_box_keeps_esc_and_the_pane_keys() {
+        let dir = repo_fixture();
+        let mut ws = Workspace::new(repo_explorer(dir.path()));
+        ask_diff(&mut ws, dir.path(), "a.txt");
+        ws.apply(PaneKey::Other, sibling).unwrap();
+        ws.focused_diff_mut().unwrap().help = true;
+        assert_eq!(ws.route_key(esc()), None);
+        assert_eq!(ws.route_key(ctrl('l')), None);
+        assert_eq!(ws.route_key(ctrl('v')), None);
+        ws.focused_diff_mut().unwrap().help = false;
+        assert_eq!(ws.route_key(ctrl('l')), Some(PaneKey::Other));
+        assert_eq!(ws.route_key(ctrl('v')), Some(PaneKey::Split));
+    }
+
+    #[test]
+    fn a_narrow_screen_focuses_the_diff_it_was_asked_for() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = repo_fixture();
+        let mut ws = Workspace::new(repo_explorer(dir.path()));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| ws.draw(frame)).unwrap();
+        ask_diff(&mut ws, dir.path(), "a.txt");
+        assert_eq!(ws.focus(), 1);
+        settle(&mut ws);
+        terminal.draw(|frame| ws.draw(frame)).unwrap();
+        let text = screen(&terminal);
+        assert!(
+            text.contains("pane 2/2") && text.contains("two changed"),
+            "{text}"
+        );
     }
 }

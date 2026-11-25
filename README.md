@@ -242,7 +242,7 @@ Because a bare letter belongs to the filter, the commands carry a `ctrl`:
 | `ctrl-v` | split into two explorers side by side, or close the other pane |
 | `ctrl-l` | focus the other pane |
 | `ctrl-w` | the repository's worktrees: `⏎` switches to one, `o` opens its PR |
-| `ctrl-f` | diff the highlighted file or folder against the default branch |
+| `ctrl-f` | diff the highlighted file or folder against the default branch, in the other pane: `←→` file, `t` opens it in `git difftool`, `esc` closes |
 | `ctrl-p` | the pull request: `o` open, `a` approve, `c` comment, `x` request changes, `d` diff, `v` review output |
 | `ctrl-o` | the repository's open pull requests: `⏎` checks one out in a task and switches to it, `o` opens it in the browser |
 | `ctrl-d` | toggle hidden dotfiles |
@@ -286,9 +286,10 @@ say) it only says so.
 Every changed file shows its `+added -removed` line counts beside its size,
 and every folder shows the sum of everything changed beneath it — measured
 from the merge base with the default branch, uncommitted edits included, the
-same diff the header counts. `ctrl-f` opens that diff for the highlighted file
-or folder (or the whole worktree, with `d` in the PR panel) in `git difftool`,
-one file at a time: `:qa` moves to the next, `:cq` stops. It uses your
+same diff the header counts. `ctrl-f` shows that diff for the highlighted file
+or folder in the other pane, in the review viewer's colours and one file to a
+page: `←→` turns the page, `r` reads it again, `esc` closes the pane. `t` opens
+the file in `git difftool`: `:qa` returns to plete. It uses your
 `diff.tool` from git config, and `vimdiff` (`nvimdiff` for a neovim editor)
 when there isn't one — `git config --global diff.tool nvimdiff`, `difftastic`
 or anything else git supports all work.

@@ -662,6 +662,33 @@ pub fn diff_stat(path: &Path, base: &str) -> Option<(usize, usize, usize)> {
     Some(parse_numstat(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// The unified diff between `base` and the working tree for `rel` — a file or
+/// folder relative to `path`, or the whole worktree when empty. Tracked files
+/// only, which is what the per-file counts measure too. Prefixes are spelled
+/// out so a `diff.noprefix` or `diff.mnemonicPrefix` setting cannot change the
+/// paths the review viewer's parser reads.
+pub fn diff_against(path: &Path, base: &str, rel: &Path) -> Result<String> {
+    let spec = match rel.as_os_str().is_empty() {
+        true => ".".to_string(),
+        // Literal, so a name starting with `:` is not read as pathspec magic.
+        false => format!(":(literal){}", rel.to_string_lossy()),
+    };
+    let out = git_output_raw(
+        path,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            base,
+            "--",
+            &spec,
+        ],
+    )?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
 pub fn merge_base(path: &Path, base: &str) -> Option<String> {
     let output = Command::new("git")
         .args(["-C", &path.to_string_lossy(), "merge-base", base, "HEAD"])
