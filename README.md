@@ -1811,7 +1811,24 @@ into tasks.
 
 ## What's new in v0.17
 
-Any task can have tasks under it, agent profiles, and managers retired.
+The explorer grows panes, a file viewer and finders; any task can have tasks
+under it; agent profiles arrive and managers retire; and plete can start a
+review for you when one is asked for.
+
+### Explorer
+
+- **Folders open in place, as a tree**, and the hint bar shows only the keys
+  that apply (`F1` lists them all).
+- **`ctrl-t` jumps to a root**: the worktree, the task's directory, its
+  project folder or the worktrees. **`ctrl-n` finds a file** anywhere under
+  the root by a few of its letters.
+- **Two panes.** `ctrl-v` splits into two explorers side by side, `ctrl-l`
+  switches. `⏎` shows a file in the other pane, `e` edits it in `$VISUAL` /
+  `$EDITOR` in a tmux split (falling back when tmux is gone), and `ctrl-f`
+  shows the diff against the default branch in the other pane
+  ([Explorer](#the-explorer)).
+
+### Agents and planners
 
 - **Subtasks anywhere.** Any task under the assistant may have tasks under it,
   to any depth. Its grant passes on, its subtasks report to it, and it
@@ -1848,6 +1865,57 @@ Any task can have tasks under it, agent profiles, and managers retired.
   `manager ls` is `task tree`, and the rest are the `task` verbs; each
   prints a deprecation line and they go in the next release. The new-task
   form (`n` in the agents tab) offers ‹planner› where it offered ‹manager›.
+
+### Auto-review
+
+- **`action = "review"`** on an `[[assistant.rules]]` rule starts the review
+  of a `review_requested` PR itself, once per PR head, within `[review]`'s
+  limits ([Watching GitHub](#watching-github)).
+- **`[watch] notifications_interval_secs`** (default 60; `0` means no faster
+  than `interval_secs`) polls notifications on a faster tick than checks and
+  projects, so a review request is seen in about a minute.
+
+### Search
+
+`plete search` is unchanged from v0.16, except that planner tasks, which
+were managers, are searched like any work task.
+
+### Config keys and deprecations
+
+| Key | Change |
+|---|---|
+| `[tasks] max_depth` | now unset by default: no depth limit |
+| `[tasks] max_children` | default 6 |
+| `[tasks] default_budget`, `default_allow`, `held` | new; replace the `[managers]` equivalents |
+| `[watch] notifications_interval_secs` | new, default 60 |
+| `[[assistant.rules]] action = "review"` | new |
+| `[managers]`, `[permissions.manager]`, `[models] manager` | deprecated; still read where `[tasks]` does not set them, **removed in the next release** |
+| `plete manager …`, `manager.*` capabilities | deprecated aliases of the `task` verbs and `task.*`; removed in the next release |
+
+**Upgrading to v0.17.0:** the index moves from **schema v14 to v16** the
+first time any v0.17 command opens it: **v15** records the agent profile a
+task is started as, and **v16** turns every manager into a work task started
+as `planner`. Before anything changes the index is copied to
+`$PLETE_HOME/backups/index-v14-<unix time>.db` (under `~/.jeet` if that is
+still your home), and the migration is refused if the copy cannot be made.
+**v0.16 and older refuse the index afterwards**, so upgrade every plete you
+run at once, the one `plete watch` runs included.
+
+After upgrading:
+
+1. **`brew upgrade plete`** (`sudo apt upgrade plete` on Debian and Ubuntu).
+   A tap user still on jeet needs `brew trust peterddod/plete` first.
+2. **Restart agents** with `plete task restart <slug>`, the assistant
+   included, so they get the new skills and settings.
+3. **Re-run `plete watch install`** to get the faster notifications tick.
+4. To turn on auto-review, add this rule **before** any existing
+   `review_requested` rule, since the first match wins:
+
+   ```toml
+   [[assistant.rules]]
+   on = ["review_requested"]
+   action = "review"
+   ```
 
 ## What's new in v0.16
 
