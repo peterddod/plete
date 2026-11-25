@@ -362,6 +362,8 @@ pub struct Explorer {
     /// A file the explorer wants shown in the other pane. The explorer cannot
     /// open panes itself; the workspace takes this after each key.
     pub show: Option<PathBuf>,
+    /// A file or folder whose diff the explorer wants shown in the other pane.
+    pub diff: Option<PathBuf>,
     /// Where the PR number was drawn in the header, so a click can open it.
     pub pr_area: Option<Rect>,
     /// The `plete review` job for this worktree's PR, if one was started.
@@ -427,6 +429,7 @@ impl Explorer {
             pr: PrLookup::Missing,
             pr_updates: None,
             show: None,
+            diff: None,
             pr_area: None,
             review_job: None,
             back: None,

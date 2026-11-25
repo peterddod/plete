@@ -1191,7 +1191,7 @@ const HELP: [(&str, &str); 31] = [
     ("", "  in the panel: o open its PR, r refresh, esc close"),
     (
         "ctrl-f",
-        "diff the highlighted file or folder against the base",
+        "diff the highlighted file or folder in the other pane",
     ),
     (
         "ctrl-p",

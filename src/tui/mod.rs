@@ -181,6 +181,7 @@ fn event_loop(app: &App, terminal: &mut Tui, workspace: &mut panes::Workspace) -
     // Quitting is always the focused pane's doing: it is the only one that
     // takes keys, and its exit is the one plete leaves with.
     while !workspace.focused().should_quit {
+        workspace.pump_diffs();
         terminal.draw(|frame| workspace.draw(frame))?;
         // Block on input unless something in the background may change what
         // is on screen, in any pane: the PR lookup, a review that is still
@@ -193,7 +194,9 @@ fn event_loop(app: &App, terminal: &mut Tui, workspace: &mut panes::Workspace) -
         });
         let looking = workspace.explorers().any(|e| e.pr_updates.is_some());
         let colouring = workspace.awaiting_highlights();
-        if (looking || job_running || colouring) && !event::poll(Duration::from_millis(200))? {
+        let diffing = workspace.diffs_working();
+        let wait = Duration::from_millis(if diffing { 100 } else { 200 });
+        if (looking || job_running || colouring || diffing) && !event::poll(wait)? {
             let check_jobs = last_job_check.elapsed() >= JOB_CHECK;
             workspace.poll_highlights();
             for explorer in workspace.explorers_mut() {
@@ -237,18 +240,12 @@ fn handle_pane_key(
     workspace: &mut panes::Workspace,
     key: KeyEvent,
 ) -> Result<()> {
-    let on_file = workspace.focused_file_mut().is_some();
-    // A file pane has no filter and no panel, so only the keys matter.
-    let focused = workspace.focused();
-    let routed = panes::route(
-        key,
-        workspace.is_split(),
-        on_file || focused.overlay.is_none(),
-        on_file || focused.filter.is_empty(),
-    );
-    let Some(routed) = routed else {
-        if on_file {
+    let Some(routed) = workspace.route_key(key) else {
+        if workspace.focused_file_mut().is_some() {
             return handle_file_key(app, terminal, workspace, key);
+        }
+        if workspace.focused_diff_mut().is_some() {
+            return handle_diff_key(app, terminal, workspace, key);
         }
         // What ⏎ on a file used to do, for when the viewer is not wanted.
         let explorer = workspace.focused();
@@ -319,6 +316,72 @@ fn handle_file_key(
     Ok(())
 }
 
+/// Keys in a diff pane: the viewer's own, except that ctrl-c and ctrl-q quit
+/// as they do from a file pane, `esc` and `q` close the pane, and `t` runs
+/// `git difftool`, which needs the terminal the viewer cannot suspend.
+fn handle_diff_key(
+    app: &App,
+    terminal: &mut Tui,
+    workspace: &mut panes::Workspace,
+    key: KeyEvent,
+) -> Result<()> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') => {
+                workspace.focused_mut().quit_in_place();
+                return Ok(());
+            }
+            KeyCode::Char('q') => {
+                workspace.focused_mut().quit_here();
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    let Some(viewer) = workspace.focused_diff_mut() else {
+        return Ok(());
+    };
+    // Nothing a local diff does starts work beyond the load itself.
+    if let Some(job) = viewer.handle_key(key) {
+        viewer.spawn(job);
+    }
+    match viewer.exit {
+        Some(review::Exit::Back) => return workspace.apply(panes::PaneKey::Close, panes::sibling),
+        Some(review::Exit::Quit) => {
+            workspace.focused_mut().quit_in_place();
+            return Ok(());
+        }
+        None => {}
+    }
+    match viewer.take_difftool() {
+        Some((base, file)) => run_difftool(app, terminal, workspace, &base, &file),
+        None => Ok(()),
+    }
+}
+
+/// `t` in a diff pane: `git difftool` on one file, with plete stepped aside,
+/// then every pane read again.
+fn run_difftool(
+    app: &App,
+    terminal: &mut Tui,
+    workspace: &mut panes::Workspace,
+    base: &str,
+    file: &str,
+) -> Result<()> {
+    let root = workspace.focused().root.clone();
+    let argv = difftool_argv(app, &root, base, file);
+    let outcome = suspended(terminal, || agent::run_in(&argv, &root, &[]))?;
+    workspace.refresh();
+    refresh_diffs(workspace.focused_mut());
+    let explorer = workspace.focused_mut();
+    match outcome {
+        Ok(0) => explorer.set_status(format!("closed the diff of {file}")),
+        Ok(_) => explorer.set_status(format!("stopped the diff of {file}")),
+        Err(e) => explorer.set_status(format!("could not run git difftool: {e}")),
+    }
+    Ok(())
+}
+
 /// `e` and ctrl-e: open `file` in `$EDITOR`. Inside tmux that is a split
 /// beside plete, which keeps running; the file view is not read again (⏎ on
 /// the file shows it afresh). Outside tmux plete steps aside until the editor
@@ -368,6 +431,12 @@ fn handle_pane_mouse(
     if workspace.focused().overlay.is_some() {
         return Ok(());
     }
+    if workspace
+        .focused_diff_mut()
+        .is_some_and(|viewer| viewer.overlay_open())
+    {
+        return Ok(());
+    }
     let Some(over) = workspace.pane_at(mouse.column, mouse.row) else {
         return Ok(());
     };
@@ -384,6 +453,11 @@ fn handle_pane_mouse(
                 MouseEventKind::Down(MouseButton::Left) => file.click(mouse.row),
                 _ => {}
             }
+            Ok(())
+        }
+        Some(panes::Pane::Diff(viewer)) => {
+            // The viewer reads the wheel, and ignores clicks, by itself.
+            viewer.handle_mouse(mouse);
             Ok(())
         }
         None => Ok(()),
@@ -456,7 +530,7 @@ fn handle_browse_key(
                 .selected_entry()
                 .map(|e| e.path.clone())
                 .unwrap_or_else(|| explorer.cwd.clone());
-            view_diff(app, terminal, explorer, &target)?;
+            explorer.diff = Some(target);
         }
         KeyCode::Char('p') if ctrl => open_pr_panel(app, terminal, explorer, false),
         KeyCode::Char('o') if ctrl => open_repo_prs(app, terminal, explorer, None),
@@ -1813,62 +1887,21 @@ fn open_review_viewer(
     Ok(())
 }
 
-/// ctrl-f: step through the diff of a file or folder against the merge base,
-/// in whatever `git difftool` is set up to use.
-fn view_diff(app: &App, terminal: &mut Tui, explorer: &mut Explorer, path: &Path) -> Result<()> {
-    let Some(default_branch) = explorer.repo.as_ref().map(|r| r.default_branch.clone()) else {
-        explorer.set_status(NOT_A_REPOSITORY);
-        return Ok(());
-    };
-    let Some(base) = explorer.diffs.merge_base.clone() else {
-        explorer.set_status(format!(
-            "no common history with {} to diff against",
-            default_branch
-        ));
-        return Ok(());
-    };
-    let root = explorer.root.clone();
-    let rel = path.strip_prefix(&root).unwrap_or(path).to_path_buf();
-    let whole = rel.as_os_str().is_empty();
-    let changed = if whole {
-        !explorer.diffs.is_empty()
-    } else {
-        explorer.diffs.get(&root, path).is_some()
-    };
-    let shown = if whole {
-        "this worktree".to_string()
-    } else {
-        rel.display().to_string()
-    };
-    if !changed {
-        explorer.set_status(format!("no changes in {shown} against {}", default_branch));
-        return Ok(());
-    }
-
+/// What runs `git difftool` on `rel` against `base` in the worktree at `root`.
+fn difftool_argv(app: &App, root: &Path, base: &str, rel: &str) -> Vec<String> {
     let mut argv: Vec<String> = ["git", "difftool", "--no-prompt", "--trust-exit-code"]
         .into_iter()
         .map(String::from)
         .collect();
     // With no diff.tool configured git guesses, and on a Mac with Xcode its
     // first guess is a GUI. Default to the terminal diff of the user's editor.
-    if crate::git::configured_diff_tool(&root).is_none() {
+    if crate::git::configured_diff_tool(root).is_none() {
         argv.push(format!("--tool={}", default_diff_tool(app)));
     }
-    argv.push(base);
+    argv.push(base.to_string());
     argv.push("--".into());
-    argv.push(if whole {
-        ".".into()
-    } else {
-        rel.to_string_lossy().to_string()
-    });
-    let outcome = suspended(terminal, || agent::run_in(&argv, &root, &[]))?;
-    match outcome {
-        Ok(0) => explorer.set_status(format!("closed the diff of {shown}")),
-        // `--trust-exit-code`: `:cq` in vimdiff stops the rest of the files.
-        Ok(_) => explorer.set_status(format!("stopped the diff of {shown}")),
-        Err(e) => explorer.set_status(format!("could not run git difftool: {e}")),
-    }
-    Ok(())
+    argv.push(rel.to_string());
+    argv
 }
 
 /// `nvimdiff` for a neovim user, `vimdiff` for everyone else.

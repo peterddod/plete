@@ -252,6 +252,17 @@ pub fn run(dir: &Path, number: u64, job: Job) -> Msg {
     }
 }
 
+/// The local diff against `base` for `rel`, as the answer to a load: no
+/// threads, no pending review, and no fingerprint to poll for.
+pub fn run_local(dir: &Path, base: &str, rel: &Path) -> Msg {
+    Msg::Loaded {
+        diff: worded(crate::git::diff_against(dir, base, rel)),
+        threads: Ok(Vec::new()),
+        pending: Ok(None),
+        fingerprint: Err("a local diff has no fingerprint".into()),
+    }
+}
+
 /// Where the cursor is, in terms that outlive the rows: the file, the
 /// comment if it is on one, and the line it is on or under.
 #[derive(Debug, Clone, PartialEq, Eq)]

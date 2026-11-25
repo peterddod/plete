@@ -199,8 +199,18 @@ pub struct Draft {
     pub input: String,
 }
 
+/// What the viewer is showing.
+#[derive(Debug, Clone)]
+pub enum Source {
+    /// A pull request, with its threads and a verdict to submit.
+    Pr(PullRequest),
+    /// `git diff <base>` of `rel` — a file or folder, or the whole worktree
+    /// when empty — in the working tree: nothing on GitHub to comment on.
+    Local { base: String, rel: PathBuf },
+}
+
 pub struct Viewer {
-    pub pr: PullRequest,
+    pub source: Source,
     /// Where `gh` runs: a checkout of the PR's repository.
     pub dir: PathBuf,
     pub load: Load,
@@ -247,13 +257,27 @@ pub struct Viewer {
     jobs: usize,
     /// Syntax colours for each file, worked out off the draw path.
     pub highlights: highlight::Cache,
+    /// `t` in a local diff: the base and the file to hand to `git difftool`.
+    /// The viewer cannot suspend the terminal, so its owner takes this.
+    difftool: Option<(String, String)>,
+    /// The key list, open over a local diff.
+    pub help: bool,
 }
 
 impl Viewer {
     pub fn new(dir: PathBuf, pr: PullRequest, palette: Palette) -> Self {
+        Self::with_source(dir, Source::Pr(pr), palette)
+    }
+
+    /// A viewer on the diff of `rel` against `base` in the worktree at `dir`.
+    pub fn local(dir: PathBuf, base: String, rel: PathBuf, palette: Palette) -> Self {
+        Self::with_source(dir, Source::Local { base, rel }, palette)
+    }
+
+    fn with_source(dir: PathBuf, source: Source, palette: Palette) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
-            pr,
+            source,
             dir,
             load: Load::Loading,
             page: 0,
@@ -281,7 +305,70 @@ impl Viewer {
             rx,
             jobs: 0,
             highlights: highlight::Cache::new(),
+            difftool: None,
+            help: false,
         }
+    }
+
+    /// What a pane's border calls a local diff: the path, or the worktree.
+    pub fn heading(&self) -> String {
+        match &self.source {
+            Source::Pr(pr) => format!("#{} {}", pr.number, pr.title),
+            Source::Local { base, rel } => {
+                let shown = match rel.as_os_str().is_empty() {
+                    true => "this worktree".to_string(),
+                    false => rel.display().to_string(),
+                };
+                format!("diff of {shown} · from {}", &base[..base.len().min(7)])
+            }
+        }
+    }
+
+    pub fn pr(&self) -> Option<&PullRequest> {
+        match &self.source {
+            Source::Pr(pr) => Some(pr),
+            Source::Local { .. } => None,
+        }
+    }
+
+    /// The PR's number, for the flows only a PR has.
+    fn number(&self) -> u64 {
+        self.pr().map_or(0, |pr| pr.number)
+    }
+
+    /// The commit a local diff is measured from.
+    pub fn base(&self) -> Option<&str> {
+        match &self.source {
+            Source::Local { base, .. } => Some(base),
+            Source::Pr(_) => None,
+        }
+    }
+
+    /// Whether anything is still on its way: an answer or syntax colours.
+    pub fn working(&self) -> bool {
+        self.jobs > 0 || self.highlights.working
+    }
+
+    /// Apply what the background threads have finished and start what
+    /// follows, for an owner that drives the viewer from its own loop.
+    pub fn pump(&mut self) {
+        self.take_updates();
+        self.update_highlights();
+        if let Some(job) = self.tick(Instant::now()) {
+            self.spawn(job);
+        }
+    }
+
+    /// Fetch the diff afresh, as `r` does.
+    pub fn reload(&mut self) {
+        if let Some(job) = self.refresh() {
+            self.spawn(job);
+        }
+    }
+
+    /// The `git difftool` run `t` asked for, if it did.
+    pub fn take_difftool(&mut self) -> Option<(String, String)> {
+        self.difftool.take()
     }
 
     pub fn review(&self) -> Option<&Review> {
@@ -310,19 +397,23 @@ impl Viewer {
     }
 
     /// Hand `job` to a background thread.
-    fn spawn(&mut self, job: Job) {
+    pub fn spawn(&mut self, job: Job) {
         if job == Job::Load {
             // Whatever was asked before this is about to be out of date.
             self.generation += 1;
             self.polling = false;
         }
         let dir = self.dir.clone();
-        let number = self.pr.number;
+        let source = self.source.clone();
         let generation = self.generation;
         let tx = self.tx.clone();
         self.jobs += 1;
         std::thread::spawn(move || {
-            let msg = actions::run(&dir, number, job);
+            // A local diff only ever loads: its keys start nothing else.
+            let msg = match source {
+                Source::Pr(pr) => actions::run(&dir, pr.number, job),
+                Source::Local { base, rel } => actions::run_local(&dir, &base, &rel),
+            };
             let _ = tx.send((generation, msg));
         });
     }
@@ -371,7 +462,8 @@ impl Viewer {
         let refresh = self.refreshing && self.review().is_some();
         self.refreshing = false;
         self.polling = false;
-        self.next_poll = Some(Instant::now() + POLL_EVERY);
+        // Nothing to poll for in a local diff.
+        self.next_poll = self.pr().map(|_| Instant::now() + POLL_EVERY);
         let text = match diff {
             Ok(text) => text,
             Err(why) if refresh => {
@@ -513,7 +605,11 @@ impl Viewer {
     fn refresh(&mut self) -> Option<Job> {
         match &self.load {
             Load::Loading => {
-                self.status = "still loading the pull request…".into();
+                self.status = match self.pr() {
+                    Some(_) => "still loading the pull request…",
+                    None => "still reading the diff…",
+                }
+                .into();
                 None
             }
             _ if self.refreshing => {
@@ -536,7 +632,7 @@ impl Viewer {
         self.busy = None;
         match result {
             Ok(()) => {
-                self.status = super::submitted_label(draft.verdict, self.pr.number);
+                self.status = super::submitted_label(draft.verdict, self.number());
                 self.submitted = Some(draft.verdict);
                 // The verdict went out with the pending review, if there was one.
                 if let Load::Ready(review) = &mut self.load {
@@ -682,7 +778,7 @@ impl Viewer {
 
     /// Mark `job` as in flight, and hand it back to be spawned.
     fn start(&mut self, job: Job) -> Option<Job> {
-        self.busy = job.busy_label(self.pr.number);
+        self.busy = job.busy_label(self.number());
         Some(job)
     }
 
@@ -901,7 +997,14 @@ impl Viewer {
         if let Some(confirm) = self.confirm.take() {
             return self.confirm_key(confirm, key);
         }
+        if self.help {
+            // Any key puts the list away.
+            self.help = false;
+            return None;
+        }
         let page = self.page_rows.max(1) as isize;
+        // A local diff has nobody to comment to or approve for.
+        let github = self.pr().is_some();
         // Some terminals report a capital as its lowercase letter with shift.
         let code = match key.code {
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -925,23 +1028,36 @@ impl Viewer {
             KeyCode::End => self.move_cursor(isize::MAX / 2),
             KeyCode::Left | KeyCode::Char('h') => self.turn(-1),
             KeyCode::Right | KeyCode::Char('l') => self.turn(1),
-            KeyCode::Char('A') => self.start_draft(Verdict::Approve),
-            KeyCode::Char('C') => self.start_draft(Verdict::Comment),
-            KeyCode::Char('X') => self.start_draft(Verdict::RequestChanges),
-            KeyCode::Char('c') => self.start_inline(),
-            KeyCode::Char('R') => self.start_reply(),
-            KeyCode::Char('+') => self.open_picker(),
-            KeyCode::Char('e') => self.start_edit(),
-            KeyCode::Char('d') => self.start_delete(),
+            KeyCode::Char('A') if github => self.start_draft(Verdict::Approve),
+            KeyCode::Char('C') if github => self.start_draft(Verdict::Comment),
+            KeyCode::Char('X') if github => self.start_draft(Verdict::RequestChanges),
+            KeyCode::Char('c') if github => self.start_inline(),
+            KeyCode::Char('R') if github => self.start_reply(),
+            KeyCode::Char('+') if github => self.open_picker(),
+            KeyCode::Char('e') if github => self.start_edit(),
+            KeyCode::Char('d') if github => self.start_delete(),
+            KeyCode::Char('t') if !github && !ctrl => self.ask_difftool(),
+            KeyCode::F(1) if !github => self.help = true,
+            KeyCode::Char('g') if !github && ctrl => self.help = true,
             KeyCode::Char('r') => return self.refresh(),
             _ => {}
         }
         None
     }
 
+    /// `t`: the current file in `git difftool`, which the owner runs.
+    fn ask_difftool(&mut self) {
+        let (Some(base), Some(file)) = (self.base(), self.file()) else {
+            self.status = "no file to open in difftool".into();
+            return;
+        };
+        self.difftool = Some((base.to_string(), file.path().to_string()));
+    }
+
     /// Whether a box is open over the diff, taking the keys.
     pub fn overlay_open(&self) -> bool {
-        self.draft.is_some()
+        self.help
+            || self.draft.is_some()
             || self.compose.is_some()
             || self.picker.is_some()
             || self.confirm.is_some()
@@ -1002,6 +1118,23 @@ mod tests {
             Ok(threads()),
             Ok(pending),
             Ok(print()),
+        );
+        viewer
+    }
+
+    /// A local diff viewer with the fixture diff loaded, as if git had answered.
+    pub(super) fn local_viewer() -> Viewer {
+        let mut viewer = Viewer::local(
+            PathBuf::from("/nowhere"),
+            "0123456789abcdef".into(),
+            PathBuf::new(),
+            Palette::truecolor(),
+        );
+        viewer.loaded(
+            Ok(include_str!("../../../tests/fixtures/pr.diff").to_string()),
+            Ok(Vec::new()),
+            Ok(None),
+            Err("none".into()),
         );
         viewer
     }

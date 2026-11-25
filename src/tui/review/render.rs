@@ -136,13 +136,13 @@ pub fn nearest_indexed((r, g, b): Rgb) -> u8 {
 /// what can be done to a line of code, or to a comment — editing and
 /// deleting only on a comment GitHub says the user may change.
 fn keys(viewer: &Viewer) -> Vec<(&'static str, &'static str)> {
-    let mut keys = vec![
-        ("←→", "file"),
-        ("↑↓", "move"),
-        ("A", "approve"),
-        ("C", "comment"),
-        ("X", "request changes"),
-    ];
+    let mut keys = vec![("←→", "file"), ("↑↓", "move")];
+    // A local diff has no pull request to approve, comment on or reply in.
+    if viewer.pr().is_none() {
+        keys.extend([("t", "difftool"), ("r", "refresh"), ("Esc/q", "close")]);
+        return keys;
+    }
+    keys.extend([("A", "approve"), ("C", "comment"), ("X", "request changes")]);
     match viewer.row() {
         Some(Row::Line(..)) => keys.push(("c", "inline comment")),
         Some(Row::Comment { .. }) => {
@@ -165,9 +165,61 @@ fn keys(viewer: &Viewer) -> Vec<(&'static str, &'static str)> {
 /// Which keys give up their place first when the bar is too narrow.
 const DROP_FIRST: [&str; 3] = ["←→", "↑↓", "r"];
 
+/// Every key a local diff answers to, for the key list: the bar shows what
+/// fits, this shows all of it.
+const LOCAL_HELP: [(&str, &str); 12] = [
+    ("←→", "previous / next file"),
+    ("↑↓ j k", "move the cursor"),
+    ("PgUp PgDn", "a page at a time"),
+    ("Home End", "top / bottom of the file"),
+    ("t", "this file in git difftool"),
+    ("r", "read the diff again"),
+    ("Esc q", "close the diff"),
+    ("^l", "other pane"),
+    ("^v", "unsplit"),
+    ("^q", "quit, leaving the shell in this directory"),
+    ("^c", "quit without moving the shell"),
+    ("F1", "this list"),
+];
+
+/// The viewer over the whole frame, as `plete review` shows it.
 pub fn draw(frame: &mut Frame, viewer: &mut Viewer) {
-    let p = viewer.palette;
     let area = frame.area();
+    draw_content(frame, area, viewer);
+}
+
+/// The viewer in a pane of the explorer screen: the File pane's border, bright
+/// when `focused`, with `marker` ("pane 1/2") in the title when only one pane
+/// fits on screen.
+pub fn draw_in(
+    frame: &mut Frame,
+    area: Rect,
+    viewer: &mut Viewer,
+    focused: bool,
+    marker: Option<&str>,
+) {
+    let (border, title) = match focused {
+        true => (Style::default(), Style::default().fg(Color::Green)),
+        false => (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+    let mut heading = format!(" {} ", viewer.heading());
+    if let Some(marker) = marker {
+        heading = format!("{heading}· {marker} ");
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border)
+        .title(Span::styled(heading, title.add_modifier(Modifier::BOLD)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    draw_content(frame, inner, viewer);
+}
+
+fn draw_content(frame: &mut Frame, area: Rect, viewer: &mut Viewer) {
+    let p = viewer.palette;
     frame.render_widget(Block::default().style(base(&p)), area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -197,28 +249,30 @@ pub fn draw(frame: &mut Frame, viewer: &mut Viewer) {
         chunks[3],
     );
     frame.render_widget(
-        Paragraph::new(key_bar(&p, keys(viewer), chunks[4].width)),
+        Paragraph::new(key_bar(
+            &p,
+            keys(viewer),
+            chunks[4].width,
+            viewer.pr().is_none(),
+        )),
         chunks[4],
     );
 
-    if let Some(draft) = &viewer.draft {
+    if let (Some(draft), Some(pr)) = (&viewer.draft, viewer.pr()) {
         let pending = viewer.review().and_then(|r| r.pending.as_ref());
-        super::super::ui::draw_review_body(
-            frame,
-            viewer.pr.number,
-            draft.verdict,
-            &draft.input,
-            pending,
-        );
+        super::super::ui::draw_review_body(frame, pr.number, draft.verdict, &draft.input, pending);
     }
     if let Some(compose) = &viewer.compose {
-        draw_compose(frame, &p, compose);
+        draw_compose(frame, area, &p, compose);
     }
     if let Some(picker) = &viewer.picker {
-        draw_picker(frame, &p, picker);
+        draw_picker(frame, area, &p, picker);
     }
     if let Some(confirm) = &viewer.confirm {
-        draw_confirm(frame, &p, confirm);
+        draw_confirm(frame, area, &p, confirm);
+    }
+    if viewer.help {
+        draw_help(frame, area, &p);
     }
     if let Some(busy) = &viewer.busy {
         super::super::ui::draw_working(frame, busy);
@@ -249,12 +303,19 @@ fn draw_header(frame: &mut Frame, area: Rect, viewer: &Viewer) {
     } else {
         ("", Style::default())
     };
-    let number = format!(" #{} ", viewer.pr.number);
+    let (number, name) = match viewer.pr() {
+        Some(pr) => (format!(" #{} ", pr.number), pr.title.clone()),
+        None => {
+            let base = viewer.base().unwrap_or_default();
+            let name = format!("working tree against {}", &base[..base.len().min(7)]);
+            (" diff ".to_string(), name)
+        }
+    };
     let room = width.saturating_sub(number.width() + news.width() + position.width() + 1);
     let title = Line::from(vec![
         Span::styled(number, Style::default().fg(p.accent)),
         Span::styled(
-            fit(&clean(&viewer.pr.title), room),
+            fit(&clean(&name), room),
             Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -277,12 +338,19 @@ fn draw_header(frame: &mut Frame, area: Rect, viewer: &Viewer) {
 
     let second = rows[1];
     let line = match (&viewer.load, viewer.file()) {
+        (Load::Loading, _) if viewer.pr().is_none() => Line::from(Span::styled(
+            " reading the diff…",
+            Style::default().fg(p.muted),
+        )),
         (Load::Loading, _) => Line::from(Span::styled(
             " loading the diff and its comments…",
             Style::default().fg(p.muted),
         )),
         (Load::Failed(_), _) => Line::from(Span::styled(
-            " the pull request could not be loaded",
+            match viewer.pr() {
+                Some(_) => " the pull request could not be loaded",
+                None => " the diff could not be read",
+            },
             Style::default().fg(p.removed_sign),
         )),
         (Load::Ready(_), None) => Line::from(Span::styled(
@@ -349,7 +417,9 @@ fn file_line(
     ])
 }
 
-fn key_bar(p: &Palette, mut keys: Vec<(&str, &str)>, width: u16) -> Line<'static> {
+/// The bar of keys. With `help`, it ends on a pointer to the key list: keys
+/// give way to it from the end until it fits, and it counts the ones that did.
+fn key_bar(p: &Palette, mut keys: Vec<(&str, &str)>, width: u16, help: bool) -> Line<'static> {
     let len = |keys: &[(&str, &str)]| -> usize {
         1 + keys
             .iter()
@@ -357,15 +427,34 @@ fn key_bar(p: &Palette, mut keys: Vec<(&str, &str)>, width: u16) -> Line<'static
             .sum::<usize>()
             + 3 * keys.len().saturating_sub(1)
     };
-    for key in DROP_FIRST {
+    // With a pointer to the key list, nothing is dropped unseen.
+    for key in DROP_FIRST.into_iter().filter(|_| !help) {
         if len(&keys) <= width as usize {
             break;
         }
         keys.retain(|(k, _)| *k != key);
     }
+    let mut more = String::from("keys");
+    if help {
+        let mut left_out = 0;
+        loop {
+            let mut with_pointer: Vec<(&str, &str)> = keys.clone();
+            with_pointer.push(("F1", &more));
+            if len(&with_pointer) <= width as usize || keys.is_empty() {
+                break;
+            }
+            keys.pop();
+            left_out += 1;
+            more = format!("+{left_out} more");
+        }
+    }
+    let mut shown: Vec<(&str, &str)> = keys;
+    if help {
+        shown.push(("F1", &more));
+    }
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1;
-    for (i, (key, what)) in keys.iter().enumerate() {
+    for (i, (key, what)) in shown.iter().enumerate() {
         let sep = if i == 0 { "" } else { " · " };
         let len = sep.width() + key.width() + 1 + what.width();
         if used + len > width as usize {
@@ -398,10 +487,17 @@ fn draw_body(frame: &mut Frame, area: Rect, viewer: &mut Viewer) {
     let lines = match &viewer.load {
         Load::Loading => message(vec![
             String::new(),
-            format!("loading #{} from GitHub…", viewer.pr.number),
+            match viewer.pr() {
+                Some(pr) => format!("loading #{} from GitHub…", pr.number),
+                None => "reading the diff…".to_string(),
+            },
         ]),
         Load::Failed(why) => {
-            let mut lines = vec![String::new(), "could not load the pull request:".into()];
+            let what = match viewer.pr() {
+                Some(_) => "could not load the pull request:",
+                None => "could not read the diff:",
+            };
+            let mut lines = vec![String::new(), what.into()];
             lines.extend(super::super::ui::wrap_words(
                 &clean(why),
                 (area.width as usize).saturating_sub(4).max(10),
@@ -412,7 +508,10 @@ fn draw_body(frame: &mut Frame, area: Rect, viewer: &mut Viewer) {
         Load::Ready(review) => match review.files.get(viewer.page) {
             None => message(vec![
                 String::new(),
-                "this pull request changes no files".into(),
+                match viewer.pr() {
+                    Some(_) => "this pull request changes no files".into(),
+                    None => "no changes to show".into(),
+                },
             ]),
             Some(file) => {
                 let ctx = Ctx {
@@ -441,17 +540,17 @@ fn draw_body(frame: &mut Frame, area: Rect, viewer: &mut Viewer) {
 }
 
 /// A box over the diff in the viewer's colours, `width` by `height` cells
-/// counting its border, centred and cut down to fit the frame. Returns the
+/// counting its border, centred in `area` and cut down to fit it. Returns the
 /// space inside the border.
 fn draw_box(
     frame: &mut Frame,
+    area: Rect,
     p: &Palette,
     title: &str,
     title_color: Color,
     width: usize,
     height: usize,
 ) -> Rect {
-    let area = frame.area();
     let w = (width as u16).min(area.width);
     let h = (height as u16).min(area.height);
     let rect = Rect {
@@ -476,14 +575,14 @@ fn draw_box(
 }
 
 /// The width of a box that takes most of the frame, but not absurdly much.
-fn box_width(frame: &Frame) -> usize {
-    let width = frame.area().width as usize;
+fn box_width(area: Rect) -> usize {
+    let width = area.width as usize;
     (width * 7 / 10).clamp(40.min(width), 100)
 }
 
 /// The text box for an inline comment, a reply or an edit.
-fn draw_compose(frame: &mut Frame, p: &Palette, compose: &Compose) {
-    let width = box_width(frame);
+fn draw_compose(frame: &mut Frame, area: Rect, p: &Palette, compose: &Compose) {
+    let width = box_width(area);
     let inner = width.saturating_sub(2).max(1);
     let hint = format!(
         "⏎ {} · ctrl-j new line · ctrl-u clear · esc cancel",
@@ -508,7 +607,7 @@ fn draw_compose(frame: &mut Frame, p: &Palette, compose: &Compose) {
     }
     // Room for the hint under a blank line; a long text shows its end, where
     // the typing is.
-    let room = (frame.area().height as usize).saturating_sub(4).max(1);
+    let room = (area.height as usize).saturating_sub(4).max(1);
     let shown = text.len().min(room.saturating_sub(2).max(1));
     let mut lines: Vec<Line<'static>> = text.split_off(text.len() - shown);
     lines.push(Line::from(""));
@@ -516,19 +615,20 @@ fn draw_compose(frame: &mut Frame, p: &Palette, compose: &Compose) {
         fit(&hint, inner),
         Style::default().fg(p.muted),
     )));
-    let area = draw_box(
+    let inside = draw_box(
         frame,
+        area,
         p,
         &compose.target.title(),
         p.accent,
         width,
         lines.len() + 2,
     );
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines), inside);
 }
 
 /// The row of reactions to pick from.
-fn draw_picker(frame: &mut Frame, p: &Palette, picker: &Picker) {
+fn draw_picker(frame: &mut Frame, area: Rect, p: &Palette, picker: &Picker) {
     let mut row = vec![Span::raw(" ")];
     for (i, reaction) in Reaction::ALL.iter().enumerate() {
         let mut style = Style::default().fg(p.fg);
@@ -555,13 +655,13 @@ fn draw_picker(frame: &mut Frame, p: &Palette, picker: &Picker) {
             Style::default().fg(p.muted),
         )),
     ];
-    let area = draw_box(frame, p, "react", p.accent, 38, lines.len() + 2);
-    frame.render_widget(Paragraph::new(lines), area);
+    let inside = draw_box(frame, area, p, "react", p.accent, 38, lines.len() + 2);
+    frame.render_widget(Paragraph::new(lines), inside);
 }
 
 /// The question before a comment is deleted.
-fn draw_confirm(frame: &mut Frame, p: &Palette, confirm: &Confirm) {
-    let width = box_width(frame).min(64);
+fn draw_confirm(frame: &mut Frame, area: Rect, p: &Palette, confirm: &Confirm) {
+    let width = box_width(area).min(64);
     let inner = width.saturating_sub(2).max(1);
     let lines = vec![
         Line::from(Span::styled(
@@ -585,15 +685,40 @@ fn draw_confirm(frame: &mut Frame, p: &Palette, confirm: &Confirm) {
             Span::styled(" keep it", Style::default().fg(p.muted)),
         ]),
     ];
-    let area = draw_box(
+    let inside = draw_box(
         frame,
+        area,
         p,
         "delete comment",
         p.removed_sign,
         width,
         lines.len() + 2,
     );
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines), inside);
+}
+
+/// Every key of a local diff, over it.
+fn draw_help(frame: &mut Frame, area: Rect, p: &Palette) {
+    let width = box_width(area).min(64);
+    let mut lines: Vec<Line<'static>> = LOCAL_HELP
+        .iter()
+        .map(|(key, what)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {key:<10}"),
+                    Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled((*what).to_string(), Style::default().fg(p.muted)),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " any key closes this",
+        Style::default().fg(p.muted),
+    )));
+    let inside = draw_box(frame, area, p, "keys", p.accent, width, lines.len() + 2);
+    frame.render_widget(Paragraph::new(lines), inside);
 }
 
 /// The first row to draw so the cursor's row is wholly on screen, moving the
@@ -1444,5 +1569,135 @@ mod tests {
                 render(&mut viewer, width, height);
             }
         }
+    }
+
+    fn local_screen(
+        viewer: &mut Viewer,
+        width: u16,
+        height: u16,
+        area: Rect,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_in(frame, area, viewer, true, None))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_local_diff_hides_and_ignores_the_pull_request_keys() {
+        use super::super::tests::local_viewer;
+        let mut viewer = local_viewer();
+        let shown: Vec<&str> = keys(&viewer).iter().map(|(k, _)| *k).collect();
+        for key in ["A", "C", "X", "c", "R", "+", "e", "d"] {
+            assert!(!shown.contains(&key), "{key}");
+        }
+        assert!(shown.contains(&"t") && shown.contains(&"r"));
+        for c in ['A', 'C', 'X', 'c', 'R', '+', 'e', 'd'] {
+            let job = viewer.handle_key(key(KeyCode::Char(c)));
+            assert!(job.is_none(), "{c}");
+        }
+        assert!(!viewer.overlay_open() && viewer.status.is_empty());
+        assert!(viewer.exit.is_none());
+        // The diff has no PR in its header either.
+        let buffer = local_screen(&mut viewer, 100, 30, Rect::new(0, 0, 100, 30));
+        let text = (0..30)
+            .map(|y| row(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("working tree against 0123456"), "{text}");
+        assert!(
+            text.contains("F1 keys") && text.contains("t difftool"),
+            "{text}"
+        );
+        assert!(!text.contains("approve"), "{text}");
+    }
+
+    #[test]
+    fn t_asks_for_difftool_on_the_current_file_and_a_pr_does_not() {
+        use super::super::tests::local_viewer;
+        let mut viewer = local_viewer();
+        assert!(viewer.handle_key(key(KeyCode::Char('t'))).is_none());
+        let (base, file) = viewer.take_difftool().unwrap();
+        assert_eq!(
+            (base.as_str(), file.as_str()),
+            ("0123456789abcdef", "src/lib.rs")
+        );
+        assert!(viewer.take_difftool().is_none());
+
+        let mut pr = loaded_viewer(None);
+        pr.handle_key(key(KeyCode::Char('t')));
+        assert!(pr.take_difftool().is_none());
+    }
+
+    #[test]
+    fn f1_lists_every_key_and_any_key_puts_it_away() {
+        use super::super::tests::local_viewer;
+        let mut viewer = local_viewer();
+        viewer.handle_key(key(KeyCode::F(1)));
+        assert!(viewer.overlay_open());
+        let buffer = local_screen(&mut viewer, 100, 30, Rect::new(0, 0, 100, 30));
+        let text = (0..30)
+            .map(|y| row(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("previous / next file"), "{text}");
+        viewer.handle_key(key(KeyCode::Esc));
+        assert!(!viewer.overlay_open() && viewer.exit.is_none());
+    }
+
+    #[test]
+    fn a_narrow_bar_counts_the_keys_it_left_out() {
+        let p = Palette::truecolor();
+        let keys = vec![("←→", "file"), ("↑↓", "move"), ("t", "difftool")];
+        let wide = key_bar(&p, keys.clone(), 80, true).to_string();
+        assert!(wide.ends_with("F1 keys"), "{wide}");
+        let narrow = key_bar(&p, keys, 22, true).to_string();
+        assert!(
+            narrow.ends_with("F1 +2 more") && narrow.width() <= 22,
+            "{narrow:?}"
+        );
+    }
+
+    #[test]
+    fn draw_in_stays_inside_its_area() {
+        use super::super::tests::local_viewer;
+        let area = Rect::new(30, 4, 50, 16);
+        let outside = |buffer: &ratatui::buffer::Buffer| {
+            for y in 0..30 {
+                for x in 0..100 {
+                    let inside = x >= area.x
+                        && x < area.x + area.width
+                        && y >= area.y
+                        && y < area.y + area.height;
+                    assert!(inside || buffer[(x, y)].symbol() == " ", "({x},{y})");
+                }
+            }
+        };
+        let mut viewer = local_viewer();
+        let buffer = local_screen(&mut viewer, 100, 30, area);
+        outside(&buffer);
+        assert_eq!(buffer[(30, 4)].symbol(), "┌");
+        assert_eq!(buffer[(79, 19)].symbol(), "┘");
+        assert!(row(&buffer, 4).contains("diff of this worktree"));
+
+        // Boxes over it are cut down to the pane, not the screen.
+        viewer.help = true;
+        outside(&local_screen(&mut viewer, 100, 30, area));
+        viewer.help = false;
+        viewer.compose = Some(Compose {
+            target: super::super::actions::Target::Reply {
+                to: 1,
+                author: "ada".into(),
+            },
+            text: "a long reply ".repeat(20),
+        });
+        outside(&local_screen(&mut viewer, 100, 30, area));
     }
 }
