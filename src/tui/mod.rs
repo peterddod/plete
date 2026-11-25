@@ -1900,7 +1900,10 @@ fn difftool_argv(app: &App, root: &Path, base: &str, rel: &str) -> Vec<String> {
     }
     argv.push(base.to_string());
     argv.push("--".into());
-    argv.push(rel.to_string());
+    argv.push(match rel {
+        "." => rel.to_string(),
+        _ => format!(":(literal){rel}"),
+    });
     argv
 }
 

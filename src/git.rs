@@ -670,7 +670,8 @@ pub fn diff_stat(path: &Path, base: &str) -> Option<(usize, usize, usize)> {
 pub fn diff_against(path: &Path, base: &str, rel: &Path) -> Result<String> {
     let spec = match rel.as_os_str().is_empty() {
         true => ".".to_string(),
-        false => rel.to_string_lossy().into_owned(),
+        // Literal, so a name starting with `:` is not read as pathspec magic.
+        false => format!(":(literal){}", rel.to_string_lossy()),
     };
     let out = git_output_raw(
         path,

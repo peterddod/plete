@@ -167,19 +167,24 @@ const DROP_FIRST: [&str; 3] = ["←→", "↑↓", "r"];
 
 /// Every key a local diff answers to, for the key list: the bar shows what
 /// fits, this shows all of it.
-const LOCAL_HELP: [(&str, &str); 12] = [
-    ("←→", "previous / next file"),
-    ("↑↓ j k", "move the cursor"),
-    ("PgUp PgDn", "a page at a time"),
-    ("Home End", "top / bottom of the file"),
-    ("t", "this file in git difftool"),
-    ("r", "read the diff again"),
-    ("Esc q", "close the diff"),
-    ("^l", "other pane"),
-    ("^v", "unsplit"),
-    ("^q", "quit, leaving the shell in this directory"),
-    ("^c", "quit without moving the shell"),
-    ("F1", "this list"),
+const LOCAL_HELP: [(&str, &str, &str); 13] = [
+    ("←→ h l", "previous / next file", "file"),
+    ("↑↓ j k", "move the cursor", "move"),
+    ("wheel", "move the cursor", "move"),
+    ("PgUp PgDn ␣", "a page at a time", "page"),
+    ("Home End", "top / bottom of the file", "top/end"),
+    ("t", "this file in git difftool", "difftool"),
+    ("r", "read the diff again", "refresh"),
+    ("Esc q", "close the diff", "close"),
+    ("^l", "other pane", "other pane"),
+    ("^v", "unsplit", "unsplit"),
+    (
+        "^q",
+        "quit, leaving the shell in this directory",
+        "quit here",
+    ),
+    ("^c", "quit without moving the shell", "quit"),
+    ("F1 ^g", "this list", "keys"),
 ];
 
 /// The viewer over the whole frame, as `plete review` shows it.
@@ -699,24 +704,47 @@ fn draw_confirm(frame: &mut Frame, area: Rect, p: &Palette, confirm: &Confirm) {
 
 /// Every key of a local diff, over it.
 fn draw_help(frame: &mut Frame, area: Rect, p: &Palette) {
-    let width = box_width(area).min(64);
-    let mut lines: Vec<Line<'static>> = LOCAL_HELP
-        .iter()
-        .map(|(key, what)| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {key:<10}"),
-                    Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled((*what).to_string(), Style::default().fg(p.muted)),
-            ])
-        })
-        .collect();
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " any key closes this",
-        Style::default().fg(p.muted),
-    )));
+    let bold = Style::default().fg(p.fg).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(p.muted);
+    // One key a line, or packed side by side with short names when the pane
+    // is too short for that.
+    let tall = LOCAL_HELP.len() + 4 <= area.height as usize;
+    let mut lines: Vec<Line<'static>> = match tall {
+        true => LOCAL_HELP
+            .iter()
+            .map(|(key, what, _)| {
+                Line::from(vec![
+                    Span::styled(format!(" {key:<12}"), bold),
+                    Span::styled((*what).to_string(), muted),
+                ])
+            })
+            .collect(),
+        false => {
+            let room = (area.width as usize).saturating_sub(4);
+            let mut lines = vec![Line::default()];
+            let mut used = 0;
+            for (key, _, what) in LOCAL_HELP {
+                let len = key.chars().count() + what.chars().count() + 3;
+                if used > 0 && used + len > room {
+                    lines.push(Line::default());
+                    used = 0;
+                }
+                let line = lines.last_mut().expect("starts with a line");
+                line.spans.push(Span::styled(format!(" {key} "), bold));
+                line.spans.push(Span::styled(format!("{what} "), muted));
+                used += len;
+            }
+            lines
+        }
+    };
+    if tall {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(" any key closes this", muted)));
+    let width = match tall {
+        true => box_width(area).min(64),
+        false => (area.width as usize).saturating_sub(2),
+    };
     let inside = draw_box(frame, area, p, "keys", p.accent, width, lines.len() + 2);
     frame.render_widget(Paragraph::new(lines), inside);
 }
@@ -1650,6 +1678,22 @@ mod tests {
         assert!(text.contains("previous / next file"), "{text}");
         viewer.handle_key(key(KeyCode::Esc));
         assert!(!viewer.overlay_open() && viewer.exit.is_none());
+    }
+
+    #[test]
+    fn a_short_pane_still_lists_every_key() {
+        use super::super::tests::local_viewer;
+        let mut viewer = local_viewer();
+        viewer.handle_key(key(KeyCode::F(1)));
+        let buffer = local_screen(&mut viewer, 50, 14, Rect::new(0, 0, 50, 14));
+        let text = (0..14)
+            .map(|y| row(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (key, _, _) in LOCAL_HELP {
+            assert!(text.contains(key), "{key} in\n{text}");
+        }
+        assert!(text.contains("any key closes this"), "{text}");
     }
 
     #[test]
