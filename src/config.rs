@@ -997,6 +997,10 @@ impl PrMode {
     }
 }
 
+/// Grows by auto before the classifier is no longer asked, unless `[budget]
+/// max_grows` says otherwise.
+pub const DEFAULT_MAX_GROWS: u32 = 3;
+
 /// `[budget]` in config.toml: the budget mode and, for `auto`, the
 /// classifier and the bounds on its growth. Each value is checked where it
 /// is used ([`Config::budget_policy`]), so a typo breaks budgets and not the
@@ -1290,7 +1294,7 @@ impl Config {
         }
         Ok(BudgetPolicy {
             mode,
-            max_grows: b.max_grows.unwrap_or(3),
+            max_grows: b.max_grows.unwrap_or(DEFAULT_MAX_GROWS),
             max_growth: b.max_growth.unwrap_or(3),
             classifier_model: b
                 .classifier_model

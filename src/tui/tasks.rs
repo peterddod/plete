@@ -8973,12 +8973,21 @@ mod tests {
                 ],
             )
             .unwrap();
-        let text = brief_lines(&app, &w).unwrap().join("\n");
-        assert!(text.contains("mode: auto (grown 2×, base 1h)"), "{text}");
-        assert!(
-            text.contains("last decision: grow +1h at 80%: progress"),
-            "{text}"
+        let pane = brief_lines(&app, &w).unwrap();
+        let said = commands::manager::shown_text(
+            &commands::manager::shown(&app, &Caller::User, &w).unwrap(),
         );
+        // The very lines `task show` prints, not a copy of them.
+        for prefix in ["budget: ", "last decision: "] {
+            let line = said.lines().find(|l| l.starts_with(prefix)).unwrap();
+            assert!(pane.iter().any(|l| l == line), "{prefix}: {pane:?}");
+        }
+        assert!(pane
+            .iter()
+            .any(|l| l.ends_with("mode: auto (grown 2×, base 1h)")));
+        assert!(pane
+            .iter()
+            .any(|l| l == "last decision: grow +1h at 80%: progress"));
         // The CLI's `manager show` refuses the assistant; `b` reads it.
         let text = brief_lines(&app, &root).unwrap().join("\n");
         assert!(text.contains("- api (work, active)"), "{text}");

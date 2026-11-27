@@ -304,7 +304,9 @@ pub fn gather(app: &App, tmux_ok: bool) -> Result<TreeInfo> {
             held: 0,
             setter,
             budget,
-            mode: budget::mode_or_on(app, task),
+            // Quietly: a warning would scribble on the alternate screen. A
+            // value that cannot be read is in the `b` pane.
+            mode: budget::effective_mode(app, task).map_or(budget::Mode::On, |(mode, _)| mode),
             inbox: messages::try_peek(&tasks::task_dir(app, task)).map(|q| q.len()),
             pr,
             queued: queued_starts.contains(&task.id),

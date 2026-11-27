@@ -3865,6 +3865,7 @@ mod tests {
         if let Some((row, _)) = node.budget.as_mut() {
             row.grows = grows;
         }
+        ui.retree();
     }
 
     #[test]
@@ -3898,6 +3899,7 @@ mod tests {
                 .get_mut("api-docs")
                 .unwrap();
             node.budget.as_mut().unwrap().1 = (used, 0);
+            ui.retree();
         };
         docs(&mut ui, 3600);
         let urgency = |ui: &TasksUi| {
@@ -3912,6 +3914,7 @@ mod tests {
         let screen = render(&mut ui, 120, 20);
         let on = line_of(&screen, "│  ├─ api-docs");
         assert!(on.contains("1h00/1h") && on.contains("budget 100%"), "{on}");
+        assert!(on.contains('$'), "{on}");
         assert!(!on.contains("BUDGET OFF"), "{on}");
 
         set_mode(&mut ui, "api-docs", Mode::Off, 0);
