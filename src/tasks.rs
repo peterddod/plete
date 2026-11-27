@@ -18,7 +18,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use uuid::Uuid;
 
 use crate::agent::AgentSpec;
@@ -486,6 +486,8 @@ pub struct NewNode {
     pub brief: Option<TaskBriefRecord>,
     pub grant: Grant,
     pub budget: Option<Limits>,
+    /// Its own budget mode override, written with its row.
+    pub budget_mode: Option<String>,
     /// How many active tasks its parent may hold, checked again as the row
     /// is written; `None` under the assistant.
     pub fan_out: Option<u32>,
@@ -576,6 +578,9 @@ pub fn plan_child(
         &policy,
     )?;
     let budget = child_budget(app, &parent, d, &policy)?;
+    if let Some(mode) = &d.budget_mode {
+        budget::Mode::parse(mode).map_err(|e| anyhow!("--budget-mode: {e}"))?;
+    }
 
     let created_by = match caller {
         Caller::User => "user".to_string(),
@@ -598,6 +603,7 @@ pub fn plan_child(
         brief,
         grant,
         budget,
+        budget_mode: d.budget_mode.clone(),
         fan_out,
     })
 }
@@ -754,6 +760,7 @@ pub fn commit_child(
             &task,
             &plan.grant.caps,
             budget,
+            plan.budget_mode.as_deref(),
             plan.brief.as_ref(),
             plan.fan_out,
         )
@@ -3314,6 +3321,26 @@ mod tests {
             "user"
         );
         assert!(app.db.budget(&child.id).unwrap().is_none());
+        // `--budget-mode` writes a row with no limits, with the task.
+        let d = Delegation {
+            budget_mode: Some("auto".into()),
+            ..d
+        };
+        let plan = plan_child(&app, &Caller::User, TaskKind::Work, "kid2", &d, None).unwrap();
+        let child = make("kid2", Some((&Caller::User, &plan)));
+        let row = app.db.budget(&child.id).unwrap().unwrap();
+        assert_eq!(
+            (row.mode.as_deref(), row.max_secs, row.max_turns),
+            (Some("auto"), None, None)
+        );
+        let bad = Delegation {
+            budget_mode: Some("sometimes".into()),
+            ..d
+        };
+        let err = plan_child(&app, &Caller::User, TaskKind::Work, "kid3", &bad, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--budget-mode"), "{err}");
         let top = make("top", None);
         assert!(app.db.grants(&top.id).unwrap().is_empty());
     }

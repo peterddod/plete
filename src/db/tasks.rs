@@ -1705,6 +1705,7 @@ impl Database {
         rec: &TaskRecord,
         grants: &[&str],
         budget: Option<(Option<i64>, Option<i64>)>,
+        mode: Option<&str>,
         brief: Option<&TaskBriefRecord>,
         fan_out: Option<u32>,
     ) -> Result<()> {
@@ -1727,11 +1728,12 @@ impl Database {
         }
         insert_task_in(&tx, rec)?;
         insert_grants_in(&tx, &rec.id, grants)?;
-        if let Some((max_secs, max_turns)) = budget {
+        if budget.is_some() || mode.is_some() {
+            let (max_secs, max_turns) = budget.unwrap_or_default();
             tx.execute(
-                "INSERT INTO task_budgets (task_id, max_secs, max_turns, base_secs, base_turns)
-                 VALUES (?1, ?2, ?3, ?2, ?3)",
-                params![rec.id, max_secs, max_turns],
+                "INSERT INTO task_budgets (task_id, max_secs, max_turns, base_secs, base_turns, mode)
+                 VALUES (?1, ?2, ?3, ?2, ?3, ?4)",
+                params![rec.id, max_secs, max_turns, mode],
             )?;
         }
         if let Some(brief) = brief {
@@ -2905,6 +2907,7 @@ mod tests {
             &child("c", "m"),
             &["worktree.add"],
             Some((Some(60), None)),
+            None,
             Some(&brief),
             None,
         )
@@ -2930,6 +2933,7 @@ mod tests {
                 &child("d", "m"),
                 &["worktree.add"],
                 None,
+                None,
                 Some(&stray),
                 None
             )
@@ -2941,12 +2945,12 @@ mod tests {
         db.set_task_state("w3", TaskState::Archived).unwrap();
         db.set_task_state("n", TaskState::Archived).unwrap();
         let err = db
-            .insert_child(&child("e", "n"), &[], None, None, None)
+            .insert_child(&child("e", "n"), &[], None, None, None, None)
             .unwrap_err();
         assert!(err.to_string().contains("archived"), "{err}");
         assert!(db.get_task("e").unwrap().is_none());
         assert!(db
-            .insert_child(&task("t", "t", 1), &[], None, None, None)
+            .insert_child(&task("t", "t", 1), &[], None, None, None, None)
             .is_err());
     }
 
@@ -2966,7 +2970,7 @@ mod tests {
                         s.spawn(move || {
                             let db = Database::open(path).unwrap();
                             start.wait();
-                            db.insert_child(&child(id, "n"), &[], None, None, Some(2))
+                            db.insert_child(&child(id, "n"), &[], None, None, None, Some(2))
                                 .is_ok()
                         })
                     })
@@ -3006,7 +3010,7 @@ mod tests {
         // Not past the parent's fan-out: `m` at its limit of 2 (n, w2),
         // archive w2, add one, and w2 cannot come back.
         db.archive_task("w2").unwrap();
-        db.insert_child(&child("w4", "m"), &[], None, None, Some(2))
+        db.insert_child(&child("w4", "m"), &[], None, None, None, Some(2))
             .unwrap();
         let err = db.unarchive_task("w2", Some(2)).unwrap_err();
         assert!(err.to_string().contains("limit of 2"), "{err}");
@@ -3044,6 +3048,36 @@ mod tests {
             (row.mode.as_deref(), row.base_secs),
             (Some("off"), Some(900))
         );
+    }
+
+    #[test]
+    fn a_child_is_made_with_its_budget_and_mode_in_one_row() {
+        let (_dir, db) = open();
+        tree(&db);
+        for (id, budget, mode) in [
+            ("a1", Some((Some(60), None)), Some("off")),
+            ("a2", None, Some("auto")),
+            ("a3", Some((None, Some(5))), None),
+            ("a4", None, None),
+        ] {
+            let mut rec = task(id, id, 1);
+            rec.parent_id = Some("m".into());
+            db.insert_child(&rec, &[], budget, mode, None, None)
+                .unwrap();
+        }
+        let row = |id: &str| db.budget(id).unwrap();
+        let a1 = row("a1").unwrap();
+        assert_eq!(
+            (a1.max_secs, a1.base_secs, a1.mode.as_deref()),
+            (Some(60), Some(60), Some("off"))
+        );
+        let a2 = row("a2").unwrap();
+        assert_eq!(
+            (a2.max_secs, a2.max_turns, a2.mode.as_deref()),
+            (None, None, Some("auto"))
+        );
+        assert_eq!(row("a3").unwrap().mode, None);
+        assert!(row("a4").is_none());
     }
 
     #[test]

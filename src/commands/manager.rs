@@ -50,7 +50,9 @@ pub fn run_tree(app: &App, command: crate::cli::TreeCommands) -> Result<()> {
     match command {
         TreeCommands::Show { name, json } => show(app, &name, json),
         TreeCommands::Grant { name, caps, none } => grant(app, &name, &caps, none),
-        TreeCommands::Budget { name, change } => set_budget(app, &name, change),
+        TreeCommands::Budget { name, change, mode } => {
+            set_budget(app, &name, change, mode.as_deref())
+        }
         TreeCommands::Pause { name } => pause(app, &name),
         TreeCommands::Resume { name } => resume(app, &name),
         TreeCommands::Stop { name, all } => stop(app, name.as_deref(), all),
@@ -776,30 +778,77 @@ pub fn grant(app: &App, name: &str, caps: &[String], none: bool) -> Result<()> {
 /// set at or below what it has used pauses it now, not after its next turn.
 /// Otherwise its run state is left as it is: a task its budget paused runs
 /// again only once resumed.
-pub fn set_budget(app: &App, name: &str, change: Change) -> Result<()> {
-    let (caller, task) = scoped(app, name, Verb::ManagerBudget)?;
+///
+/// `mode` sets the task's own budget mode (`inherit` clears it) before the
+/// change is made. Only a task below the caller is reached, so a task cannot
+/// change its own mode or an ancestor's.
+pub fn set_budget(app: &App, name: &str, change: Option<Change>, mode: Option<&str>) -> Result<()> {
+    let target = Target::Key {
+        key: name.to_string(),
+        exact: false,
+    };
+    let (caller, task) = permissions::resolve_target(app, &target)?;
+    set_budget_for(app, &caller, &task, change, mode)
+}
+
+/// [`set_budget`] on `task`, as `caller`: checked for the verb first.
+fn set_budget_for(
+    app: &App,
+    caller: &Caller,
+    task: &TaskRecord,
+    change: Option<Change>,
+    mode: Option<&str>,
+) -> Result<()> {
+    permissions::in_scope(app, caller, Verb::ManagerBudget, task)?;
+    if let Some(mode) = mode {
+        let own = match mode {
+            "inherit" => None,
+            other => Some(budget::Mode::parse(other).map_err(|e| anyhow::anyhow!("--mode: {e}"))?),
+        };
+        app.db
+            .set_budget_mode(&task.id, own.map(budget::Mode::as_str))?;
+        match own {
+            Some(own) => eprintln!(
+                "plete: {}'s budget mode is {}",
+                manager::label(task),
+                own.as_str()
+            ),
+            None => eprintln!("plete: {}'s budget mode is inherited", manager::label(task)),
+        }
+    }
+    match change {
+        Some(change) => change_budget(app, caller, task, change),
+        None if mode.is_none() => {
+            eprintln!("plete: no change given");
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+fn change_budget(app: &App, caller: &Caller, task: &TaskRecord, change: Change) -> Result<()> {
     let row = app.db.budget(&task.id)?;
     let had = Limits {
         secs: row.as_ref().and_then(|r| r.max_secs),
         turns: row.as_ref().and_then(|r| r.max_turns),
     };
     let want = budget::changed(had, change)
-        .with_context(|| format!("{}'s budget", manager::label(&task)))?;
-    let want = budget::cap(app, &task, &caller, had, want)?;
+        .with_context(|| format!("{}'s budget", manager::label(task)))?;
+    let want = budget::cap(app, task, caller, had, want)?;
     app.db.set_budget_max(&task.id, want.secs, want.turns)?;
     let (secs, turns) = app.db.subtree_used(&task.id)?;
     eprintln!(
         "plete: {}'s budget is {} ({}m and {turns} turns used, with the tasks below it)",
-        manager::label(&task),
+        manager::label(task),
         budget::label(want),
         secs / 60
     );
     // No hook charges an idle task, so nothing else would check it before
     // it ran a turn past the new limit.
-    if matches!(budget::enforce(app, &task)?, budget::Threshold::Hit100) {
-        budget::report_blocked(app, &task);
+    if matches!(budget::enforce(app, task)?, budget::Threshold::Hit100) {
+        budget::report_blocked(app, task);
     }
-    let task = app.db.get_task(&task.id)?.unwrap_or(task);
+    let task = app.db.get_task(&task.id)?.unwrap_or_else(|| task.clone());
     if task.run_state_by == Some(Setter::Budget) {
         eprintln!(
             "plete: its budget paused it; `plete task resume {}` lets it run again",
@@ -997,6 +1046,70 @@ mod tests {
         app.db.insert_task(&task).unwrap();
         app.db.set_grants(&task.id, grants).unwrap();
         task
+    }
+
+    #[test]
+    fn a_budget_mode_is_set_inherited_overridden_and_cleared() {
+        let (_dir, app, root) = lab();
+        let m = add(&app, "m", TaskKind::Work, &root, &[]);
+        let w = add(&app, "w", TaskKind::Work, &m, &[]);
+        let g = add(&app, "g", TaskKind::Work, &w, &[]);
+        let mode = |t: &TaskRecord| {
+            let (mode, source) = budget::effective_mode(&app, t).unwrap();
+            (mode.as_str(), source)
+        };
+        assert_eq!(mode(&g), ("on", budget::Source::Global));
+        set_budget(&app, "m", None, Some("off")).unwrap();
+        assert_eq!(mode(&g), ("off", budget::Source::Task("m".into())));
+        // A grandchild with its own override wins, and only below it.
+        set_budget(&app, "w", None, Some("auto")).unwrap();
+        assert_eq!(mode(&g), ("auto", budget::Source::Task("w".into())));
+        assert_eq!(mode(&m).0, "off");
+        // `inherit` clears it.
+        set_budget(&app, "w", None, Some("inherit")).unwrap();
+        assert_eq!(mode(&g), ("off", budget::Source::Task("m".into())));
+        assert_eq!(app.db.budget("w-id").unwrap().unwrap().mode, None);
+        assert!(set_budget(&app, "w", None, Some("sometimes")).is_err());
+    }
+
+    #[test]
+    fn a_mode_and_a_change_are_made_together_and_neither_alone_changes_nothing() {
+        let (_dir, app, root) = lab();
+        add(&app, "m", TaskKind::Work, &root, &[]);
+        let change = budget::parse_change("=2h").unwrap();
+        set_budget(&app, "m", Some(change), Some("auto")).unwrap();
+        let row = app.db.budget("m-id").unwrap().unwrap();
+        assert_eq!(
+            (row.mode.as_deref(), row.max_secs, row.base_secs),
+            (Some("auto"), Some(7200), Some(7200))
+        );
+        // A mode alone leaves the limits.
+        set_budget(&app, "m", None, Some("off")).unwrap();
+        let row = app.db.budget("m-id").unwrap().unwrap();
+        assert_eq!(
+            (row.mode.as_deref(), row.max_secs),
+            (Some("off"), Some(7200))
+        );
+        // Neither: nothing changes.
+        set_budget(&app, "m", None, None).unwrap();
+        assert_eq!(app.db.budget("m-id").unwrap().unwrap(), row);
+    }
+
+    #[test]
+    fn a_task_cannot_change_its_own_mode_or_an_ancestors() {
+        let (_dir, app, root) = lab();
+        let m = add(&app, "m", TaskKind::Work, &root, &[]);
+        let w = add(&app, "w", TaskKind::Work, &m, &[]);
+        let g = add(&app, "g", TaskKind::Work, &w, &[]);
+        let as_w = Caller::Node(w.clone());
+        let mode_of = |id: &str| app.db.budget(id).unwrap().and_then(|r| r.mode);
+        for target in [&w, &m] {
+            let err = set_budget_for(&app, &as_w, target, None, Some("off")).unwrap_err();
+            assert!(err.to_string().contains("task budget"), "{err}");
+            assert_eq!(mode_of(&target.id), None);
+        }
+        set_budget_for(&app, &as_w, &g, None, Some("off")).unwrap();
+        assert_eq!(mode_of(&g.id).as_deref(), Some("off"));
     }
 
     /// `manager show --json` on a manager whose grant names what the

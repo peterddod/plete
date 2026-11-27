@@ -96,6 +96,10 @@ pub struct Settings {
     /// `default` for `[tasks] default_budget`, cut to what is left above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<String>,
+    /// How its budget is enforced unless `--budget-mode` names it: `on`,
+    /// `off` or `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_mode: Option<String>,
     /// How many active tasks it may keep under it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_children: Option<u32>,
@@ -214,6 +218,9 @@ fn check(s: &Settings) -> Result<()> {
     }
     if let Some(b) = s.budget.as_deref().filter(|b| *b != DEFAULT_BUDGET) {
         budget::parse_limits(b).map_err(|e| anyhow::anyhow!("budget: {e}"))?;
+    }
+    if let Some(mode) = &s.budget_mode {
+        budget::Mode::parse(mode).map_err(|e| anyhow::anyhow!("budget_mode: {e}"))?;
     }
     if s.max_children == Some(0) {
         bail!("max_children = 0 allows nothing; give at least 1");
@@ -437,6 +444,7 @@ description = "What a task started as {name} is for"
 # model = "sonnet"                 # the model its agent runs, over [models]
 # allow = ["task.create", "worktree.add"]   # its grant unless --allow names one
 # budget = "2h,40turns"            # what it may spend unless --budget names it
+# budget_mode = "auto"             # on, off or auto, unless --budget-mode names it
 # max_children = 4                 # active tasks it may keep under it
 # pr = "draft"                     # auto, draft or ask
 # skills = ["my-skill"]            # from this profile's skills/, the project's, or built-in
@@ -666,6 +674,8 @@ mod tests {
             "task.fly is not a capability",
         );
         refused("+++\nbudget = \"$5\"\n+++\n", "budget");
+        refused("+++\nbudget_mode = \"x\"\n+++\n", "budget_mode");
+        parse("+++\nbudget_mode = \"auto\"\n+++\n").unwrap();
         refused("+++\nmax_children = 0\n+++\n", "allows nothing");
         refused("+++\nskills = [\"../x\"]\n+++\n", "no skill's name");
         refused("+++\nenv = { PLETE_HOME = \"/x\" }\n+++\n", "plete's own");

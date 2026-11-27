@@ -650,6 +650,11 @@ pub struct Delegation {
     /// comma-separated, within what is left above it
     #[arg(long, value_delimiter = ',', value_parser = crate::manager::budget::parse_part)]
     pub budget: Vec<BudgetPart>,
+    /// How its budget is enforced, and below it unless a task there says
+    /// otherwise: on, off or auto (default: its parent's, else `[budget]
+    /// mode`)
+    #[arg(long, value_name = "MODE", value_parser = ["on", "off", "auto"])]
+    pub budget_mode: Option<String>,
     /// Started on the user's word: its done and questions notify the user
     /// at any depth (`[notify] events`). For the assistant; what the user
     /// makes at their own terminal is theirs already
@@ -744,12 +749,16 @@ pub enum TreeCommands {
 
     /// Change what a task under the assistant may spend: `+` raises it
     /// (+1h, +20turns), `=` sets it (=2h,40turns), within what is left
-    /// above it
+    /// above it; `--mode` sets how it is enforced
     Budget {
         #[arg(add = ArgValueCandidates::new(manager_candidates))]
         name: String,
         #[arg(value_parser = crate::manager::budget::parse_change)]
-        change: Change,
+        change: Option<Change>,
+        /// on, off or auto for it and the tasks below it; `inherit` clears
+        /// its own
+        #[arg(long, value_parser = ["on", "off", "auto", "inherit"])]
+        mode: Option<String>,
     },
 
     /// Pause a task under the assistant and everything below it: each
@@ -1094,6 +1103,59 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("plete").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn budget_mode_flags_take_only_their_values() {
+        let Some(Commands::Task {
+            command: TaskCommands::New { delegation, .. },
+        }) = parse(&["task", "new", "x", "--budget-mode", "auto"]).command
+        else {
+            panic!("expected task new");
+        };
+        assert_eq!(delegation.budget_mode.as_deref(), Some("auto"));
+        let Some(Commands::Task {
+            command: TaskCommands::Subtree(TreeCommands::Budget { change, mode, .. }),
+        }) = parse(&["task", "budget", "x", "--mode", "inherit"]).command
+        else {
+            panic!("expected task budget");
+        };
+        assert!(change.is_none());
+        assert_eq!(mode.as_deref(), Some("inherit"));
+        let Some(Commands::Task {
+            command: TaskCommands::Subtree(TreeCommands::Budget { change, mode, .. }),
+        }) = parse(&["task", "budget", "x", "+1h", "--mode", "off"]).command
+        else {
+            panic!("expected task budget");
+        };
+        assert!(change.is_some());
+        assert_eq!(mode.as_deref(), Some("off"));
+        let bad = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("plete").chain(args.iter().copied())).is_err()
+        };
+        assert!(bad(&["task", "new", "x", "--budget-mode", "inherit"]));
+        assert!(bad(&["task", "new", "x", "--budget-mode", "sometimes"]));
+        assert!(bad(&["task", "budget", "x", "--mode", "sometimes"]));
+    }
+
+    #[test]
+    fn clap_offers_the_budget_modes_as_completions() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let task = cmd.find_subcommand("task").unwrap();
+        let values = |sub: &str, arg: &str| -> Vec<String> {
+            task.find_subcommand(sub)
+                .unwrap()
+                .get_arguments()
+                .find(|a| a.get_id() == arg)
+                .unwrap()
+                .get_possible_values()
+                .iter()
+                .map(|v| v.get_name().to_string())
+                .collect()
+        };
+        assert_eq!(values("new", "budget_mode"), ["on", "off", "auto"]);
+        assert_eq!(values("budget", "mode"), ["on", "off", "auto", "inherit"]);
     }
 
     #[test]
