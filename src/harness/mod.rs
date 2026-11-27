@@ -136,6 +136,12 @@ pub trait Harness: Sync {
         None
     }
 
+    /// Whether [`Harness::fork_args`] and [`Harness::seed_session`] work, so
+    /// a start may fork.
+    fn can_fork(&self) -> bool {
+        false
+    }
+
     /// Arguments that start a new session `new_id` as a fork of recorded
     /// session `base_id`, named `name`: it begins with the base's history,
     /// and the base is left as it was. The base's transcript must already be

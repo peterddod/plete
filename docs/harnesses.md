@@ -22,7 +22,8 @@ plete does without that feature:
 | `tested_version` | the latest version you tested; older ones get a warning | no version check |
 | `new_session_args(id, name)` | starts a session under an id plete picks | no recorded sessions, no resume, no assistant |
 | `resume_args(id)` | resumes a recorded session | as above |
-| `fork_args(base, id, name)` | starts a new session `id` as a fork of recorded session `base` (Claude Code: `--resume <base> --fork-session --session-id <id> -n <name>`), for a task with a fork base on its first start; plete records `id` before launch, never `base`, and every later start resumes `id` | the task starts a cold new session |
+| `can_fork` | whether `fork_args` and `seed_session` work; plete forks only when it is true | `false`: a task with a fork base starts a cold session |
+| `fork_args(base, id, name)` | starts a new session `id` as a fork of recorded session `base` (Claude Code: `--resume <base> --fork-session --session-id <id> -n <name>`), for a task with a fork base on its first start; plete records `id` before launch, never `base`, and every later start resumes `id` | as `can_fork` |
 | `seed_session(from, to, id)` | copies the one session `id` from where the agent keeps those started in `from` to where it looks for those started in `to` (which must exist), skipping one already there, so a fork started in `to` finds its base | nothing is copied (a harness with `fork_args` needs it) |
 | `transcript_info(dir, id)` | the size of a session's last input in tokens and the files it read, from the agent's own record | the warm-up build cannot size or list what a base read |
 | `headless_args(prompt, opts)` | runs one prompt to completion with nobody at the terminal, within `max_turns` and the tools allowed and denied | a profile with `[warmup]` cannot be built |

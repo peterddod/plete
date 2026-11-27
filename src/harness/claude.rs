@@ -291,8 +291,13 @@ impl Harness for ClaudeCode {
     }
 
     /// `to` must exist: Claude names the store by its real path. A session
-    /// already at `to` is left alone.
+    /// already at `to` is left alone. Copied under a temporary name and
+    /// renamed, so a crash leaves no truncated transcript for the next call
+    /// to take as seeded.
     fn seed_session(&self, from: &Path, to: &Path, id: &str) -> Result<()> {
+        if !single_component(id) {
+            bail!("{id:?} is not a session id");
+        }
         let (Some(source), Some(dest)) = (session_dir(from), session_dir(to)) else {
             bail!("could not locate the Claude Code config directory");
         };
@@ -302,13 +307,28 @@ impl Harness for ClaudeCode {
             return Ok(());
         }
         std::fs::create_dir_all(&dest).with_context(|| format!("create {}", dest.display()))?;
-        std::fs::copy(source.join(&name), &target).with_context(|| format!("copy session {id}"))?;
-        Ok(())
+        let partial = dest.join(format!(".{name}.{}.part", std::process::id()));
+        let copied = std::fs::copy(source.join(&name), &partial)
+            .with_context(|| format!("copy session {id}"))
+            .and_then(|_| {
+                std::fs::rename(&partial, &target).with_context(|| format!("place session {id}"))
+            });
+        if copied.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        copied
+    }
+
+    fn can_fork(&self) -> bool {
+        true
     }
 
     fn transcript_info(&self, dir: &Path, id: &str) -> Option<Transcript> {
+        if !single_component(id) {
+            return None;
+        }
         let path = session_dir(dir)?.join(format!("{id}.jsonl"));
-        transcript_info(&path, dir).ok()
+        transcript_info(&path, dir)
     }
 
     fn last_messages(&self, dir: &Path, id: &str, n: usize) -> Option<Result<LastTurn>> {
@@ -656,6 +676,11 @@ pub(crate) fn project_slug(root: &Path) -> String {
         .collect()
 }
 
+/// Whether `id` names one file in a directory: not empty, `.`, `..` or a path.
+fn single_component(id: &str) -> bool {
+    !id.contains(['/', '\\', '\0']) && !matches!(id, "" | "." | "..")
+}
+
 /// Where Claude Code keeps the transcripts of sessions started in `root`.
 fn session_dir(root: &Path) -> Option<PathBuf> {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -701,14 +726,17 @@ fn sessions(root: &Path) -> Result<Vec<AgentSession>> {
 /// separate records sharing one `usage`, so the last record's is the last
 /// reply's. Subagents' records are not the session's own.
 #[allow(dead_code)] // called by the warm-up build, a later step
-fn transcript_info(path: &Path, dir: &Path) -> Result<Transcript> {
-    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+fn transcript_info(path: &Path, dir: &Path) -> Option<Transcript> {
+    let file = std::fs::File::open(path).ok()?;
     let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let mut last_input_tokens = 0;
+    let mut last_input_tokens = None;
     let mut files_read: Vec<String> = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line.with_context(|| format!("read {}", path.display()))?;
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+    // Split as bytes: a line that is not UTF-8 is skipped, not fatal.
+    for line in BufReader::new(file).split(b'\n') {
+        let Ok(line) = line else {
+            break;
+        };
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
         if record["isSidechain"] == true || record["type"] != "assistant" {
@@ -716,15 +744,16 @@ fn transcript_info(path: &Path, dir: &Path) -> Result<Transcript> {
         }
         let message = &record["message"];
         let usage = &message["usage"];
-        if usage.is_object() {
-            last_input_tokens = [
-                "input_tokens",
-                "cache_read_input_tokens",
-                "cache_creation_input_tokens",
-            ]
-            .iter()
-            .filter_map(|k| usage[*k].as_u64())
-            .sum();
+        let counted: Vec<u64> = [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .filter_map(|k| usage[*k].as_u64())
+        .collect();
+        if !counted.is_empty() {
+            last_input_tokens = Some(counted.iter().sum());
         }
         let Some(blocks) = message["content"].as_array() else {
             continue;
@@ -748,8 +777,8 @@ fn transcript_info(path: &Path, dir: &Path) -> Result<Transcript> {
             }
         }
     }
-    Ok(Transcript {
-        last_input_tokens,
+    Some(Transcript {
+        last_input_tokens: last_input_tokens?,
         files_read,
     })
 }
@@ -1647,6 +1676,133 @@ mod tests {
     }
 
     #[test]
+    fn headless_args_deny_tools_and_leave_out_empty_lists() {
+        let deny = vec!["Bash(git push:*)".to_string(), "Edit".to_string()];
+        let opts = Headless {
+            max_turns: 5,
+            allow: &[],
+            deny: &deny,
+        };
+        assert_eq!(
+            ClaudeCode.headless_args("x", &opts).unwrap(),
+            [
+                "-p",
+                "x",
+                "--max-turns",
+                "5",
+                "--disallowedTools",
+                "Bash(git push:*),Edit"
+            ]
+        );
+        let none = Headless {
+            max_turns: 1,
+            ..Headless::default()
+        };
+        assert_eq!(
+            ClaudeCode.headless_args("x", &none).unwrap(),
+            ["-p", "x", "--max-turns", "1"]
+        );
+    }
+
+    #[test]
+    fn only_a_single_file_name_is_a_session_id() {
+        with_config_dir(|_| {
+            let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            for id in ["", ".", "..", "../x", "a/b", "/abs", "a\\b"] {
+                assert!(
+                    ClaudeCode.seed_session(from.path(), to.path(), id).is_err(),
+                    "{id:?}"
+                );
+                assert!(
+                    ClaudeCode.transcript_info(from.path(), id).is_none(),
+                    "{id:?}"
+                );
+            }
+            assert!(!session_dir(to.path()).unwrap().exists());
+        });
+    }
+
+    #[test]
+    fn a_failed_seed_leaves_no_partial_file_behind() {
+        with_config_dir(|_| {
+            let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            assert!(ClaudeCode
+                .seed_session(from.path(), to.path(), "gone")
+                .is_err());
+            let dest = session_dir(to.path()).unwrap();
+            assert_eq!(std::fs::read_dir(dest).unwrap().count(), 0);
+            assert!(!ClaudeCode.has_session(to.path(), "gone"));
+        });
+    }
+
+    /// A transcript in a fresh store for a directory, from `lines` written
+    /// as given.
+    fn transcript_of(dir: &Path, lines: &[Vec<u8>]) {
+        let store = session_dir(dir).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("s.jsonl"), lines.join(&b'\n')).unwrap();
+    }
+
+    fn line(value: serde_json::Value) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    #[test]
+    fn a_reply_with_no_counted_usage_does_not_reset_the_last_input_size() {
+        with_config_dir(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let reply = |usage: serde_json::Value| {
+                line(serde_json::json!({"type":"assistant","message":{"usage":usage,"content":[]}}))
+            };
+            transcript_of(
+                dir.path(),
+                &[
+                    reply(serde_json::json!({"input_tokens": 7, "cache_read_input_tokens": 90})),
+                    reply(serde_json::json!({"output_tokens": 3})),
+                    reply(serde_json::json!({})),
+                ],
+            );
+            let info = ClaudeCode.transcript_info(dir.path(), "s").unwrap();
+            assert_eq!(info.last_input_tokens, 97);
+        });
+    }
+
+    #[test]
+    fn a_transcript_with_no_usage_has_no_info() {
+        with_config_dir(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            transcript_of(
+                dir.path(),
+                &[
+                    line(serde_json::json!({"type":"user","message":{"content":"hi"}})),
+                    line(serde_json::json!({"type":"assistant","message":{"content":[]}})),
+                ],
+            );
+            assert!(ClaudeCode.transcript_info(dir.path(), "s").is_none());
+        });
+    }
+
+    #[test]
+    fn unreadable_lines_are_skipped_not_fatal() {
+        with_config_dir(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            transcript_of(
+                dir.path(),
+                &[
+                    vec![0xff, 0xfe, b'{', 0x80],
+                    b"not json".to_vec(),
+                    line(serde_json::json!({"type":"assistant","message":{
+                        "usage":{"input_tokens": 12},
+                        "content":[{"type":"tool_use","name":"Read","input":{"file_path":"/x/y"}}]}})),
+                ],
+            );
+            let info = ClaudeCode.transcript_info(dir.path(), "s").unwrap();
+            assert_eq!(info.last_input_tokens, 12);
+            assert_eq!(info.files_read, ["/x/y"]);
+        });
+    }
+
+    #[test]
     fn a_session_is_seeded_into_another_directorys_store_once() {
         with_config_dir(|config| {
             let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -1728,33 +1884,43 @@ mod tests {
     #[ignore]
     fn a_fork_started_in_another_cwd_finds_its_seeded_base() {
         let bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-        let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (base, new) = (
-            uuid::Uuid::new_v4().to_string(),
-            uuid::Uuid::new_v4().to_string(),
-        );
-        let run = |dir: &Path, args: Vec<String>| {
-            std::process::Command::new(&bin)
-                .current_dir(dir)
-                .args(["-p", "reply with ok"])
-                .args(args)
-                .output()
-                .unwrap()
-        };
-        let out = run(
-            from.path(),
-            ClaudeCode.new_session_args(&base, "base").unwrap(),
-        );
-        assert!(out.status.success(), "{out:?}");
-        ClaudeCode
-            .seed_session(from.path(), to.path(), &base)
-            .unwrap();
-        let out = run(
-            to.path(),
-            ClaudeCode.fork_args(&base, &new, "fork").unwrap(),
-        );
-        assert!(out.status.success(), "{out:?}");
-        assert!(ClaudeCode.has_session(to.path(), &new));
-        assert!(!ClaudeCode.has_session(from.path(), &new));
+        // A temp config directory, so the real one is never written to.
+        with_config_dir(|_| {
+            let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (base, new) = (
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+            );
+            let run = |dir: &Path, args: Vec<String>| {
+                std::process::Command::new(&bin)
+                    .current_dir(dir)
+                    .args(["-p", "reply with ok"])
+                    .args(args)
+                    .output()
+                    .unwrap()
+            };
+            let out = run(
+                from.path(),
+                ClaudeCode.new_session_args(&base, "base").unwrap(),
+            );
+            assert!(out.status.success(), "{out:?}");
+            let base_file = format!("{base}.jsonl");
+            let original = session_dir(from.path()).unwrap().join(&base_file);
+            let before = std::fs::read(&original).unwrap();
+            ClaudeCode
+                .seed_session(from.path(), to.path(), &base)
+                .unwrap();
+            let out = run(
+                to.path(),
+                ClaudeCode.fork_args(&base, &new, "fork").unwrap(),
+            );
+            assert!(out.status.success(), "{out:?}");
+            assert!(ClaudeCode.has_session(to.path(), &new));
+            assert!(!ClaudeCode.has_session(from.path(), &new));
+            // The fork wrote to neither copy of the base.
+            assert_eq!(before, std::fs::read(&original).unwrap());
+            let seeded = session_dir(to.path()).unwrap().join(&base_file);
+            assert_eq!(before, std::fs::read(seeded).unwrap());
+        });
     }
 }

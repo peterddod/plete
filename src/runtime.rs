@@ -594,12 +594,18 @@ fn launch_argv(
         return Ok((argv, None));
     }
 
-    let (id, start) = pick_session(launch, session)?;
-    // A fork looks for its base where its own transcripts are kept.
+    let (id, mut start) = pick_session(launch, session)?;
+    // A fork looks for its base where its own transcripts are kept. A base
+    // that cannot be seeded (pruned, say) is a broken cache, which never
+    // keeps a task from starting: it starts cold.
     if let Start::Fork(base, from) = &start {
-        spec.harness
-            .seed_session(from, &launch.dir, base)
-            .with_context(|| format!("seed session {base} for {}", launch.subject))?;
+        if let Err(e) = spec.harness.seed_session(from, &launch.dir, base) {
+            eprintln!(
+                "warning: could not fork {}'s warm-up session {base}, starting cold ({e:#})",
+                launch.subject
+            );
+            start = Start::New;
+        }
     }
     // Recorded before launch, so the session is known even if the agent
     // never gets as far as its first hook. A fork's base never is.
@@ -659,7 +665,7 @@ fn pick_session(launch: &Launch, session: Option<&str>) -> Result<(String, Start
                 let fork = launch
                     .fork_base
                     .as_ref()
-                    .filter(|_| spec.harness.fork_args("", "", "").is_some());
+                    .filter(|_| spec.harness.can_fork());
                 let start = match fork {
                     Some((base, from)) => Start::Fork(base.clone(), from.clone()),
                     None => Start::New,
@@ -1737,8 +1743,12 @@ mod tests {
     /// A harness that keeps sessions in memory, and forks them when `fork`.
     struct Fake {
         fork: bool,
+        /// Seeding fails, as for a base that was pruned.
+        seed_fails: bool,
         have: std::sync::Mutex<Vec<String>>,
         seeded: std::sync::Mutex<Vec<(PathBuf, PathBuf, String)>>,
+        /// `seed` and `record`, in the order they happened.
+        events: std::sync::Mutex<Vec<&'static str>>,
     }
 
     impl Harness for Fake {
@@ -1757,6 +1767,9 @@ mod tests {
         fn resume_args(&self, id: &str) -> Option<Vec<String>> {
             Some(vec!["--resume".into(), id.into()])
         }
+        fn can_fork(&self) -> bool {
+            self.fork
+        }
         fn fork_args(&self, base: &str, id: &str, name: &str) -> Option<Vec<String>> {
             self.fork
                 .then(|| ["--fork", base, id, name].map(String::from).to_vec())
@@ -1765,6 +1778,10 @@ mod tests {
             self.have.lock().unwrap().iter().any(|s| s == id)
         }
         fn seed_session(&self, from: &Path, to: &Path, id: &str) -> Result<()> {
+            self.events.lock().unwrap().push("seed");
+            if self.seed_fails {
+                bail!("no transcript for {id}");
+            }
             self.seeded
                 .lock()
                 .unwrap()
@@ -1773,11 +1790,23 @@ mod tests {
         }
     }
 
+    fn fake_failing_to_seed() -> &'static Fake {
+        Box::leak(Box::new(Fake {
+            fork: true,
+            seed_fails: true,
+            have: Default::default(),
+            seeded: Default::default(),
+            events: Default::default(),
+        }))
+    }
+
     fn fake(fork: bool) -> &'static Fake {
         Box::leak(Box::new(Fake {
             fork,
+            seed_fails: false,
             have: Default::default(),
             seeded: Default::default(),
+            events: Default::default(),
         }))
     }
 
@@ -1819,7 +1848,12 @@ mod tests {
     }
 
     /// `launch_argv` for `launch`, with what was recorded and when.
-    fn argv_of(home: &Path, launch: &Launch, session: Option<&str>) -> (Vec<String>, Vec<String>) {
+    fn argv_of(
+        home: &Path,
+        harness: &Fake,
+        launch: &Launch,
+        session: Option<&str>,
+    ) -> (Vec<String>, Vec<String>) {
         let app = App {
             config: crate::config::load_or_create(home).unwrap(),
             db: crate::db::Database::open(&crate::config::index_path(home)).unwrap(),
@@ -1828,6 +1862,7 @@ mod tests {
         };
         let mut recorded = Vec::new();
         let (argv, id) = launch_argv(&app, launch, session, None, |id| {
+            harness.events.lock().unwrap().push("record");
             recorded.push(id.to_string());
             Ok(())
         })
@@ -1841,12 +1876,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let harness = fake(true);
         let launch = launch_for(harness, &[], Some(("base-1", "/warm/work")));
-        let (argv, recorded) = argv_of(home.path(), &launch, None);
+        let (argv, recorded) = argv_of(home.path(), harness, &launch, None);
         assert_eq!(recorded.len(), 1);
         let new = &recorded[0];
         assert_ne!(new, "base-1");
         assert_eq!(&argv[1..5], ["--fork", "base-1", new.as_str(), "t one"]);
         assert!(!recorded.iter().any(|id| id == "base-1"));
+        // Seeded before the session is recorded.
+        assert_eq!(*harness.events.lock().unwrap(), ["seed", "record"]);
         assert_eq!(
             *harness.seeded.lock().unwrap(),
             [(
@@ -1862,14 +1899,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let harness = fake(true);
         let first = launch_for(harness, &[], Some(("base-1", "/warm/work")));
-        let (_, recorded) = argv_of(home.path(), &first, None);
+        let (_, recorded) = argv_of(home.path(), harness, &first, None);
         let new = recorded[0].clone();
         harness.have.lock().unwrap().push(new.clone());
         harness.seeded.lock().unwrap().clear();
 
         // The next start knows the session plete recorded, fork base or not.
         let second = launch_for(harness, &[&new], Some(("base-1", "/warm/work")));
-        let (argv, recorded) = argv_of(home.path(), &second, Some(&new));
+        let (argv, recorded) = argv_of(home.path(), harness, &second, Some(&new));
         assert_eq!(&argv[1..], ["--resume", new.as_str()]);
         assert_eq!(recorded, [new]);
         assert!(!argv.iter().any(|a| a == "--fork" || a == "base-1"));
@@ -1881,14 +1918,26 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let harness = fake(true);
         let launch = launch_for(harness, &[], None);
-        let (argv, recorded) = argv_of(home.path(), &launch, None);
+        let (argv, recorded) = argv_of(home.path(), harness, &launch, None);
         assert_eq!(&argv[1..], ["--new", recorded[0].as_str(), "t one"]);
         assert!(harness.seeded.lock().unwrap().is_empty());
 
         harness.have.lock().unwrap().push("s1".into());
         let launch = launch_for(harness, &["s1"], None);
-        let (argv, _) = argv_of(home.path(), &launch, Some("s1"));
+        let (argv, _) = argv_of(home.path(), harness, &launch, Some("s1"));
         assert_eq!(&argv[1..], ["--resume", "s1"]);
+    }
+
+    #[test]
+    fn a_base_that_cannot_be_seeded_starts_cold_and_records_only_the_new_session() {
+        let home = tempfile::tempdir().unwrap();
+        let harness = fake_failing_to_seed();
+        let launch = launch_for(harness, &[], Some(("base-1", "/warm/work")));
+        let (argv, recorded) = argv_of(home.path(), harness, &launch, None);
+        assert_eq!(recorded.len(), 1);
+        assert_ne!(recorded[0], "base-1");
+        assert_eq!(&argv[1..], ["--new", recorded[0].as_str(), "t one"]);
+        assert!(!argv.iter().any(|a| a == "--fork" || a == "base-1"));
     }
 
     #[test]
@@ -1896,7 +1945,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let harness = fake(false);
         let launch = launch_for(harness, &[], Some(("base-1", "/warm/work")));
-        let (argv, recorded) = argv_of(home.path(), &launch, None);
+        let (argv, recorded) = argv_of(home.path(), harness, &launch, None);
         assert_eq!(&argv[1..], ["--new", recorded[0].as_str(), "t one"]);
         assert!(harness.seeded.lock().unwrap().is_empty());
     }
