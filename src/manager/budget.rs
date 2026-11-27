@@ -39,7 +39,6 @@ pub enum Change {
 
 /// How a node's budget is enforced: `on` as always, `off` inert, `auto`
 /// asking a classifier at a crossing.
-#[allow(dead_code)] // read by the override surfaces and enforcement that follow
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     On,
@@ -47,7 +46,6 @@ pub enum Mode {
     Auto,
 }
 
-#[allow(dead_code)] // read by the override surfaces and enforcement that follow
 impl Mode {
     pub fn parse(s: &str) -> Result<Mode, String> {
         match s {
@@ -68,7 +66,6 @@ impl Mode {
 }
 
 /// Where an effective mode comes from.
-#[allow(dead_code)] // read by the override surfaces and enforcement that follow
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// `[budget] mode`, or `on` when unset.
@@ -80,7 +77,6 @@ pub enum Source {
 /// `task`'s budget mode: its own override, else the nearest ancestor's, else
 /// `[budget] mode`, else `on`. An unknown value, stored or configured, is an
 /// error naming where it is.
-#[allow(dead_code)] // read by the override surfaces and enforcement that follow
 pub fn effective_mode(app: &App, task: &TaskRecord) -> Result<(Mode, Source)> {
     let mut chain = vec![task.clone()];
     chain.extend(app.db.ancestors(&task.id)?);
@@ -217,10 +213,58 @@ pub fn changed(had: Limits, change: Change) -> Result<Limits> {
     }
 }
 
+/// `task`'s effective mode as it is acted on. A value that cannot be read
+/// is warned of and taken as `on`: a typo must not stop a task being held.
+pub fn mode_or_on(app: &App, task: &TaskRecord) -> Mode {
+    effective_mode(app, task).map_or_else(
+        |e| {
+            warn_once(format!("plete: {e:#}; budgets are enforced as `on`"));
+            Mode::On
+        },
+        |(mode, _)| mode,
+    )
+}
+
+/// Say `warning` on stderr once per process: a long-lived process reads a
+/// bad mode on every charge.
+fn warn_once(warning: String) {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.contains(&warning) {
+        eprintln!("{warning}");
+        said.push(warning);
+    }
+}
+
+/// `[budget] mode` alone, as a review sees it: it has no task to carry an
+/// override. Unreadable, it is `on`, as in [`mode_or_on`].
+pub fn global_off(app: &App) -> bool {
+    global_mode(app) == Mode::Off
+}
+
+fn global_mode(app: &App) -> Mode {
+    app.config.budget_policy().map_or_else(
+        |e| {
+            warn_once(format!("plete: {e:#}; budgets are enforced as `on`"));
+            Mode::On
+        },
+        |policy| policy.mode,
+    )
+}
+
+/// What a command that has just set a limit on `task` says, if its mode is
+/// `off`: the limit is recorded and not enforced. The command prints it,
+/// once.
+pub fn limit_note(app: &App, task: &TaskRecord) -> Option<&'static str> {
+    (mode_or_on(app, task) == Mode::Off)
+        .then_some("plete: budget mode is off; the limit is recorded and not enforced")
+}
+
 /// What is left to spend under `under` (M19): for each unit, the least,
 /// over it and each ancestor with a limit, of that limit less what its
 /// subtree has used, never below 0. `None` where nothing above limits that
-/// unit; the assistant has no budget of its own.
+/// unit; the assistant has no budget of its own. A row whose owner's mode is
+/// `off` is inert and limits nothing.
 pub fn remaining(app: &App, under: &TaskRecord) -> Result<Limits> {
     let mut left = Limits::default();
     let mut chain = vec![under.clone()];
@@ -230,6 +274,9 @@ pub fn remaining(app: &App, under: &TaskRecord) -> Result<Limits> {
             continue;
         };
         if row.max_secs.is_none() && row.max_turns.is_none() {
+            continue;
+        }
+        if mode_or_on(app, &node) == Mode::Off {
             continue;
         }
         let (secs, turns) = app.db.subtree_used(&node.id)?;
@@ -245,7 +292,8 @@ pub fn remaining(app: &App, under: &TaskRecord) -> Result<Limits> {
 /// has left itself. No limit in a unit is always allowed: the ones above
 /// still apply. Nor is a unit kept as it was, or lowered, checked: what
 /// siblings spent may leave less above than a limit given before, and
-/// that must not hold back a change to the other unit, or a cut.
+/// that must not hold back a change to the other unit, or a cut. A target
+/// whose mode is `off` has its limits unchecked.
 pub fn cap(
     app: &App,
     target: &TaskRecord,
@@ -253,6 +301,9 @@ pub fn cap(
     had: Limits,
     want: Limits,
 ) -> Result<Limits> {
+    if mode_or_on(app, target) == Mode::Off {
+        return Ok(want);
+    }
     let parent = match &target.parent_id {
         Some(id) => app.db.get_task(id)?,
         None => None,
@@ -337,6 +388,11 @@ pub fn enforce(app: &App, node: &TaskRecord) -> Result<Threshold> {
     let held_before = super::run::hold(app, node)?.is_some();
     let mut crossed = Threshold::None;
     for task in &counted_toward(app, node)? {
+        // A row is held to its owner's mode: `off` is inert, though what
+        // the node used is still charged to it.
+        if mode_or_on(app, task) == Mode::Off {
+            continue;
+        }
         // Read, paused and claimed in one go: a limit changed meanwhile is
         // checked as it now is, and only one of two checks at once tells.
         let check = app
@@ -409,6 +465,11 @@ fn counted_toward(app: &App, node: &TaskRecord) -> Result<Vec<TaskRecord>> {
 /// it is blocked ([`report_blocked_review`]), `Warn80` when an 80% was
 /// newly crossed, else `None`.
 pub fn enforce_review(app: &App, review: &ReviewRecord) -> Result<Threshold> {
+    // `off` turns off all budgeting, a review's caps too. Only the global
+    // mode: a review has no task to carry an override.
+    if global_off(app) {
+        return Ok(Threshold::None);
+    }
     let check = app
         .db
         .check_review_budget(&review.id, |row, used| match percent(row, used) {
@@ -498,6 +559,9 @@ fn blocked_body(app: &App, node: &TaskRecord) -> Result<String> {
         let Some(row) = app.db.budget(&task.id)? else {
             continue;
         };
+        if mode_or_on(app, task) == Mode::Off {
+            continue;
+        }
         let used = app.db.subtree_used(&task.id)?;
         if percent(&row, used).is_some_and(|pct| pct >= 100) {
             whose = match task.id == node.id {
@@ -868,8 +932,13 @@ mod tests {
     /// A review the assistant asked for, with `[review]`'s turns capped.
     fn add_review(app: &App, turns: i64) -> ReviewRecord {
         let root = super::super::root(app).unwrap();
+        add_review_by(app, turns, &root.id)
+    }
+
+    /// A review of `turns` turns asked for by task `by`.
+    fn add_review_by(app: &App, turns: i64, by: &str) -> ReviewRecord {
         let mut r = ReviewRecord::new("r".into(), "r".into(), "github.com/acme/api", 7, 0);
-        r.requested_by = Some(root.id);
+        r.requested_by = Some(by.into());
         app.db.insert_review(&r).unwrap();
         std::fs::create_dir_all(review::dir(app, &r)).unwrap();
         app.db
@@ -912,6 +981,156 @@ mod tests {
             told[0].body.starts_with("budget used up (5 of 5turns)"),
             "{told:?}"
         );
+    }
+
+    #[test]
+    fn an_off_row_is_charged_but_never_warns_pauses_reports_or_notifies() {
+        let (_dir, app) = lab();
+        app.db.set_budget_mode("w", Some("off")).unwrap();
+        app.db.set_budget_max("w", None, Some(10)).unwrap();
+        let w = get(&app, "w");
+        // `Hit100` is all that has a caller report a task blocked
+        // (`report_blocked`): past its limit, an off row never returns it.
+        for turns in [8, 2, 5] {
+            app.db.charge("w", 0, turns).unwrap();
+            let at = enforce(&app, &w).unwrap();
+            assert_eq!(at, Threshold::None);
+            assert_ne!(at, Threshold::Hit100);
+        }
+        assert_eq!(get(&app, "w").run_state, RunState::Run);
+        assert!(budget_reports(&app, "w").is_empty());
+        assert!(budget_reports(&app, "m").is_empty());
+        assert!(inbox(&app, "w").is_empty());
+        assert!(crate::notify::queued(&app.home).is_empty());
+        let row = app.db.budget("w").unwrap().unwrap();
+        assert_eq!((row.used_turns, row.warned), (15, 0));
+        assert_eq!(app.db.subtree_used("m").unwrap(), (0, 15));
+    }
+
+    #[test]
+    fn a_node_off_under_an_on_parent_still_counts_toward_and_is_held_by_the_parent() {
+        let (_dir, app) = lab();
+        app.db.set_budget_max("m", None, Some(10)).unwrap();
+        app.db.set_budget_mode("w", Some("off")).unwrap();
+        app.db.set_budget_max("w", None, Some(5)).unwrap();
+        app.db.charge("w", 0, 10).unwrap();
+        let w = get(&app, "w");
+        assert_eq!(enforce(&app, &w).unwrap(), Threshold::Hit100);
+        // The parent's row crossed and paused the parent; w's own is inert.
+        let m = get(&app, "m");
+        assert_eq!(
+            (m.run_state, m.run_state_by),
+            (RunState::Paused, Some(Setter::Budget))
+        );
+        assert_eq!(get(&app, "w").run_state, RunState::Run);
+        assert_eq!(app.db.budget("w").unwrap().unwrap().warned, 0);
+        assert_eq!(app.db.budget("m").unwrap().unwrap().warned, 100);
+        // The report names the parent's row, not w's inert one.
+        report_blocked(&app, &w);
+        let told = budget_reports(&app, "w");
+        assert!(told[0].contains("under task m (10 of 10turns)"), "{told:?}");
+    }
+
+    #[test]
+    fn an_off_ancestors_limit_binds_nothing_below_it() {
+        let (_dir, app) = lab();
+        app.db.set_budget_max("m", Some(3600), None).unwrap();
+        let (m, w) = (get(&app, "m"), get(&app, "w"));
+        let want = |b: &str| parse_limits(b).unwrap();
+        let none = Limits::default();
+        assert!(cap(&app, &w, &Caller::Root, none, want("2h")).is_err());
+        assert_eq!(remaining(&app, &m).unwrap(), want("1h"));
+        app.db.set_budget_mode("m", Some("off")).unwrap();
+        assert_eq!(remaining(&app, &m).unwrap(), Limits::default());
+        assert_eq!(remaining(&app, &w).unwrap(), Limits::default());
+        assert_eq!(
+            cap(&app, &w, &Caller::Root, none, want("2h")).unwrap(),
+            want("2h")
+        );
+        // An `on` row set under it by a user still binds.
+        app.db.set_budget_mode("w", Some("on")).unwrap();
+        app.db.set_budget_max("w", Some(1800), None).unwrap();
+        assert_eq!(remaining(&app, &w).unwrap(), want("30m"));
+    }
+
+    #[test]
+    fn the_off_note_is_said_only_while_the_mode_is_off() {
+        let (_dir, mut app) = lab();
+        let w = get(&app, "w");
+        assert_eq!(limit_note(&app, &w), None);
+        app.db.set_budget_mode("m", Some("off")).unwrap();
+        assert_eq!(
+            limit_note(&app, &w),
+            Some("plete: budget mode is off; the limit is recorded and not enforced")
+        );
+        app.db.set_budget_mode("w", Some("auto")).unwrap();
+        assert_eq!(limit_note(&app, &w), None);
+        app.db.set_budget_mode("w", None).unwrap();
+        app.db.set_budget_mode("m", None).unwrap();
+        app.config.budget.mode = Some("off".into());
+        assert!(limit_note(&app, &w).is_some());
+    }
+
+    #[test]
+    fn a_target_that_is_off_may_have_more_than_is_left() {
+        let (_dir, app) = lab();
+        app.db.set_budget_max("m", Some(3600), None).unwrap();
+        let w = get(&app, "w");
+        let want = parse_limits("5h").unwrap();
+        assert!(cap(&app, &w, &Caller::Root, Limits::default(), want).is_err());
+        app.db.set_budget_mode("w", Some("off")).unwrap();
+        assert_eq!(
+            cap(&app, &w, &Caller::Root, Limits::default(), want).unwrap(),
+            want
+        );
+    }
+
+    #[test]
+    fn off_reads_the_global_mode_only_for_a_reviews_caps() {
+        let (_dir, mut app) = lab();
+        // Asked for by task m, which is the one whose mode could matter.
+        add_review_by(&app, 5, "m");
+        app.db.charge_review("r", 0, 5).unwrap();
+        let hold = |app: &App| {
+            let r = app.db.get_review("r").unwrap().unwrap();
+            enforce_review(app, &r).unwrap()
+        };
+        let paused = |app: &App| app.db.get_review("r").unwrap().unwrap().paused;
+        let stuck = |app: &App| crate::notify::queued(&app.home).len();
+        // Asked again: its caps are given afresh and the pause lifted.
+        let rerun = |app: &App| {
+            app.db.set_review_budget_max("r", None, Some(50)).unwrap();
+            assert!(app.db.resume_review("r", false).unwrap());
+            app.db.set_review_budget_max("r", None, Some(5)).unwrap();
+        };
+
+        // m's own `off` is not the review's: with `[budget] mode` on, it
+        // is held at 100% and the user told it is stuck.
+        app.db.set_budget_mode("m", Some("off")).unwrap();
+        app.config.budget.mode = Some("on".into());
+        assert_eq!(hold(&app), Threshold::Hit100);
+        assert!(paused(&app));
+        assert_eq!(stuck(&app), 1);
+        rerun(&app);
+
+        // Global `off` turns it off, whatever m says: nothing is held,
+        // told or recorded.
+        app.db.set_budget_mode("m", Some("on")).unwrap();
+        app.config.budget.mode = Some("off".into());
+        assert_eq!(hold(&app), Threshold::None);
+        assert!(!paused(&app));
+        assert_eq!(app.db.get_review("r").unwrap().unwrap().warned, 0);
+        assert_eq!(stuck(&app), 1, "no new notification");
+        assert!(app.db.reports_for("r", 10).unwrap().is_empty());
+
+        // `auto` leaves review caps as in `on`.
+        for mode in ["auto", "on"] {
+            app.config.budget.mode = Some(mode.into());
+            app.db.set_review_budget_max("r", None, Some(5)).unwrap();
+            assert_eq!(hold(&app), Threshold::Hit100, "{mode}");
+            assert!(paused(&app), "{mode}");
+            rerun(&app);
+        }
     }
 
     #[test]

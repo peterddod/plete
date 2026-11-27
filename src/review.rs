@@ -1386,7 +1386,8 @@ fn give_budget(app: &App, review: &ReviewRecord) -> Result<()> {
         more(review.used_secs, caps.secs),
         more(review.used_turns, caps.turns),
     )?;
-    app.db.resume_review(&review.id)?;
+    app.db
+        .resume_review(&review.id, crate::manager::budget::global_off(app))?;
     Ok(())
 }
 
@@ -2982,6 +2983,30 @@ mod tests {
         assert_eq!((r.max_secs, r.max_turns), (Some(7200), Some(23)));
         assert_eq!(r.warned, 0);
         assert!(!r.paused);
+    }
+
+    /// `off` turns the review's caps off, but they are still given and still
+    /// validated: a bad `[review] time` is refused as under `on`.
+    #[cfg(unix)]
+    #[test]
+    fn review_caps_are_recorded_and_validated_while_budgets_are_off() {
+        let home = tempfile::tempdir().unwrap();
+        let mut app = test_app(home.path());
+        app.config.budget.mode = Some("off".into());
+        let get = || app.db.get_review("t").unwrap().unwrap();
+        give_budget(&app, &get()).unwrap();
+        assert_eq!((get().max_secs, get().max_turns), (Some(3600), Some(20)));
+        // Charged to its caps, charged and not held.
+        app.db.charge_review("t", 3600, 20).unwrap();
+        let held = crate::manager::budget::enforce_review(&app, &get()).unwrap();
+        assert_eq!(held, crate::manager::budget::Threshold::None);
+        assert!(!get().paused);
+        assert_eq!((get().used_secs, get().used_turns), (3600, 20));
+        // A bad cap is refused all the same, and nothing is recorded.
+        app.config.review.time = Some("soon".into());
+        let err = format!("{:#}", give_budget(&app, &get()).unwrap_err());
+        assert!(err.contains("[review] time"), "{err}");
+        assert_eq!((get().max_secs, get().max_turns), (Some(3600), Some(20)));
     }
 
     /// A test index holding the assistant and one review `t`.

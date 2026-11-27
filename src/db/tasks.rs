@@ -1814,12 +1814,35 @@ impl Database {
     }
 
     /// Set `id`'s own budget mode override; `None` clears it, so the task
-    /// inherits. A task with no budget row gets one with no limits.
+    /// inherits. A task with no budget row gets one with no limits. What was
+    /// told is left as it is: see [`Database::restart_told`].
     pub fn set_budget_mode(&self, id: &str, mode: Option<&str>) -> Result<()> {
         self.conn().execute(
             "INSERT INTO task_budgets (task_id, mode) VALUES (?1, ?2)
              ON CONFLICT(task_id) DO UPDATE SET mode = excluded.mode",
             params![id, mode],
+        )?;
+        Ok(())
+    }
+
+    /// Start what was told and asked over (`warned`, `consulted`,
+    /// `net_reported`) in `id`'s row and in every row below it that inherits
+    /// its mode (one under another override keeps its own, and so does
+    /// everything below that). For a mode that changed whether budgets are
+    /// enforced: a row paused at 100% under `on`, resumed while `off` and
+    /// back `on` over its limit is told again, not paused in silence.
+    pub fn restart_told(&self, id: &str) -> Result<()> {
+        self.conn().execute(
+            "WITH RECURSIVE sub(id, depth) AS (
+                 SELECT ?1, 0
+                 UNION
+                 SELECT t.id, sub.depth + 1 FROM tasks t JOIN sub ON t.parent_id = sub.id
+                 LEFT JOIN task_budgets b ON b.task_id = t.id
+                 WHERE sub.depth < ?2 AND b.mode IS NULL
+             )
+             UPDATE task_budgets SET warned = 0, consulted = 0, net_reported = 0
+             WHERE task_id IN (SELECT id FROM sub)",
+            params![id, MAX_HOPS],
         )?;
         Ok(())
     }
@@ -1910,8 +1933,14 @@ impl Database {
     /// and its subtree is still within its budget: false, and nothing
     /// written, when a pause or stop changed them since, or a charge used
     /// the budget up (a budget's pause of a row a node holds already leaves
-    /// the row as it was).
-    pub fn resume_run_state(&self, id: &str, checked: (RunState, Option<&Setter>)) -> Result<bool> {
+    /// the row as it was). `inert`: its budget mode is `off`, so its limits
+    /// are not looked at.
+    pub fn resume_run_state(
+        &self,
+        id: &str,
+        checked: (RunState, Option<&Setter>),
+        inert: bool,
+    ) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(task) = get_task_in(&tx, id)? else {
@@ -1920,7 +1949,7 @@ impl Database {
         if (task.run_state, task.run_state_by.as_ref()) != checked {
             return Ok(false);
         }
-        if let Some(row) = budget_in(&tx, id)? {
+        if let Some(row) = budget_in(&tx, id)?.filter(|_| !inert) {
             let (secs, turns) = subtree_used_in(&tx, id)?;
             if row.max_secs.is_some_and(|max| secs >= max)
                 || row.max_turns.is_some_and(|max| turns >= max)
@@ -3028,6 +3057,54 @@ mod tests {
     }
 
     #[test]
+    fn restarting_what_was_told_stops_at_an_override_and_stays_inside_the_subtree() {
+        let (_dir, db) = open();
+        tree(&db);
+        node(&db, "w4", TaskKind::Work, Some("w3"));
+        let told = |id: &str| {
+            let r = db.budget(id).unwrap().unwrap();
+            (r.warned, r.consulted, r.net_reported as i64)
+        };
+        let tell = |id: &str| {
+            db.conn()
+                .execute(
+                    "UPDATE task_budgets SET warned = 100, consulted = 80, net_reported = 1
+                     WHERE task_id = ?1",
+                    [id],
+                )
+                .unwrap();
+        };
+        // m > n > w3 > w4; w1 is outside m. w3 has an override of its own,
+        // w4 below it inherits that.
+        for id in ["m", "n", "w3", "w4", "w1"] {
+            db.set_budget_max(id, Some(600), None).unwrap();
+        }
+        db.set_budget_mode("w3", Some("auto")).unwrap();
+        db.set_budget_mode("m", Some("on")).unwrap();
+        for id in ["m", "n", "w3", "w4", "w1"] {
+            tell(id);
+        }
+        // Setting a mode alone tells nothing over.
+        db.set_budget_mode("m", Some("off")).unwrap();
+        assert_eq!(told("m"), (100, 80, 1));
+        // Restarting starts it over in m and what inherits it, and stops at
+        // w3's override, and so below it (w4 inherits w3's, not m's).
+        db.restart_told("m").unwrap();
+        assert_eq!(told("m"), (0, 0, 0));
+        assert_eq!(told("n"), (0, 0, 0));
+        assert_eq!(told("w3"), (100, 80, 1), "its own override holds");
+        assert_eq!(told("w4"), (100, 80, 1), "below an override");
+        assert_eq!(told("w1"), (100, 80, 1), "outside m");
+        // The limits stay.
+        assert_eq!(db.budget("m").unwrap().unwrap().max_secs, Some(600));
+        // A task with no row yet gets a limit-less one, and restarting it
+        // is a no-op.
+        db.set_budget_mode("w2", Some("off")).unwrap();
+        db.restart_told("w2").unwrap();
+        assert_eq!(db.budget("w2").unwrap().unwrap().max_secs, None);
+    }
+
+    #[test]
     fn a_human_limit_sets_the_base_and_a_mode_keeps_it() {
         let (_dir, db) = open();
         tree(&db);
@@ -3252,11 +3329,11 @@ mod tests {
         db.set_run_state("n", RunState::Paused, Some(&Setter::User))
             .unwrap();
         assert!(!db
-            .resume_run_state("n", (RunState::Paused, Some(&by_m)))
+            .resume_run_state("n", (RunState::Paused, Some(&by_m)), false)
             .unwrap());
         assert_eq!(state("n"), (RunState::Paused, Some(Setter::User)));
         assert!(db
-            .resume_run_state("n", (RunState::Paused, Some(&Setter::User)))
+            .resume_run_state("n", (RunState::Paused, Some(&Setter::User)), false)
             .unwrap());
         assert_eq!(state("n"), (RunState::Run, None));
     }
@@ -3277,13 +3354,18 @@ mod tests {
         db.set_run_state("n", RunState::Paused, Some(&Setter::Budget))
             .unwrap();
         assert!(!db
-            .resume_run_state("n", (RunState::Paused, Some(&by_m)))
+            .resume_run_state("n", (RunState::Paused, Some(&by_m)), false)
             .unwrap());
         let n = db.get_task("n").unwrap().unwrap();
         assert_eq!(
             (n.run_state, n.run_state_by),
-            (RunState::Paused, Some(by_m))
+            (RunState::Paused, Some(by_m.clone()))
         );
+        // An inert row (its mode is off) is not looked at.
+        assert!(db
+            .resume_run_state("n", (RunState::Paused, Some(&by_m)), true)
+            .unwrap());
+        assert_eq!(db.get_task("n").unwrap().unwrap().run_state, RunState::Run);
     }
 
     #[test]

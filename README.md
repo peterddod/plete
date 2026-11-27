@@ -1250,6 +1250,23 @@ lowered is not checked); the 80% and 100%
 reports start over, and a limit set at or below what the task has used
 pauses it at once.
 
+**Budget mode.** `[budget] mode = "on"` (the default) is everything above.
+`"off"` turns budgeting off, `[review]` time and turns caps included: usage is
+still charged, but nothing warns, pauses, reports or notifies, `--budget`,
+`default_budget`, a profile's `budget` and `plete task budget +1h` still parse
+and are recorded and have no effect, and a budget is neither refused for
+being more than is left nor cut to it. A task paused while `on` can be
+resumed once off. Each such command says `plete: budget mode is off; the
+limit is recorded and not enforced`. A task has its own mode with `plete task
+new --budget-mode on|off`, a profile's `budget_mode`, or `plete task budget
+<task> --mode on|off|inherit`; its tasks below inherit it unless they set
+one, and a task may not change its own or an ancestor's. A limit belongs to the
+task it is set on, so an `off` task under an `on` parent still counts toward
+the parent's limit and is held when it pauses. Switching to `on` re-checks every
+limit at once and may pause tasks already over. A review's caps follow
+`[budget] mode` only. Editing it in config.toml takes effect at the next
+charge.
+
 `plete manager new|ls|show|grant|budget|pause|resume|stop` still work for
 one release as deprecated aliases (each prints a deprecation line): `manager
 new` makes a planner task, `manager ls` is `task tree` and the rest are the

@@ -577,10 +577,11 @@ pub fn plan_child(
         d.allow.as_deref(),
         &policy,
     )?;
-    let budget = child_budget(app, &parent, d, &policy)?;
-    if let Some(mode) = &d.budget_mode {
-        budget::Mode::parse(mode).map_err(|e| anyhow!("--budget-mode: {e}"))?;
-    }
+    let mode = match &d.budget_mode {
+        Some(mode) => Some(budget::Mode::parse(mode).map_err(|e| anyhow!("--budget-mode: {e}"))?),
+        None => None,
+    };
+    let budget = child_budget(app, &parent, d, &policy, mode)?;
 
     let created_by = match caller {
         Caller::User => "user".to_string(),
@@ -697,16 +698,20 @@ pub(crate) fn format_char(c: char) -> bool {
 /// A new child's budget: what `--budget` asks for, which must fit in what
 /// is left above it, else `[tasks] default_budget` for a manager or a
 /// task under another task (M20), cut to what is left. A worker under the
-/// assistant gets none unless asked.
+/// assistant gets none unless asked. A child whose mode will be `off`
+/// (`mode`, else its parent's) is neither refused nor cut: its limits are
+/// recorded and inert.
 fn child_budget(
     app: &App,
     parent: &TaskRecord,
     d: &Delegation,
     policy: &crate::config::ManagerPolicy,
+    mode: Option<budget::Mode>,
 ) -> Result<Option<Limits>> {
+    let inert = mode.unwrap_or_else(|| budget::mode_or_on(app, parent)) == budget::Mode::Off;
     let left = budget::remaining(app, parent)?;
     // Spent in either unit, whatever is asked: nothing more is born there.
-    if left.secs == Some(0) || left.turns == Some(0) {
+    if !inert && (left.secs == Some(0) || left.turns == Some(0)) {
         bail!("nothing is left of the budget under task {}", parent.slug);
     }
     let fits = |want: Option<i64>, left: Option<i64>| match (want, left) {
@@ -715,7 +720,7 @@ fn child_budget(
     };
     if !d.budget.is_empty() {
         let want = budget::limits(&d.budget)?;
-        if !fits(want.secs, left.secs) || !fits(want.turns, left.turns) {
+        if !inert && (!fits(want.secs, left.secs) || !fits(want.turns, left.turns)) {
             bail!(
                 "--budget {} is more than is left under task {} ({})",
                 budget::label(want),
@@ -729,7 +734,7 @@ fn child_budget(
         return Ok(None);
     }
     let cut = |want: Option<i64>, left: Option<i64>| match (want, left) {
-        (Some(want), Some(left)) => Some(want.min(left)),
+        (Some(want), Some(left)) if !inert => Some(want.min(left)),
         (want, _) => want,
     };
     let given = Limits {
@@ -737,6 +742,13 @@ fn child_budget(
         turns: cut(policy.default_budget.turns, left.turns),
     };
     Ok((given != Limits::default()).then_some(given))
+}
+
+/// What `plete task new` and `plete manager new` say, once, of the task
+/// `plan` made: that its limit is not enforced, if it was given one and its
+/// mode is `off` ([`budget::limit_note`]).
+pub fn child_limit_note(app: &App, plan: &NewNode, task: &TaskRecord) -> Option<&'static str> {
+    plan.budget.and(budget::limit_note(app, task))
 }
 
 /// Make the task [`plan_child`] planned, with `project`'s files: its
@@ -3557,6 +3569,122 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// A child that will be `off` (by flag, or its parent's mode) is neither
+    /// refused nor cut: its limits are recorded and inert. Each case is one
+    /// the guard decides: reverting it fails the test.
+    #[test]
+    fn an_off_child_is_neither_refused_nor_cut() {
+        let (_dir, app, _trunk) = manager_lab();
+        let m = app.db.get_task("m-id").unwrap().unwrap();
+        // m is `on`, with 30m and 15 turns left.
+        app.db.set_budget_max(&m.id, Some(3600), Some(20)).unwrap();
+        app.db.charge(&m.id, 1800, 5).unwrap();
+        let user = Caller::User;
+        let big = |d: Delegation| Delegation {
+            budget: vec![crate::manager::budget::parse_part("9h").unwrap()],
+            ..d
+        };
+        let with_mode = |d: Delegation, mode: &str| Delegation {
+            budget_mode: Some(mode.into()),
+            ..d
+        };
+        let plan = |d: &Delegation| plan_child(&app, &user, TaskKind::Work, "x", d, None);
+        let secs = |d: &Delegation| plan(d).unwrap().budget.unwrap().secs;
+        let refusal = |d: &Delegation| format!("{:#}", plan(d).unwrap_err());
+        assert!(refusal(&big(under("m"))).contains("more than is left"));
+        assert_eq!(secs(&under("m")), Some(1800));
+        // By flag: the budget is kept as asked, and the default is not cut.
+        assert_eq!(secs(&with_mode(big(under("m")), "off")), Some(9 * 3600));
+        assert_eq!(secs(&with_mode(under("m"), "off")), Some(4 * 3600));
+        // Another mode is held as before.
+        assert!(refusal(&with_mode(big(under("m")), "auto")).contains("more than is left"));
+
+        // Spent, m is `on`: a child is refused, whatever it asks...
+        app.db.charge(&m.id, 1800, 15).unwrap();
+        for (i, d) in [under("m"), big(under("m")), with_mode(under("m"), "on")]
+            .iter()
+            .enumerate()
+        {
+            assert!(refusal(d).contains("nothing is left"), "case {i}");
+        }
+        assert!(refusal(&with_mode(under("m"), "auto")).contains("nothing is left"));
+        // ...unless it will be `off`: made, with the default uncut.
+        assert_eq!(secs(&with_mode(under("m"), "off")), Some(4 * 3600));
+        assert_eq!(secs(&with_mode(big(under("m")), "off")), Some(9 * 3600));
+
+        // By the parent's mode, as by the flag. m's own row is inert, so it
+        // bounds nothing below it, even a child that is `on`.
+        app.db.set_budget_mode(&m.id, Some("off")).unwrap();
+        assert_eq!(secs(&under("m")), Some(4 * 3600));
+        assert_eq!(secs(&big(under("m"))), Some(9 * 3600));
+        assert_eq!(secs(&with_mode(under("m"), "on")), Some(4 * 3600));
+        app.db.set_budget_mode(&m.id, None).unwrap();
+        assert!(refusal(&under("m")).contains("nothing is left"));
+    }
+
+    /// What `task new` and `manager new` say of a limit not enforced, from
+    /// each way a child is given one, and nothing otherwise.
+    #[test]
+    fn a_limit_given_to_an_off_child_is_noted_once_and_otherwise_not() {
+        let (_dir, mut app, _trunk) = manager_lab();
+        let user = Caller::User;
+        app.config.tasks.max_children = Some(40);
+        let note = "plete: budget mode is off; the limit is recorded and not enforced";
+        let mut n = 0;
+        let mut made = |app: &App, d: &Delegation| {
+            n += 1;
+            let plan = plan_child(app, &user, TaskKind::Work, &format!("c{n}"), d, None).unwrap();
+            let (child, _) = commit_child(app, &plan, None).unwrap();
+            child_limit_note(app, &plan, &child)
+        };
+        let budget = |d: Delegation| Delegation {
+            budget: vec![crate::manager::budget::parse_part("1h").unwrap()],
+            ..d
+        };
+        let mode = |d: Delegation, mode: &str| Delegation {
+            budget_mode: Some(mode.into()),
+            ..d
+        };
+        let profile = |text: &str| {
+            let (settings, body) = crate::profiles::parse(text).unwrap();
+            crate::profiles::Profile {
+                name: "p".into(),
+                source: crate::profiles::Source::Builtin,
+                settings,
+                body,
+            }
+        };
+        let with_profile = |d: &Delegation, p: &str| {
+            crate::commands::task::with_profile(d, Some(&profile(p)))
+                .unwrap()
+                .0
+        };
+
+        // Under an `off` parent: each way of giving a limit says it once.
+        app.config.budget.mode = Some("off".into());
+        assert_eq!(made(&app, &budget(under("m"))), Some(note), "--budget");
+        let d = with_profile(&under("m"), "+++\nbudget = \"2h\"\n+++\n");
+        assert_eq!(made(&app, &d), Some(note), "profile budget");
+        let d = with_profile(&under("m"), "+++\nbudget = \"default\"\n+++\n");
+        assert!(d.default_budget);
+        assert_eq!(made(&app, &d), Some(note), "profile default");
+        assert_eq!(made(&app, &under("m")), Some(note), "default_budget");
+        // No limit given (a worker under the assistant gets none): no note.
+        assert_eq!(made(&app, &under("assistant")), None, "no limit");
+        // `--budget-mode off` on its own is a limit-less row: no note either.
+        assert_eq!(made(&app, &mode(under("assistant"), "off")), None);
+        // Another mode, by flag or the global one: nothing is said.
+        for m in ["on", "auto"] {
+            assert_eq!(made(&app, &mode(budget(under("m")), m)), None, "{m}");
+        }
+        app.config.budget.mode = Some("on".into());
+        assert_eq!(made(&app, &budget(under("m"))), None, "global on");
+        app.config.budget.mode = Some("auto".into());
+        assert_eq!(made(&app, &budget(under("m"))), None, "global auto");
+        // Off by flag under a mode that is not.
+        assert_eq!(made(&app, &mode(budget(under("m")), "off")), Some(note));
     }
 
     /// A task's own fan-out limit is at most `[managers] max_children` and

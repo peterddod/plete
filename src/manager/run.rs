@@ -225,7 +225,9 @@ pub fn check_resume(app: &App, by: &Caller, target: &TaskRecord) -> Result<()> {
             holder.run_state.as_str()
         );
     }
-    if let Some(row) = app.db.budget(&target.id)? {
+    // An `off` row is inert: a task over its limit may run on.
+    let inert = budget::mode_or_on(app, target) == budget::Mode::Off;
+    if let Some(row) = app.db.budget(&target.id)?.filter(|_| !inert) {
         let (secs, turns) = app.db.subtree_used(&target.id)?;
         let spent = row.max_secs.is_some_and(|max| secs >= max)
             || row.max_turns.is_some_and(|max| turns >= max);
@@ -264,7 +266,8 @@ pub fn resume(app: &App, by: &Caller, target: &TaskRecord) -> Result<Vec<NodeOut
         // What was checked is what is undone: a pause or stop written
         // since, by someone who may outrank `by`, stays.
         let checked = (target.run_state, target.run_state_by.as_ref());
-        if !app.db.resume_run_state(&target.id, checked)? {
+        let inert = budget::mode_or_on(app, target) == budget::Mode::Off;
+        if !app.db.resume_run_state(&target.id, checked, inert)? {
             bail!(
                 "{} was paused or stopped again meanwhile, or used its budget; look with \
                  `plete task show {}`",
@@ -1359,6 +1362,29 @@ mod tests {
         assert!(err.to_string().contains("used its budget"), "{err}");
         app.db.set_budget_max("m2", None, Some(20)).unwrap();
         check_resume(&app, &Caller::Root, &get(&app, "m2")).unwrap();
+    }
+
+    /// A task paused while `on` is not left unresumable by switching off:
+    /// neither the check nor the write looks at an inert row.
+    #[test]
+    fn resume_ignores_a_spent_budget_whose_mode_is_off() {
+        let (_dir, app) = lab();
+        app.db.set_budget_max("m2", None, Some(10)).unwrap();
+        app.db.charge("w2", 0, 10).unwrap();
+        app.db
+            .set_run_state("m2", RunState::Paused, Some(&Setter::Budget))
+            .unwrap();
+        assert!(resume(&app, &Caller::Root, &get(&app, "m2")).is_err());
+        app.db.set_budget_mode("m2", Some("off")).unwrap();
+        let outcomes = resume(&app, &Caller::Root, &get(&app, "m2")).unwrap();
+        assert_eq!(outcomes[0].line, "resumed");
+        assert_eq!(get(&app, "m2").run_state, RunState::Run);
+        // Switched back on, the spent budget refuses again.
+        app.db
+            .set_run_state("m2", RunState::Paused, Some(&Setter::Budget))
+            .unwrap();
+        app.db.set_budget_mode("m2", None).unwrap();
+        assert!(resume(&app, &Caller::Root, &get(&app, "m2")).is_err());
     }
 
     #[test]
