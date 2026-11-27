@@ -218,11 +218,22 @@ pub fn changed(had: Limits, change: Change) -> Result<Limits> {
 pub fn mode_or_on(app: &App, task: &TaskRecord) -> Mode {
     effective_mode(app, task).map_or_else(
         |e| {
-            eprintln!("plete: {e:#}; budgets are enforced as `on`");
+            warn_once(format!("plete: {e:#}; budgets are enforced as `on`"));
             Mode::On
         },
         |(mode, _)| mode,
     )
+}
+
+/// Say `warning` on stderr once per process: a long-lived process reads a
+/// bad mode on every charge.
+fn warn_once(warning: String) {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.contains(&warning) {
+        eprintln!("{warning}");
+        said.push(warning);
+    }
 }
 
 /// `[budget] mode` alone, as a review sees it: it has no task to carry an
@@ -234,23 +245,17 @@ pub fn global_off(app: &App) -> bool {
 fn global_mode(app: &App) -> Mode {
     app.config.budget_policy().map_or_else(
         |e| {
-            eprintln!("plete: {e:#}; budgets are enforced as `on`");
+            warn_once(format!("plete: {e:#}; budgets are enforced as `on`"));
             Mode::On
         },
         |policy| policy.mode,
     )
 }
 
-/// Say, on stderr, that a limit just set on `task` is not enforced because
-/// its mode is `off`.
-pub fn note_if_off(app: &App, task: &TaskRecord) {
-    if let Some(note) = off_note(app, task) {
-        eprintln!("{note}");
-    }
-}
-
-/// What [`note_if_off`] says, if `task`'s mode is `off`.
-fn off_note(app: &App, task: &TaskRecord) -> Option<&'static str> {
+/// What a command that has just set a limit on `task` says, if its mode is
+/// `off`: the limit is recorded and not enforced. The command prints it,
+/// once.
+pub fn limit_note(app: &App, task: &TaskRecord) -> Option<&'static str> {
     (mode_or_on(app, task) == Mode::Off)
         .then_some("plete: budget mode is off; the limit is recorded and not enforced")
 }
@@ -927,8 +932,13 @@ mod tests {
     /// A review the assistant asked for, with `[review]`'s turns capped.
     fn add_review(app: &App, turns: i64) -> ReviewRecord {
         let root = super::super::root(app).unwrap();
+        add_review_by(app, turns, &root.id)
+    }
+
+    /// A review of `turns` turns asked for by task `by`.
+    fn add_review_by(app: &App, turns: i64, by: &str) -> ReviewRecord {
         let mut r = ReviewRecord::new("r".into(), "r".into(), "github.com/acme/api", 7, 0);
-        r.requested_by = Some(root.id);
+        r.requested_by = Some(by.into());
         app.db.insert_review(&r).unwrap();
         std::fs::create_dir_all(review::dir(app, &r)).unwrap();
         app.db
@@ -979,9 +989,13 @@ mod tests {
         app.db.set_budget_mode("w", Some("off")).unwrap();
         app.db.set_budget_max("w", None, Some(10)).unwrap();
         let w = get(&app, "w");
+        // `Hit100` is all that has a caller report a task blocked
+        // (`report_blocked`): past its limit, an off row never returns it.
         for turns in [8, 2, 5] {
             app.db.charge("w", 0, turns).unwrap();
-            assert_eq!(enforce(&app, &w).unwrap(), Threshold::None);
+            let at = enforce(&app, &w).unwrap();
+            assert_eq!(at, Threshold::None);
+            assert_ne!(at, Threshold::Hit100);
         }
         assert_eq!(get(&app, "w").run_state, RunState::Run);
         assert!(budget_reports(&app, "w").is_empty());
@@ -990,7 +1004,6 @@ mod tests {
         assert!(crate::notify::queued(&app.home).is_empty());
         let row = app.db.budget("w").unwrap().unwrap();
         assert_eq!((row.used_turns, row.warned), (15, 0));
-        // Nor does the sweep's own report on a charge: nothing crossed.
         assert_eq!(app.db.subtree_used("m").unwrap(), (0, 15));
     }
 
@@ -1044,18 +1057,18 @@ mod tests {
     fn the_off_note_is_said_only_while_the_mode_is_off() {
         let (_dir, mut app) = lab();
         let w = get(&app, "w");
-        assert_eq!(off_note(&app, &w), None);
+        assert_eq!(limit_note(&app, &w), None);
         app.db.set_budget_mode("m", Some("off")).unwrap();
         assert_eq!(
-            off_note(&app, &w),
+            limit_note(&app, &w),
             Some("plete: budget mode is off; the limit is recorded and not enforced")
         );
         app.db.set_budget_mode("w", Some("auto")).unwrap();
-        assert_eq!(off_note(&app, &w), None);
+        assert_eq!(limit_note(&app, &w), None);
         app.db.set_budget_mode("w", None).unwrap();
         app.db.set_budget_mode("m", None).unwrap();
         app.config.budget.mode = Some("off".into());
-        assert!(off_note(&app, &w).is_some());
+        assert!(limit_note(&app, &w).is_some());
     }
 
     #[test]
@@ -1075,31 +1088,48 @@ mod tests {
     #[test]
     fn off_reads_the_global_mode_only_for_a_reviews_caps() {
         let (_dir, mut app) = lab();
-        add_review(&app, 5);
+        // Asked for by task m, which is the one whose mode could matter.
+        add_review_by(&app, 5, "m");
         app.db.charge_review("r", 0, 5).unwrap();
-        // A task's own override does not turn off the review it started.
-        app.db.set_budget_mode("m", Some("off")).unwrap();
         let hold = |app: &App| {
             let r = app.db.get_review("r").unwrap().unwrap();
             enforce_review(app, &r).unwrap()
         };
+        let paused = |app: &App| app.db.get_review("r").unwrap().unwrap().paused;
+        let stuck = |app: &App| crate::notify::queued(&app.home).len();
+        // Asked again: its caps are given afresh and the pause lifted.
+        let rerun = |app: &App| {
+            app.db.set_review_budget_max("r", None, Some(50)).unwrap();
+            assert!(app.db.resume_review("r", false).unwrap());
+            app.db.set_review_budget_max("r", None, Some(5)).unwrap();
+        };
+
+        // m's own `off` is not the review's: with `[budget] mode` on, it
+        // is held at 100% and the user told it is stuck.
+        app.db.set_budget_mode("m", Some("off")).unwrap();
+        app.config.budget.mode = Some("on".into());
+        assert_eq!(hold(&app), Threshold::Hit100);
+        assert!(paused(&app));
+        assert_eq!(stuck(&app), 1);
+        rerun(&app);
+
+        // Global `off` turns it off, whatever m says: nothing is held,
+        // told or recorded.
+        app.db.set_budget_mode("m", Some("on")).unwrap();
         app.config.budget.mode = Some("off".into());
         assert_eq!(hold(&app), Threshold::None);
-        let row = app.db.get_review("r").unwrap().unwrap();
-        assert!(!row.paused);
-        assert_eq!(row.warned, 0);
-        assert!(crate::notify::queued(&app.home).is_empty());
+        assert!(!paused(&app));
+        assert_eq!(app.db.get_review("r").unwrap().unwrap().warned, 0);
+        assert_eq!(stuck(&app), 1, "no new notification");
         assert!(app.db.reports_for("r", 10).unwrap().is_empty());
+
         // `auto` leaves review caps as in `on`.
         for mode in ["auto", "on"] {
             app.config.budget.mode = Some(mode.into());
             app.db.set_review_budget_max("r", None, Some(5)).unwrap();
             assert_eq!(hold(&app), Threshold::Hit100, "{mode}");
-            assert!(app.db.get_review("r").unwrap().unwrap().paused, "{mode}");
-            // Asked again, it is given its caps afresh and lifted.
-            app.db.set_review_budget_max("r", None, Some(50)).unwrap();
-            assert!(app.db.resume_review("r", false).unwrap());
-            app.db.set_review_budget_max("r", None, Some(5)).unwrap();
+            assert!(paused(&app), "{mode}");
+            rerun(&app);
         }
     }
 

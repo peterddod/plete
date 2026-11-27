@@ -109,8 +109,11 @@ pub fn new(app: &App, args: &NewTaskArgs) -> Result<()> {
         },
     )?;
     warn_all(&created.warnings);
-    if plan.as_ref().is_some_and(|p| p.budget.is_some()) {
-        crate::manager::budget::note_if_off(app, &created.task);
+    if let Some(note) = plan
+        .as_ref()
+        .and_then(|plan| tasks::child_limit_note(app, plan, &created.task))
+    {
+        eprintln!("{note}");
     }
     set_notify_flags(app, &created.task.id, &flags)?;
     // Before its agent can start, which reads them.
