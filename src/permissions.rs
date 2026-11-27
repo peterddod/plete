@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::{
     AgentsCommands, AliasCommands, Commands, ManagerCommands, PrCommands, ProjectCommands,
-    ReviewCommands, SetupCommands, TaskCommands, TreeCommands, WatchCommands, WorktreeArgs,
-    WorktreeCommands,
+    ReviewCommands, SetupCommands, TaskCommands, TreeCommands, WarmupCommands, WatchCommands,
+    WorktreeArgs, WorktreeCommands,
 };
 use crate::config::NotifyLevel;
 use crate::config::{self, ManagerPolicy};
@@ -704,6 +704,10 @@ pub fn gate(command: Option<&Commands>, terminal: bool) -> Gate {
         | Commands::Search { .. }
         // Reads only.
         | Commands::Doctor { .. }
+        // `ls` and `show` read; `refresh` and `clear` spend or delete, and a
+        // task with a parent is refused them ([`node_only`]), which needs no
+        // capability of the assistant's.
+        | Commands::Warmup { .. }
         // Started by plete itself, under the command that was checked.
         | Commands::ReviewJob { .. }
         | Commands::StoreSync
@@ -1450,6 +1454,11 @@ fn review_as_requester(
 fn node_only(command: Option<&Commands>) -> Option<&'static str> {
     match command? {
         Commands::Todo { .. } => Some("keep the assistant's todo list"),
+        // They spend a headless session or delete what others share; its
+        // parent decides.
+        Commands::Warmup {
+            command: Some(WarmupCommands::Refresh { .. } | WarmupCommands::Clear { .. }),
+        } => Some("rebuild or delete a warm-up"),
         Commands::Brief { .. } => Some("read what was kept for the assistant"),
         // Only `plete review` starts one, and a Node may not review.
         Commands::ReviewJob { .. } => Some("run review jobs"),
@@ -1763,6 +1772,8 @@ fn node_scope(command: Option<&Commands>) -> Option<Scope> {
         | Commands::TaskHook { .. }
         | Commands::TaskStartup { .. }
         | Commands::Inbox { .. }
+        // What a task with a parent may not do of it is `node_only`'s.
+        | Commands::Warmup { .. }
         // Into the store, which no task owns: only with `repo.clone`.
         | Commands::Clone { .. }
         | Commands::Tasks
@@ -2111,6 +2122,31 @@ mod tests {
         match gate_of(args) {
             Gate::Needs { capability, action } => (capability, action),
             other => panic!("{args:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warmup_commands_need_no_capability_and_a_task_with_a_parent_may_only_read() {
+        for args in [
+            &["warmup"][..],
+            &["warmup", "ls"],
+            &["warmup", "show", "p", "s"],
+            &["warmup", "refresh", "p"],
+            &["warmup", "clear"],
+        ] {
+            assert_eq!(gate_of(args), Gate::Free, "{args:?}");
+        }
+        let only_root = |args: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from(
+                std::iter::once("plete").chain(args.iter().copied()),
+            )
+            .unwrap();
+            node_only(cli.command.as_ref())
+        };
+        assert_eq!(only_root(&["warmup", "ls"]), None);
+        assert_eq!(only_root(&["warmup", "show", "p", "s"]), None);
+        for args in [&["warmup", "refresh", "p"][..], &["warmup", "clear"]] {
+            assert_eq!(only_root(args), Some("rebuild or delete a warm-up"));
         }
     }
 
@@ -3178,6 +3214,12 @@ mod tests {
             (&["store-sync"], true),
             (&["tasks"], true),
             (&["chat"], true),
+            // `refresh` and `clear` are in `node_only`'s hands.
+            (&["warmup"], true),
+            (&["warmup", "ls"], true),
+            (&["warmup", "show", "p", "s"], true),
+            (&["warmup", "refresh", "p"], true),
+            (&["warmup", "clear"], true),
             (&["todo"], true),
             (&["todo", "ls"], true),
             (&["todo", "add", "x"], true),

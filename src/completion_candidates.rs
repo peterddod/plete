@@ -169,3 +169,31 @@ pub fn branch_names(filter: Option<&str>) -> Vec<String> {
     out.dedup();
     out
 }
+
+/// Profiles that have a warm-up kept.
+pub fn warmup_profile_candidates() -> Vec<CompletionCandidate> {
+    let Ok(app) = App::open() else {
+        return Vec::new();
+    };
+    crate::commands::warmup::kept(&app)
+        .into_iter()
+        .map(|(profile, _)| profile)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+/// Scopes that have a warm-up kept, of any profile.
+pub fn warmup_scope_candidates() -> Vec<CompletionCandidate> {
+    let Ok(app) = App::open() else {
+        return Vec::new();
+    };
+    crate::commands::warmup::kept(&app)
+        .into_iter()
+        .map(|(_, scope)| scope)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}

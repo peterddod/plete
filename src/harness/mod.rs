@@ -282,6 +282,10 @@ pub trait Harness: Sync {
         Ok(())
     }
 
+    /// Delete the record of session `id`, started in `dir`, so a warm-up
+    /// replaced by a newer one leaves nothing behind. Missing is fine.
+    fn forget_session(&self, _dir: &Path, _id: &str) {}
+
     /// What session `id`, started in `dir`, read and cost, from its record.
     /// `None` when it keeps none plete can read.
     #[allow(dead_code)] // called by the warm-up build, a later step
@@ -587,6 +591,13 @@ pub fn version_warning(harness: &dyn Harness, program: &str) -> Option<String> {
             })
         })
         .clone()
+}
+
+/// The version `program --version` prints, asked once per run: what a
+/// warm-up's fingerprint holds.
+pub fn program_version(program: &str) -> Option<String> {
+    static ASKED: OnceLock<Option<String>> = OnceLock::new();
+    ASKED.get_or_init(|| installed_version(program)).clone()
 }
 
 /// The version `program --version` prints, given a couple of seconds.

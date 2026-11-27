@@ -323,6 +323,15 @@ impl Harness for ClaudeCode {
         true
     }
 
+    fn forget_session(&self, dir: &Path, id: &str) {
+        let (true, Some(sessions)) = (single_component(id), session_dir(dir)) else {
+            return;
+        };
+        let _ = std::fs::remove_file(sessions.join(format!("{id}.jsonl")));
+        // What its subagents left.
+        let _ = std::fs::remove_dir_all(sessions.join(id));
+    }
+
     fn transcript_info(&self, dir: &Path, id: &str) -> Option<Transcript> {
         if !single_component(id) {
             return None;

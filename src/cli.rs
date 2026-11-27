@@ -4,7 +4,7 @@ use clap_complete::engine::ArgValueCandidates;
 use crate::completion_candidates::{
     all_branch_candidates, capability_candidates, manager_candidates, parent_candidates,
     project_candidates, repo_filter_candidates, review_candidates, task_candidates,
-    task_worktree_candidates,
+    task_worktree_candidates, warmup_profile_candidates, warmup_scope_candidates,
 };
 use crate::manager::budget::{BudgetPart, Change};
 use crate::permissions::parse_capability;
@@ -171,6 +171,14 @@ pub enum Commands {
     Agents {
         #[command(subcommand)]
         command: Option<AgentsCommands>,
+    },
+
+    /// Session warm-ups of agent profiles with `[warmup]`: what each
+    /// explored, whether it is fresh, and rebuilding or deleting it (with no
+    /// subcommand: the list)
+    Warmup {
+        #[command(subcommand)]
+        command: Option<WarmupCommands>,
     },
 
     /// Record an agent's hook event for a task's status (run by the agent)
@@ -773,6 +781,57 @@ pub enum TreeCommands {
         /// Every task under the assistant (only the user)
         #[arg(long)]
         all: bool,
+    },
+}
+
+/// `plete warmup`.
+#[derive(Subcommand)]
+pub enum WarmupCommands {
+    /// The warm-ups kept: profile, scope, when built, commit, size, status,
+    /// and the turns and time the build took
+    #[command(
+        long_about = "The warm-ups kept: profile, scope (a repo's store id, or a project), \
+when built, commit, size (the base's input tokens), status (fresh, stale with the \
+trigger that fired, or building) and the turns and time the build took. Status is \
+by the default branch as last fetched.\n\n\
+A fork resends the whole base on every turn. Prompt caching helps only within its \
+TTL and only when prefixes match (each task's system prompt and hooks differ from the \
+base's), so the saving is mostly time, not tokens: a task pays base-size input on every \
+turn instead of a one-time exploration. The warm-up is not a task: it takes no \
+`max_live` slot and is charged to no task's or parent's budget; its own `max_turns` and \
+`timeout` bound it."
+    )]
+    Ls {
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print what a warm-up found: its CONTEXT.md
+    Show {
+        #[arg(add = ArgValueCandidates::new(warmup_profile_candidates))]
+        profile: String,
+        #[arg(add = ArgValueCandidates::new(warmup_scope_candidates))]
+        scope: String,
+    },
+
+    /// Rebuild warm-ups now, spending a headless session each (all scopes of
+    /// the profile if none is named; a scope not built yet is a repo's store id
+    /// or a project's name)
+    Refresh {
+        #[arg(add = ArgValueCandidates::new(warmup_profile_candidates))]
+        profile: String,
+        #[arg(add = ArgValueCandidates::new(warmup_scope_candidates))]
+        scope: Option<String>,
+    },
+
+    /// Delete warm-ups (every one, a profile's, or one scope's); the next
+    /// task rebuilds
+    Clear {
+        #[arg(add = ArgValueCandidates::new(warmup_profile_candidates))]
+        profile: Option<String>,
+        #[arg(add = ArgValueCandidates::new(warmup_scope_candidates))]
+        scope: Option<String>,
     },
 }
 

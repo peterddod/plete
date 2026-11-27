@@ -18324,3 +18324,273 @@ fn migrate_home_prints_its_plan_and_needs_yes() {
         stderr_of(&output)
     );
 }
+
+// ---------------------------------------------------------------------------
+// plete warmup
+// ---------------------------------------------------------------------------
+
+/// A store with a repo `widget`, a profile `mapper` that opts into a warm-up,
+/// and a fake `claude` that prints what the test says: no real agent, no
+/// network, and Claude's own store is `/nonexistent`.
+#[cfg(unix)]
+struct WarmupLab {
+    lab: StoreLab,
+    scratch: TempDir,
+    program: String,
+}
+
+#[cfg(unix)]
+const WIDGET_SCOPE: &str = "github.com_acme_widget";
+
+#[cfg(unix)]
+impl WarmupLab {
+    fn new(refresh: &str) -> WarmupLab {
+        use std::os::unix::fs::PermissionsExt;
+        let lab = StoreLab::new();
+        lab.clone_repo("widget");
+        let scratch = TempDir::new().unwrap();
+        let dir = scratch.path();
+        let script = dir.join("claude");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.327 (Claude Code)'; exit 0;; esac\n\
+                 printf '%s\\n' \"$@\" > '{0}/args'\npwd > '{0}/cwd'\ncat '{0}/reply'\nexit \"$(cat '{0}/code')\"\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let this = WarmupLab {
+            program: script.to_string_lossy().to_string(),
+            lab,
+            scratch,
+        };
+        this.reply(
+            r##"{"type":"result","subtype":"success","is_error":false,"result":"# widget map\nsrc/main.rs starts it","num_turns":6}"##,
+            0,
+        );
+        let agents = this.lab.home().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("mapper.md"),
+            format!(
+                "+++\n[warmup]\nprompt = \"Map this repo\"\nper = \"repo\"\n{refresh}\n+++\nYou map repos.\n"
+            ),
+        )
+        .unwrap();
+        this
+    }
+
+    fn reply(&self, text: &str, code: i32) {
+        std::fs::write(self.scratch.path().join("reply"), text).unwrap();
+        std::fs::write(self.scratch.path().join("code"), code.to_string()).unwrap();
+    }
+
+    fn plete(&self, args: &[&str]) -> std::process::Output {
+        self.plete_as(args, &[])
+    }
+
+    fn plete_as(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+        let mut all = vec![("PLETE_AGENT", self.program.as_str())];
+        all.extend_from_slice(env);
+        self.lab.plete_at(args, &self.lab.home(), &all)
+    }
+
+    fn dir(&self) -> std::path::PathBuf {
+        self.lab.home().join("warmup/mapper").join(WIDGET_SCOPE)
+    }
+
+    fn actions(&self) -> String {
+        std::fs::read_to_string(self.lab.home().join("assistant/actions.log")).unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn warmup_ls_is_empty_before_any_build() {
+    let lab = WarmupLab::new("");
+    let output = lab.plete(&["warmup", "ls"]);
+    succeeded(&output);
+    assert!(
+        stdout_of(&output).contains("no warm-ups"),
+        "{}",
+        stdout_of(&output)
+    );
+    let output = lab.plete(&["warmup", "show", "mapper", WIDGET_SCOPE]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("no warm-up"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn warmup_refresh_builds_and_ls_and_show_report_it() {
+    let lab = WarmupLab::new("");
+    // By the store id, as `plete worktree add` takes one.
+    let output = lab.plete(&["warmup", "refresh", "mapper", "acme/widget"]);
+    succeeded(&output);
+    assert!(
+        stderr_of(&output).contains("6 turns"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    let output = lab.plete(&["warmup", "show", "mapper", WIDGET_SCOPE]);
+    succeeded(&output);
+    assert_eq!(stdout_of(&output), "# widget map\nsrc/main.rs starts it\n");
+
+    let listed = stdout_of(&lab.plete(&["warmup"]));
+    let row = listed
+        .lines()
+        .find(|l| l.contains("mapper"))
+        .expect(&listed);
+    assert!(
+        row.contains(WIDGET_SCOPE) && row.contains("fresh"),
+        "{listed}"
+    );
+    assert!(row.contains(" 6 "), "its turns: {listed}");
+    let json = stdout_of(&lab.plete(&["warmup", "ls", "--json"]));
+    let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(rows[0]["turns"], 6);
+    assert_eq!(rows[0]["status"], "fresh");
+
+    // Read-only, headless, in the warm-up's own directory, with no task's.
+    let args = std::fs::read_to_string(lab.scratch.path().join("args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    assert_eq!(args[0], "-p");
+    assert!(args.contains(&"dontAsk"));
+    assert!(args.iter().any(|a| a.contains("Bash(*--output*)")));
+    let cwd = std::fs::read_to_string(lab.scratch.path().join("cwd")).unwrap();
+    assert_eq!(
+        std::path::Path::new(cwd.trim()).canonicalize().unwrap(),
+        lab.dir().join("work").canonicalize().unwrap()
+    );
+    // The worktree is of the default branch, not the user's trunk.
+    let wt = lab.dir().join("work").join(WIDGET_SCOPE);
+    assert!(is_detached(&wt));
+    // The build is logged with its turns and time.
+    let log = lab.actions();
+    assert!(
+        log.contains("warm-up mapper/github.com_acme_widget: 6 turns"),
+        "{log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn warmup_ls_turns_stale_when_the_default_branch_moves() {
+    let lab = WarmupLab::new("[warmup.refresh]\ncommits = 0\n");
+    succeeded(&lab.plete(&["warmup", "refresh", "mapper", "acme/widget"]));
+    assert!(stdout_of(&lab.plete(&["warmup", "ls"])).contains("fresh"));
+    lab.lab.commit("widget", "more work");
+    succeeded(&lab.plete(&["sync"]));
+    let listed = stdout_of(&lab.plete(&["warmup", "ls"]));
+    assert!(listed.contains("stale: 1 commits since"), "{listed}");
+    // Rebuilt, it is fresh again, at the new commit.
+    succeeded(&lab.plete(&["warmup", "refresh", "mapper"]));
+    let listed = stdout_of(&lab.plete(&["warmup", "ls"]));
+    assert!(listed.contains("fresh"), "{listed}");
+    let head = rev(
+        &lab.lab.home().join("store/github.com/acme/widget"),
+        "origin/main",
+    );
+    let meta = std::fs::read_to_string(lab.dir().join("meta.json")).unwrap();
+    assert!(meta.contains(&head), "{meta}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_refresh_says_why_and_keeps_the_base() {
+    let lab = WarmupLab::new("");
+    succeeded(&lab.plete(&["warmup", "refresh", "mapper", "acme/widget"]));
+    lab.reply(
+        r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":31}"#,
+        1,
+    );
+    let output = lab.plete(&["warmup", "refresh", "mapper"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("30 turns"),
+        "{}",
+        stderr_of(&output)
+    );
+    let shown = stdout_of(&lab.plete(&["warmup", "show", "mapper", WIDGET_SCOPE]));
+    assert!(shown.contains("widget map"), "{shown}");
+    assert!(lab.actions().contains("\"outcome\":\"failed\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn warmup_refresh_needs_a_scope_for_a_profile_never_built() {
+    let lab = WarmupLab::new("");
+    let output = lab.plete(&["warmup", "refresh", "mapper"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("name the repo"),
+        "{}",
+        stderr_of(&output)
+    );
+    // A profile with no [warmup] is not one.
+    let output = lab.plete(&["warmup", "refresh", "default", "acme/widget"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("no [warmup]"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn warmup_clear_removes_the_base_and_its_worktree_through_git() {
+    let lab = WarmupLab::new("");
+    succeeded(&lab.plete(&["warmup", "refresh", "mapper", "acme/widget"]));
+    let trunk = lab.lab.home().join("store/github.com/acme/widget");
+    let wt = lab.dir().join("work").join(WIDGET_SCOPE);
+    let listed = git_stdout(&["worktree", "list", "--porcelain"], &trunk);
+    assert!(listed.contains("warmup/mapper"), "{listed}");
+    assert!(wt.is_dir());
+
+    succeeded(&lab.plete(&["warmup", "clear", "mapper", WIDGET_SCOPE]));
+    assert!(!lab.dir().exists() && !wt.exists());
+    assert!(!lab.lab.home().join("warmup/mapper").exists());
+    let listed = git_stdout(&["worktree", "list", "--porcelain"], &trunk);
+    assert!(!listed.contains("warmup/mapper"), "{listed}");
+    assert!(stdout_of(&lab.plete(&["warmup", "ls"])).contains("no warm-ups"));
+    // Nothing left to clear is not an error.
+    succeeded(&lab.plete(&["warmup", "clear"]));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_with_a_parent_may_read_warmups_but_not_rebuild_or_clear_them() {
+    let lab = WarmupLab::new("");
+    succeeded(&lab.plete(&["warmup", "refresh", "mapper", "acme/widget"]));
+    lab.lab.new_task_with("kid", &["--parent", "assistant"]);
+    let env = [("PLETE_AGENT", lab.program.as_str())];
+    let home = lab.lab.home();
+    let as_kid = |args: &[&str]| lab.lab.task_pane("kid").plete(args, &home, &env);
+    succeeded(&as_kid(&["warmup", "ls"]));
+    succeeded(&as_kid(&["warmup", "show", "mapper", WIDGET_SCOPE]));
+    for args in [
+        &["warmup", "refresh", "mapper"][..],
+        &["warmup", "clear"][..],
+    ] {
+        let output = as_kid(args);
+        assert!(!output.status.success(), "{args:?}");
+        let said = stderr_of(&output);
+        assert!(
+            said.contains("task kid may not rebuild or delete a warm-up"),
+            "{said}"
+        );
+        assert!(said.contains("tells its parent"), "{said}");
+        assert!(lab.dir().exists());
+    }
+    // The user, and a top-level task's agent, may.
+    succeeded(&lab.plete(&["warmup", "refresh", "mapper"]));
+    succeeded(&lab.plete(&["warmup", "clear", "mapper"]));
+}
