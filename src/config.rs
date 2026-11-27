@@ -1540,11 +1540,54 @@ pub fn plete_homes() -> Result<(PathBuf, Option<PathBuf>)> {
     let new_home = env_home(crate::env::NEW_HOME_VAR).filter(|_| plete.is_some() || jeet.is_some());
     let user_home = dirs::home_dir();
     if plete.is_some() || jeet.is_some() {
+        if let (Some(exe), Some(real)) = (crate::db::dev_build(), crate::db::account_home()) {
+            let allow = crate::env::var(crate::db::ALLOW_DEV_MIGRATE).unwrap_or_default();
+            refuse_real_home(
+                &exe,
+                &real,
+                &allow,
+                &[
+                    ("PLETE_HOME", plete.as_deref()),
+                    ("JEET_HOME", jeet.as_deref()),
+                    (crate::env::NEW_HOME_VAR, new_home.as_deref()),
+                ],
+            )?;
+        }
         let user_home = user_home.unwrap_or_default();
         return Ok(resolve_homes(plete, jeet, new_home, &user_home));
     }
     let user_home = user_home.context("could not determine home directory")?;
     Ok(default_homes(&user_home))
+}
+
+/// Refuse, in a development build, an explicitly set home variable that
+/// names the account's real `~/.jeet` or `~/.plete`: a run with a scratch
+/// `PLETE_HOME` but `PLETE_NEW_HOME` at the real home would otherwise
+/// create items there. `PLETE_ALLOW_DEV_MIGRATE` set to the directory lets
+/// it through.
+fn refuse_real_home(
+    exe: &str,
+    real: &Path,
+    allow: &str,
+    vars: &[(&str, Option<&Path>)],
+) -> Result<()> {
+    use crate::db::{same_file, ALLOW_DEV_MIGRATE};
+    for (name, path) in vars {
+        let Some(path) = path else { continue };
+        let is_real = default_home_candidates(real)
+            .iter()
+            .any(|d| same_file(path, d));
+        if is_real && (allow.is_empty() || !same_file(path, Path::new(allow))) {
+            bail!(
+                "this is a development build of plete ({exe}); {name}={} is the real home. \
+                 Point it at a scratch directory (e.g. {name}=$(mktemp -d)), or set \
+                 {ALLOW_DEV_MIGRATE}={} to use it anyway",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn plete_home() -> Result<PathBuf> {
@@ -1633,6 +1676,41 @@ pub fn expand_path(path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dev_build_refuses_any_home_variable_at_the_real_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("acct");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(real.join(".plete")).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let real_new = real.join(".plete");
+        let check = |allow: &str, new: &Path| {
+            refuse_real_home(
+                "dev",
+                &real,
+                allow,
+                &[
+                    ("PLETE_HOME", Some(&scratch)),
+                    ("JEET_HOME", Some(&scratch)),
+                    ("PLETE_NEW_HOME", Some(new)),
+                ],
+            )
+        };
+        let err = check("", &real_new).unwrap_err().to_string();
+        assert!(err.contains("PLETE_NEW_HOME="), "{err}");
+        assert!(check("", &scratch).is_ok());
+        assert!(check(real_new.to_str().unwrap(), &real_new).is_ok());
+        let err = refuse_real_home(
+            "dev",
+            &real,
+            "",
+            &[("JEET_HOME", Some(&real.join(".jeet")))],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("JEET_HOME="), "{err}");
+    }
+
     #[test]
     fn other_programs_variables_are_not_prefixed() {
         std::env::set_var("CFGTEST_EDITOR", "ed");
