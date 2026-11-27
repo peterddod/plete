@@ -731,7 +731,7 @@ impl Database {
 /// Set to `1` to let a development build migrate the index at a default
 /// home under `$HOME` anyway, or to the index's own path to let it migrate
 /// that one, even in the account's real home.
-const ALLOW_DEV_MIGRATE: &str = "PLETE_ALLOW_DEV_MIGRATE";
+pub(crate) const ALLOW_DEV_MIGRATE: &str = "PLETE_ALLOW_DEV_MIGRATE";
 
 /// Refuse to migrate the index at a default home (`~/.jeet` or `~/.plete`) from a
 /// development build: one built from an unreleased main would take it to a
@@ -773,7 +773,7 @@ fn refuse_dev_migration(index: &Path, current: i64, latest: i64) -> Result<()> {
 /// The account's home directory from the user database, whatever `$HOME`
 /// says.
 #[cfg(unix)]
-fn account_home() -> Option<PathBuf> {
+pub(crate) fn account_home() -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let mut buf = vec![0 as libc::c_char; 16 * 1024];
     // SAFETY: zeroed is a valid passwd; getpwuid_r writes only into it and
@@ -798,7 +798,7 @@ fn account_home() -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn account_home() -> Option<PathBuf> {
+pub(crate) fn account_home() -> Option<PathBuf> {
     None
 }
 
@@ -808,7 +808,7 @@ fn account_home() -> Option<PathBuf> {
 /// marks `target` with a `CACHEDIR.TAG`. Only those two levels are looked
 /// at, so a release unpacked somewhere under an unrelated tagged cache is
 /// not mistaken for one. An installed release is neither.
-fn dev_build() -> Option<String> {
+pub(crate) fn dev_build() -> Option<String> {
     let exe = std::env::current_exe().ok();
     if cfg!(debug_assertions) {
         return Some(exe.map_or("debug build".into(), |e| e.display().to_string()));
@@ -824,7 +824,7 @@ fn dev_build() -> Option<String> {
 
 /// Whether two paths name the same file, through symlinks where they exist.
 /// The file itself may not exist yet, so its directory is resolved then.
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| {
         if let Ok(p) = p.canonicalize() {
             return p;
