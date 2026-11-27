@@ -78,6 +78,10 @@ pub struct Config {
     /// The model each kind of agent runs (`[models]`).
     #[serde(default, skip_serializing_if = "ModelsConfig::is_empty")]
     pub models: ModelsConfig,
+
+    /// How budgets are enforced (`[budget]`).
+    #[serde(default, skip_serializing_if = "BudgetConfig::is_empty")]
+    pub budget: BudgetConfig,
 }
 
 /// `harness` in config.toml: a name, or a table.
@@ -993,6 +997,57 @@ impl PrMode {
     }
 }
 
+/// `[budget]` in config.toml: the budget mode and, for `auto`, the
+/// classifier and the bounds on its growth. Each value is checked where it
+/// is used ([`Config::budget_policy`]), so a typo breaks budgets and not the
+/// whole config.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetConfig {
+    /// `"on"` (default), `"off"` or `"auto"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+
+    /// Grows by auto before the classifier is no longer asked (default: 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_grows: Option<u32>,
+
+    /// How many times the limit a human set a row may grow to (default: 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_growth: Option<u32>,
+
+    /// The model the classifier runs (default: `"haiku"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_model: Option<String>,
+
+    /// The classifier's command line, `{model}` substituted (default: the
+    /// harness's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_command: Option<String>,
+
+    /// Seconds the classifier may take (default: 90).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_timeout_secs: Option<u64>,
+}
+
+impl BudgetConfig {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// [`BudgetConfig`] with its defaults filled in and checked.
+#[allow(dead_code)] // read by the override surfaces and enforcement that follow
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetPolicy {
+    pub mode: budget::Mode,
+    pub max_grows: u32,
+    pub max_growth: u32,
+    pub classifier_model: String,
+    pub classifier_command: Option<String>,
+    pub classifier_timeout_secs: u64,
+}
+
 /// `[models]` in config.toml: the model each kind of agent is launched
 /// with, as `--model`, unless its command line already names one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1091,6 +1146,7 @@ impl Default for Config {
             permissions: PermissionsConfig::default(),
             tasks: GlobalTasksConfig::default(),
             models: ModelsConfig::default(),
+            budget: BudgetConfig::default(),
         }
     }
 }
@@ -1213,6 +1269,34 @@ impl Config {
             .idle_report_mins
             .or(self.managers.as_ref().and_then(|m| m.idle_report_mins))
             .unwrap_or(DEFAULT_IDLE_REPORT_MINS)
+    }
+
+    /// The `[budget]` settings with their defaults. It refuses an unknown mode,
+    /// a `max_growth` or `classifier_timeout_secs` of 0.
+    #[allow(dead_code)] // read by the override surfaces and enforcement that follow
+    pub fn budget_policy(&self) -> Result<BudgetPolicy> {
+        let b = &self.budget;
+        let mode = match &b.mode {
+            Some(m) => budget::Mode::parse(m).map_err(|e| anyhow!("[budget] mode: {e}"))?,
+            None => budget::Mode::On,
+        };
+        if b.max_growth == Some(0) {
+            bail!("[budget] max_growth = 0 allows nothing; give at least 1");
+        }
+        if b.classifier_timeout_secs == Some(0) {
+            bail!("[budget] classifier_timeout_secs = 0 allows nothing; give at least 1");
+        }
+        Ok(BudgetPolicy {
+            mode,
+            max_grows: b.max_grows.unwrap_or(3),
+            max_growth: b.max_growth.unwrap_or(3),
+            classifier_model: b
+                .classifier_model
+                .clone()
+                .unwrap_or_else(|| "haiku".to_string()),
+            classifier_command: b.classifier_command.clone(),
+            classifier_timeout_secs: b.classifier_timeout_secs.unwrap_or(90),
+        })
     }
 
     /// The tree's keys, from `[tasks]` or else `[managers]`, with their
@@ -2193,6 +2277,67 @@ mod tests {
         refused("default_budget = \"\"", "default_budget");
         // A mistake there does not stop config.toml from loading.
         assert!(toml::from_str::<Config>("[managers]\nmax_live = 0\n").is_ok());
+    }
+
+    #[test]
+    fn budget_policy_defaults_and_refuses_naming_the_key() {
+        let of = |text: &str| toml::from_str::<Config>(text).unwrap().budget_policy();
+        let policy = Config::default().budget_policy().unwrap();
+        assert_eq!(
+            policy,
+            BudgetPolicy {
+                mode: budget::Mode::On,
+                max_grows: 3,
+                max_growth: 3,
+                classifier_model: "haiku".into(),
+                classifier_command: None,
+                classifier_timeout_secs: 90,
+            }
+        );
+        assert_eq!(of("[budget]\n").unwrap(), policy);
+        let policy = of("[budget]\nmode = \"auto\"\nmax_grows = 0\nmax_growth = 2\n\
+                         classifier_model = \"m\"\nclassifier_command = \"c {model}\"\n\
+                         classifier_timeout_secs = 5\n")
+        .unwrap();
+        assert_eq!(policy.mode, budget::Mode::Auto);
+        assert_eq!((policy.max_grows, policy.max_growth), (0, 2));
+        assert_eq!(policy.classifier_command.as_deref(), Some("c {model}"));
+        assert_eq!(policy.classifier_timeout_secs, 5);
+        for (text, says) in [
+            (
+                "mode = \"sometimes\"",
+                "[budget] mode: \"sometimes\" is not one of on, off, auto",
+            ),
+            ("max_growth = 0", "[budget] max_growth"),
+            (
+                "classifier_timeout_secs = 0",
+                "[budget] classifier_timeout_secs",
+            ),
+        ] {
+            let err = of(&format!("[budget]\n{text}\n")).unwrap_err().to_string();
+            assert!(err.contains(says), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_bad_budget_mode_does_not_stop_the_config_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[budget]\nmode = \"sometimes\"\n",
+        )
+        .unwrap();
+        assert!(load_or_create(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn an_empty_budget_table_writes_nothing_back() {
+        let config: Config = toml::from_str("[budget]\n").unwrap();
+        assert_eq!(config.budget, BudgetConfig::default());
+        assert!(!toml::to_string(&config).unwrap().contains("budget"));
+        assert!(!toml::to_string(&Config::default())
+            .unwrap()
+            .contains("budget"));
     }
 
     #[test]

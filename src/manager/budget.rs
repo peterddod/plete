@@ -37,6 +37,65 @@ pub enum Change {
     Set(Limits),
 }
 
+/// How a node's budget is enforced: `on` as always, `off` inert, `auto`
+/// asking a classifier at a crossing.
+#[allow(dead_code)] // read by the override surfaces and enforcement that follow
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    On,
+    Off,
+    Auto,
+}
+
+#[allow(dead_code)] // read by the override surfaces and enforcement that follow
+impl Mode {
+    pub fn parse(s: &str) -> Result<Mode, String> {
+        match s {
+            "on" => Ok(Mode::On),
+            "off" => Ok(Mode::Off),
+            "auto" => Ok(Mode::Auto),
+            other => Err(format!("{other:?} is not one of on, off, auto")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::On => "on",
+            Mode::Off => "off",
+            Mode::Auto => "auto",
+        }
+    }
+}
+
+/// Where an effective mode comes from.
+#[allow(dead_code)] // read by the override surfaces and enforcement that follow
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// `[budget] mode`, or `on` when unset.
+    Global,
+    /// The override of the task with this slug.
+    Task(String),
+}
+
+/// `task`'s budget mode: its own override, else the nearest ancestor's, else
+/// `[budget] mode`, else `on`. An unknown value, stored or configured, is an
+/// error naming where it is.
+#[allow(dead_code)] // read by the override surfaces and enforcement that follow
+pub fn effective_mode(app: &App, task: &TaskRecord) -> Result<(Mode, Source)> {
+    let mut chain = vec![task.clone()];
+    chain.extend(app.db.ancestors(&task.id)?);
+    for node in chain {
+        let Some(value) = app.db.budget(&node.id)?.and_then(|row| row.mode) else {
+            continue;
+        };
+        return match Mode::parse(&value) {
+            Ok(mode) => Ok((mode, Source::Task(node.slug))),
+            Err(e) => bail!("budget mode of {}: {e}", node.slug),
+        };
+    }
+    Ok((app.config.budget_policy()?.mode, Source::Global))
+}
+
 const FORMS: &str = "hours (4h), minutes (30m) or turns (20turns)";
 
 /// One part: `<n>h`, `<n>m` or `<n>turns`, with `n` at least 1. A `$`
@@ -570,6 +629,42 @@ mod tests {
 
     fn get(app: &App, id: &str) -> TaskRecord {
         app.db.get_task(id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn effective_mode_is_the_nearest_override_else_the_global_one() {
+        let (_dir, mut app) = lab();
+        let (m, w) = (get(&app, "m"), get(&app, "w"));
+        let of = |app: &App, t: &TaskRecord| effective_mode(app, t).unwrap();
+        assert_eq!(of(&app, &w), (Mode::On, Source::Global));
+        app.config.budget.mode = Some("off".into());
+        assert_eq!(of(&app, &w), (Mode::Off, Source::Global));
+        // An override on `m` is inherited by `w`.
+        app.db.set_budget_mode("m", Some("auto")).unwrap();
+        assert_eq!(of(&app, &m), (Mode::Auto, Source::Task("m".into())));
+        assert_eq!(of(&app, &w), (Mode::Auto, Source::Task("m".into())));
+        // One on `w` wins over it.
+        app.db.set_budget_mode("w", Some("on")).unwrap();
+        assert_eq!(of(&app, &w), (Mode::On, Source::Task("w".into())));
+        assert_eq!(of(&app, &m).0, Mode::Auto);
+        // `inherit` clears it.
+        app.db.set_budget_mode("w", None).unwrap();
+        assert_eq!(of(&app, &w), (Mode::Auto, Source::Task("m".into())));
+        app.db.set_budget_mode("m", None).unwrap();
+        assert_eq!(of(&app, &w), (Mode::Off, Source::Global));
+    }
+
+    #[test]
+    fn effective_mode_refuses_what_it_cannot_read() {
+        let (_dir, mut app) = lab();
+        let w = get(&app, "w");
+        app.db.set_budget_mode("m", Some("sometimes")).unwrap();
+        let err = effective_mode(&app, &w).unwrap_err().to_string();
+        assert!(err.contains("budget mode of m"), "{err}");
+        app.db.set_budget_mode("m", None).unwrap();
+        app.config.budget.mode = Some("sometimes".into());
+        let err = effective_mode(&app, &w).unwrap_err().to_string();
+        assert!(err.contains("[budget] mode"), "{err}");
     }
 
     /// The bodies of plete's budget reports about `id`.

@@ -3661,7 +3661,7 @@ mod tests {
                     max_turns: None,
                     used_secs: 0,
                     used_turns: 0,
-                    warned: 0,
+                    ..Default::default()
                 };
                 (row, (used, 0))
             }),

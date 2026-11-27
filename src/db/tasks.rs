@@ -300,7 +300,7 @@ pub struct TaskBriefRecord {
 
 /// A task's limits and what it has used itself; its subtree's use is
 /// [`Database::subtree_used`]. `None`: no limit of its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BudgetRow {
     pub max_secs: Option<i64>,
     pub max_turns: Option<i64>,
@@ -308,6 +308,19 @@ pub struct BudgetRow {
     pub used_turns: i64,
     /// The last threshold told: 0, 80 or 100 (per cent).
     pub warned: u8,
+    /// The task's own budget mode override; `None` inherits.
+    pub mode: Option<String>,
+    /// How many times the limits grew by auto.
+    pub grows: i64,
+    /// The limits as a human set them; auto growth is bounded by these.
+    pub base_secs: Option<i64>,
+    pub base_turns: Option<i64>,
+    /// The threshold a classifier was last asked at: 0, 80 or 100.
+    pub consulted: u8,
+    /// The last classifier decision, as JSON text.
+    pub last_decision: Option<String>,
+    /// Whether the auto-growth limit was told.
+    pub net_reported: bool,
 }
 
 /// What [`Database::check_budget`] read and did.
@@ -690,7 +703,8 @@ fn set_run_state_in(tx: &Connection, id: &str, state: RunState, by: Option<&Sett
 fn budget_in(conn: &Connection, id: &str) -> Result<Option<BudgetRow>> {
     Ok(conn
         .query_row(
-            "SELECT max_secs, max_turns, used_secs, used_turns, warned
+            "SELECT max_secs, max_turns, used_secs, used_turns, warned,
+                    mode, grows, base_secs, base_turns, consulted, last_decision, net_reported
              FROM task_budgets WHERE task_id = ?1",
             params![id],
             |row| {
@@ -700,6 +714,13 @@ fn budget_in(conn: &Connection, id: &str) -> Result<Option<BudgetRow>> {
                     used_secs: row.get(2)?,
                     used_turns: row.get(3)?,
                     warned: row.get(4)?,
+                    mode: row.get(5)?,
+                    grows: row.get(6)?,
+                    base_secs: row.get(7)?,
+                    base_turns: row.get(8)?,
+                    consulted: row.get(9)?,
+                    last_decision: row.get(10)?,
+                    net_reported: row.get(11)?,
                 })
             },
         )
@@ -1708,7 +1729,8 @@ impl Database {
         insert_grants_in(&tx, &rec.id, grants)?;
         if let Some((max_secs, max_turns)) = budget {
             tx.execute(
-                "INSERT INTO task_budgets (task_id, max_secs, max_turns) VALUES (?1, ?2, ?3)",
+                "INSERT INTO task_budgets (task_id, max_secs, max_turns, base_secs, base_turns)
+                 VALUES (?1, ?2, ?3, ?2, ?3)",
                 params![rec.id, max_secs, max_turns],
             )?;
         }
@@ -1769,15 +1791,33 @@ impl Database {
     }
 
     /// Set `id`'s limits, keeping what it has used. The thresholds are told
-    /// again against the new limits.
+    /// again against the new limits, and the limits become the base that
+    /// auto growth is bounded by: a human decision restarts it.
     pub fn set_budget_max(&self, id: &str, secs: Option<i64>, turns: Option<i64>) -> Result<()> {
         self.conn().execute(
-            "INSERT INTO task_budgets (task_id, max_secs, max_turns) VALUES (?1, ?2, ?3)
+            "INSERT INTO task_budgets (task_id, max_secs, max_turns, base_secs, base_turns)
+             VALUES (?1, ?2, ?3, ?2, ?3)
              ON CONFLICT(task_id) DO UPDATE SET
                max_secs = excluded.max_secs,
                max_turns = excluded.max_turns,
-               warned = 0",
+               base_secs = excluded.max_secs,
+               base_turns = excluded.max_turns,
+               grows = 0,
+               warned = 0,
+               consulted = 0,
+               net_reported = 0",
             params![id, secs, turns],
+        )?;
+        Ok(())
+    }
+
+    /// Set `id`'s own budget mode override; `None` clears it, so the task
+    /// inherits. A task with no budget row gets one with no limits.
+    pub fn set_budget_mode(&self, id: &str, mode: Option<&str>) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO task_budgets (task_id, mode) VALUES (?1, ?2)
+             ON CONFLICT(task_id) DO UPDATE SET mode = excluded.mode",
+            params![id, mode],
         )?;
         Ok(())
     }
@@ -2984,6 +3024,29 @@ mod tests {
     }
 
     #[test]
+    fn a_human_limit_sets_the_base_and_a_mode_keeps_it() {
+        let (_dir, db) = open();
+        tree(&db);
+        db.set_budget_mode("m", Some("auto")).unwrap();
+        let row = db.budget("m").unwrap().unwrap();
+        assert_eq!((row.mode.as_deref(), row.max_secs), (Some("auto"), None));
+        db.set_budget_max("m", Some(600), None).unwrap();
+        db.set_budget_mode("m", None).unwrap();
+        let row = db.budget("m").unwrap().unwrap();
+        assert_eq!(
+            (row.mode, row.max_secs, row.base_secs),
+            (None, Some(600), Some(600))
+        );
+        db.set_budget_mode("m", Some("off")).unwrap();
+        db.set_budget_max("m", Some(900), None).unwrap();
+        let row = db.budget("m").unwrap().unwrap();
+        assert_eq!(
+            (row.mode.as_deref(), row.base_secs),
+            (Some("off"), Some(900))
+        );
+    }
+
+    #[test]
     fn budgets_count_a_whole_subtree() {
         let (_dir, db) = open();
         tree(&db);
@@ -3014,7 +3077,8 @@ mod tests {
                 max_turns: None,
                 used_secs: 10,
                 used_turns: 1,
-                warned: 0,
+                base_secs: Some(1200),
+                ..BudgetRow::default()
             }
         );
         // A deleted task's use stays with its parent, and so above it.
