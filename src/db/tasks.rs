@@ -7,6 +7,8 @@
 // use most of this.
 #![allow(dead_code)]
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -1003,6 +1005,31 @@ impl Database {
                 "SELECT agent FROM task_agents WHERE task_id = ?1",
                 params![id],
                 |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Make session `session_id`, run in `dir`, what task `id`'s first
+    /// start forks.
+    pub fn set_task_fork_base(&self, id: &str, session_id: &str, dir: &Path) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO task_fork_base (task_id, session_id, dir) VALUES (?1, ?2, ?3)
+             ON CONFLICT(task_id) DO UPDATE SET session_id = excluded.session_id,
+                                                dir = excluded.dir",
+            params![id, session_id, dir.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    /// The session task `id`'s first start forks, and where it ran, if it
+    /// was given one.
+    pub fn task_fork_base(&self, id: &str) -> Result<Option<(String, PathBuf)>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT session_id, dir FROM task_fork_base WHERE task_id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, PathBuf::from(row.get::<_, String>(1)?))),
             )
             .optional()?)
     }
@@ -2174,6 +2201,22 @@ mod tests {
         db.touch_task("a", 50).unwrap();
         db.touch_task("a", 5).unwrap();
         assert_eq!(db.get_task("a").unwrap().unwrap().last_activity, 50);
+    }
+
+    #[test]
+    fn a_fork_base_is_kept_per_task_and_goes_with_it() {
+        let (_dir, db) = open();
+        db.insert_task(&task("a", "first", 1)).unwrap();
+        assert_eq!(db.task_fork_base("a").unwrap(), None);
+        db.set_task_fork_base("a", "base-1", Path::new("/w/one"))
+            .unwrap();
+        db.set_task_fork_base("a", "base-2", Path::new("/w/two"))
+            .unwrap();
+        assert_eq!(
+            db.task_fork_base("a").unwrap(),
+            Some(("base-2".to_string(), PathBuf::from("/w/two")))
+        );
+        assert_eq!(db.task_fork_base("other").unwrap(), None);
     }
 
     #[test]

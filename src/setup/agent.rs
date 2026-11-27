@@ -400,6 +400,7 @@ fn start(app: &App, task: &TaskRecord, spec: AgentSpec, new: bool) -> Result<run
         name: NAME.to_string(),
         dir: dir.clone(),
         known_sessions: known,
+        fork_base: None,
         ungated_warning: false,
         spec,
         hooks: Some(hooks),
