@@ -189,6 +189,10 @@ pub const HELP_AGENTS: &[(&str, &str)] = &[
         "status",
         "◆ needs you / needs input  ! blocked or a question  $ budget",
     ),
+    (
+        "",
+        "BUDGET OFF: its limit is not enforced; ↑n: grown by auto n times",
+    ),
     ("", "● running  ○ idle  ✓ done  ⏸ paused  ■ stopped"),
     ("", "(n): how many below it are so; held: how many it holds"),
     (
@@ -570,6 +574,16 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &TasksUi) {
     ];
     if ui.view == View::Agents {
         spans.extend(agents_cells(ui));
+    }
+    if budgets_off(ui) {
+        spans.push(Span::styled(
+            " budgets: off ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("   "));
     }
     match (ui.filtering, ui.filter.is_empty()) {
         (true, _) => {
@@ -1336,6 +1350,19 @@ pub fn fitted_breadcrumb(crumbs: &[String], width: usize) -> String {
     truncate(&line, width)
 }
 
+/// Whether budgets are off where the user is looking: `[budget] mode` is
+/// `off`, or the effective mode of a task in the agents tree is, a closed
+/// branch's included.
+fn budgets_off(ui: &TasksUi) -> bool {
+    ui.tree_info.as_ref().is_some_and(|info| {
+        info.budgets_off
+            || info
+                .nodes
+                .iter()
+                .any(|(id, node)| ui.shown.contains_key(id) && budget_is_off(node))
+    })
+}
+
 /// The agents view's header cells (Q8): how many agents are live against
 /// `max_live`, how many prompts wait on the user, how many starts wait on
 /// `max_live`. The last two only when there are some.
@@ -1535,9 +1562,11 @@ fn tree_line(ui: &TasksUi, line: &TreeLine, columns: &TreeColumns) -> Line<'stat
         ),
     ];
     if columns.budget > 0 {
+        let text = budget_cell(line.at, node);
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!(" {}", cell(&budget_cell(line.at, node), columns.budget)),
-            Style::default().fg(Color::Blue),
+            cell(&text, columns.budget),
+            budget_style(&text),
         ));
     }
     if columns.notes > 0 {
@@ -1693,12 +1722,43 @@ fn budget_cell(at: At, node: Option<&NodeInfo>) -> String {
         }
     };
     match &node.budget {
-        Some((row, (secs, turns))) => match (row.max_secs, row.max_turns) {
-            (Some(max), _) => format!("{}/{}", hours(*secs, false), hours(max, true)),
-            (None, Some(max)) => format!("{turns}/{max} turns"),
-            (None, None) => String::new(),
-        },
+        Some((row, _)) if budget_is_off(node) && has_limit(row) => BUDGET_OFF.into(),
+        Some((row, (secs, turns))) => {
+            let cell = match (row.max_secs, row.max_turns) {
+                (Some(max), _) => format!("{}/{}", hours(*secs, false), hours(max, true)),
+                (None, Some(max)) => format!("{turns}/{max} turns"),
+                (None, None) => String::new(),
+            };
+            // What auto has grown it by.
+            match node.mode == crate::manager::budget::Mode::Auto && row.grows > 0 {
+                true => format!("{cell} ↑{}", row.grows),
+                false => cell,
+            }
+        }
         None => String::new(),
+    }
+}
+
+/// What the budget cell says of a limit that is not enforced.
+const BUDGET_OFF: &str = "BUDGET OFF";
+
+fn has_limit(row: &crate::db::tasks::BudgetRow) -> bool {
+    row.max_secs.is_some() || row.max_turns.is_some()
+}
+
+/// Whether `node`'s limits are inert: it has one and its mode is `off`.
+fn budget_is_off(node: &NodeInfo) -> bool {
+    node.mode == crate::manager::budget::Mode::Off
+}
+
+/// How the budget cell is drawn: the `off` badge is bold and stands out.
+fn budget_style(cell: &str) -> Style {
+    match cell == BUDGET_OFF {
+        true => Style::default()
+            .fg(Color::Black)
+            .bg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
+        false => Style::default().fg(Color::Blue),
     }
 }
 
@@ -1723,6 +1783,7 @@ fn notes(ui: &TasksUi, at: At, node: Option<&NodeInfo>) -> Vec<String> {
     let pct = node
         .budget
         .as_ref()
+        .filter(|_| !budget_is_off(node))
         .and_then(|(row, used)| budget::percent(row, *used));
     if let Some(pct) = pct.filter(|&pct| pct >= 80) {
         notes.push(format!("budget {pct}%"));
@@ -3665,6 +3726,7 @@ mod tests {
                 };
                 (row, (used, 0))
             }),
+            mode: crate::manager::budget::Mode::On,
             inbox: Some(0),
             pr: None,
             queued: false,
@@ -3779,6 +3841,7 @@ mod tests {
             .into(),
             max_live: Some(8),
             queued: 0,
+            budgets_off: false,
             nodes,
         });
         ui.collapsed.insert("frontend".into());
@@ -3793,6 +3856,129 @@ mod tests {
             .iter()
             .find(|l| l.contains(what))
             .unwrap_or_else(|| panic!("no {what} in {screen:#?}"))
+    }
+
+    /// Set the mode of node `id` of an agents view, with `grows` grown.
+    fn set_mode(ui: &mut TasksUi, id: &str, mode: crate::manager::budget::Mode, grows: i64) {
+        let node = ui.tree_info.as_mut().unwrap().nodes.get_mut(id).unwrap();
+        node.mode = mode;
+        if let Some((row, _)) = node.budget.as_mut() {
+            row.grows = grows;
+        }
+    }
+
+    #[test]
+    fn an_auto_node_shows_what_it_grew_by() {
+        use crate::manager::budget::Mode;
+        let mut ui = agents_ui();
+        set_mode(&mut ui, "backend", Mode::Auto, 2);
+        let screen = render(&mut ui, 120, 20);
+        let backend = line_of(&screen, "├─ ▾ backend");
+        assert!(backend.contains("2h10/6h ↑2"), "{backend}");
+        // Not grown: as `on` is. Nor does `on` show it.
+        set_mode(&mut ui, "backend", Mode::Auto, 0);
+        set_mode(&mut ui, "api-docs", Mode::On, 3);
+        let screen = render(&mut ui, 120, 20);
+        assert!(!line_of(&screen, "├─ ▾ backend").contains('↑'));
+        assert!(!line_of(&screen, "api-docs").contains('↑'));
+    }
+
+    #[test]
+    fn an_off_node_shows_a_loud_badge_in_place_of_its_budget_and_urgency() {
+        use crate::manager::budget::Mode;
+        let mut ui = agents_ui();
+        // frontend is paused at 96% of its budget by a user; make api-docs
+        // use up its limit, and see it called out first.
+        let docs = |ui: &mut TasksUi, used: i64| {
+            let node = ui
+                .tree_info
+                .as_mut()
+                .unwrap()
+                .nodes
+                .get_mut("api-docs")
+                .unwrap();
+            node.budget.as_mut().unwrap().1 = (used, 0);
+        };
+        docs(&mut ui, 3600);
+        let urgency = |ui: &TasksUi| {
+            let i = ui
+                .rows
+                .iter()
+                .position(|r| r.task.id == "api-docs")
+                .unwrap();
+            managers::row_urgency(&ui.rows[i], ui.tree_info.as_ref())
+        };
+        assert_eq!(urgency(&ui), Urgency::Budget);
+        let screen = render(&mut ui, 120, 20);
+        let on = line_of(&screen, "│  ├─ api-docs");
+        assert!(on.contains("1h00/1h") && on.contains("budget 100%"), "{on}");
+        assert!(!on.contains("BUDGET OFF"), "{on}");
+
+        set_mode(&mut ui, "api-docs", Mode::Off, 0);
+        // The percent and the `$` go with the limit.
+        assert_ne!(urgency(&ui), Urgency::Budget);
+        let screen = render(&mut ui, 120, 20);
+        let off = line_of(&screen, "│  ├─ api-docs");
+        assert!(off.contains("BUDGET OFF"), "{off}");
+        assert!(
+            !off.contains("1h00/1h") && !off.contains("budget 100%"),
+            "{off}"
+        );
+        assert!(!off.contains('$'), "{off}");
+        // Drawn bold on a loud background, not dim.
+        let y = screen.iter().position(|l| l == off).unwrap() as u16;
+        let x = column(off, "BUDGET OFF") as u16;
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut ui)).unwrap();
+        let style = terminal.backend().buffer()[(x, y)].style();
+        assert!(style.add_modifier.contains(Modifier::BOLD), "{style:?}");
+        assert!(!style.add_modifier.contains(Modifier::DIM), "{style:?}");
+        assert_eq!(
+            (style.fg, style.bg),
+            (Some(Color::Black), Some(Color::LightRed))
+        );
+        // A node with no limit has nothing to turn off.
+        set_mode(&mut ui, "fix-login", Mode::Off, 0);
+        let screen = render(&mut ui, 120, 20);
+        assert!(!line_of(&screen, "├─ fix-login").contains("BUDGET OFF"));
+    }
+
+    #[test]
+    fn the_header_says_budgets_off_when_the_global_mode_or_a_shown_task_is() {
+        use crate::manager::budget::Mode;
+        let mut ui = agents_ui();
+        let header = |ui: &mut TasksUi| render(ui, 160, 20)[..4].join("\n");
+        // None.
+        assert!(!header(&mut ui).contains("budgets: off"));
+        // One shown task is off, whether or not it has a limit.
+        set_mode(&mut ui, "fix-login", Mode::Off, 0);
+        assert!(
+            header(&mut ui).contains("budgets: off"),
+            "{}",
+            header(&mut ui)
+        );
+        set_mode(&mut ui, "fix-login", Mode::On, 0);
+        assert!(!header(&mut ui).contains("budgets: off"));
+        // One in a closed branch counts: it is the one not in sight.
+        set_mode(&mut ui, "fe-a", Mode::Off, 0);
+        assert!(!render(&mut ui, 160, 20).join("\n").contains("fe-a"));
+        assert!(header(&mut ui).contains("budgets: off"));
+        set_mode(&mut ui, "fe-a", Mode::On, 0);
+        // One outside the agents tree (archived, say) does not.
+        ui.tree_info.as_mut().unwrap().nodes.insert(
+            "gone".into(),
+            NodeInfo {
+                mode: Mode::Off,
+                ..node_info(Some((3600, 0)))
+            },
+        );
+        assert!(!header(&mut ui).contains("budgets: off"));
+        // The global mode.
+        ui.tree_info.as_mut().unwrap().budgets_off = true;
+        assert!(header(&mut ui).contains("budgets: off"));
+        // And in the other views: the badge is the header's, not the agents'.
+        ui.view = View::Active;
+        assert!(header(&mut ui).contains("budgets: off"));
     }
 
     #[test]
