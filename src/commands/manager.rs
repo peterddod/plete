@@ -874,8 +874,15 @@ fn set_budget_for(
             "inherit" => None,
             other => Some(budget::Mode::parse(other).map_err(|e| anyhow::anyhow!("--mode: {e}"))?),
         };
+        let was_off = budget::mode_or_on(app, task) == budget::Mode::Off;
         app.db
             .set_budget_mode(&task.id, own.map(budget::Mode::as_str))?;
+        // Only moving into or out of `off` starts what was told over: `on`
+        // to `auto`, or an `on` that was inherited already, must not tell
+        // 80% and 100% again.
+        if was_off != (budget::mode_or_on(app, task) == budget::Mode::Off) {
+            app.db.restart_told(&task.id)?;
+        }
         match own {
             Some(own) => eprintln!(
                 "plete: {}'s budget mode is {}",
@@ -936,8 +943,8 @@ fn budget_text(app: &App, task: &TaskRecord) -> Result<String> {
 
 /// After a mode is set: unless budgets are now off, every row under `task`
 /// and above it is checked at once, so a task already over its limit is
-/// paused now rather than at its next charge.
-/// What it says of that, if it checked.
+/// paused now rather than at its next charge. What it says of that, if it
+/// checked.
 fn recheck(app: &App, task: &TaskRecord, mode: Option<&str>) -> Result<Option<&'static str>> {
     if mode.is_none() || budget::mode_or_on(app, task) == budget::Mode::Off {
         return Ok(None);
@@ -1392,6 +1399,45 @@ mod tests {
                 "inherited: {inherited}"
             );
         }
+    }
+
+    /// Only a move into or out of `off` starts what was told over: an
+    /// explicit `on` on a task already `on`, `auto`, or clearing an override
+    /// the inherited mode equals must not tell 80% and 100% again.
+    #[test]
+    fn only_a_move_across_off_starts_what_was_told_over() {
+        let (_dir, app, root) = lab();
+        let m = add(&app, "m", TaskKind::Work, &root, &[]);
+        let w = add(&app, "w", TaskKind::Work, &m, &[]);
+        app.db.set_budget_max("w-id", None, Some(5)).unwrap();
+        app.db.charge("w-id", 0, 8).unwrap();
+        budget::enforce(&app, &w).unwrap();
+        let warned = || app.db.budget("w-id").unwrap().unwrap().warned;
+        assert_eq!(warned(), 100);
+        for (mode, want) in [
+            ("on", 100),
+            ("auto", 100),
+            ("on", 100),
+            ("inherit", 100),
+            ("off", 0),
+        ] {
+            set_budget(&app, "w", None, Some(mode)).unwrap();
+            assert_eq!(warned(), want, "{mode}");
+        }
+        // Off, then on: told again.
+        set_budget(&app, "w", None, Some("off")).unwrap();
+        assert_eq!(warned(), 0, "off to off");
+        app.db.set_warned("w-id", 80).unwrap();
+        set_budget(&app, "w", None, Some("off")).unwrap();
+        assert_eq!(warned(), 80, "off to off keeps it");
+        set_budget(&app, "w", None, Some("on")).unwrap();
+        assert_eq!(warned(), 100, "on again: told afresh");
+        // An inherited `on` equal to the old override.
+        app.db.set_budget_mode("m-id", Some("on")).unwrap();
+        set_budget(&app, "w", None, Some("on")).unwrap();
+        assert_eq!(warned(), 100);
+        set_budget(&app, "w", None, Some("inherit")).unwrap();
+        assert_eq!(warned(), 100, "inherit an equal mode");
     }
 
     /// `task budget` says the limit is not enforced exactly when it set one
