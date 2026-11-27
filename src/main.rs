@@ -41,6 +41,7 @@ mod todo;
 mod tui;
 mod waiter;
 mod wake;
+mod warmup;
 mod watch;
 mod worktrees;
 
