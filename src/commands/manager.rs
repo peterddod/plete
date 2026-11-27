@@ -122,6 +122,9 @@ pub fn new(app: &App, args: &NewManager) -> Result<()> {
     )?;
     warn_all(&created.warnings);
     let task = created.task;
+    if plan.budget.is_some() {
+        budget::note_if_off(app, &task);
+    }
     super::task::set_notify_flags(app, &task.id, &flags)?;
     app.db.set_task_agent(&task.id, &profile.name)?;
     if let Some(pr) = profile.settings.pr {
@@ -817,13 +820,27 @@ fn set_budget_for(
         }
     }
     match change {
-        Some(change) => change_budget(app, caller, task, change),
-        None if mode.is_none() => {
-            eprintln!("plete: no change given");
-            Ok(())
-        }
-        None => Ok(()),
+        Some(change) => change_budget(app, caller, task, change)?,
+        None if mode.is_none() => eprintln!("plete: no change given"),
+        None => {}
     }
+    recheck(app, task, mode)
+}
+
+/// After a mode is set: unless budgets are now off, every row under `task`
+/// and above it is checked at once, so a task already over its limit is
+/// paused now rather than at its next charge.
+fn recheck(app: &App, task: &TaskRecord, mode: Option<&str>) -> Result<()> {
+    if mode.is_none() || budget::mode_or_on(app, task) == budget::Mode::Off {
+        return Ok(());
+    }
+    eprintln!("plete: budgets re-checked; a task over its limit is paused now");
+    for node in tasks::subtree_leaves_first(app, task)? {
+        if matches!(budget::enforce(app, &node)?, budget::Threshold::Hit100) {
+            budget::report_blocked(app, &node);
+        }
+    }
+    Ok(())
 }
 
 fn change_budget(app: &App, caller: &Caller, task: &TaskRecord, change: Change) -> Result<()> {
@@ -836,6 +853,7 @@ fn change_budget(app: &App, caller: &Caller, task: &TaskRecord, change: Change) 
         .with_context(|| format!("{}'s budget", manager::label(task)))?;
     let want = budget::cap(app, task, caller, had, want)?;
     app.db.set_budget_max(&task.id, want.secs, want.turns)?;
+    budget::note_if_off(app, task);
     let (secs, turns) = app.db.subtree_used(&task.id)?;
     eprintln!(
         "plete: {}'s budget is {} ({}m and {turns} turns used, with the tasks below it)",
@@ -1093,6 +1111,38 @@ mod tests {
         // Neither: nothing changes.
         set_budget(&app, "m", None, None).unwrap();
         assert_eq!(app.db.budget("m-id").unwrap().unwrap(), row);
+    }
+
+    #[test]
+    fn switching_to_on_checks_every_row_at_once_and_to_off_resumes_nothing() {
+        let (_dir, app, root) = lab();
+        let m = add(&app, "m", TaskKind::Work, &root, &[]);
+        let w = add(&app, "w", TaskKind::Work, &m, &[]);
+        let state = |id: &str| {
+            let t = app.db.get_task(id).unwrap().unwrap();
+            (t.run_state, t.run_state_by)
+        };
+        app.db.set_budget_mode("m-id", Some("off")).unwrap();
+        app.db.set_budget_max("m-id", None, Some(10)).unwrap();
+        app.db.set_budget_max("w-id", None, Some(5)).unwrap();
+        app.db.charge("w-id", 0, 8).unwrap();
+        budget::enforce(&app, &w).unwrap();
+        assert_eq!(state("m-id").0, RunState::Run);
+        assert_eq!(state("w-id").0, RunState::Run);
+        // On: m's row is not over, w's own is, and is paused now.
+        set_budget(&app, "m", None, Some("on")).unwrap();
+        assert_eq!(state("m-id").0, RunState::Run);
+        assert_eq!(state("w-id"), (RunState::Paused, Some(Setter::Budget)));
+        // Off again: nothing is resumed; the human does.
+        set_budget(&app, "m", None, Some("off")).unwrap();
+        assert_eq!(state("w-id"), (RunState::Paused, Some(Setter::Budget)));
+        let w = app.db.get_task(&w.id).unwrap().unwrap();
+        run::resume(&app, &Caller::Root, &w).unwrap();
+        assert_eq!(state("w-id").0, RunState::Run);
+        // Over its own limit, and `auto` holds as `on` does.
+        app.db.charge("m-id", 0, 5).unwrap();
+        set_budget(&app, "m", None, Some("auto")).unwrap();
+        assert_eq!(state("m-id"), (RunState::Paused, Some(Setter::Budget)));
     }
 
     #[test]

@@ -1386,7 +1386,8 @@ fn give_budget(app: &App, review: &ReviewRecord) -> Result<()> {
         more(review.used_secs, caps.secs),
         more(review.used_turns, caps.turns),
     )?;
-    app.db.resume_review(&review.id)?;
+    app.db
+        .resume_review(&review.id, crate::manager::budget::global_off(app))?;
     Ok(())
 }
 

@@ -572,6 +572,17 @@ get a `status` report. At 100% plete **pauses** the node's subtree and reports
 own remaining budget, or stop it. (`plete manager budget` works on any
 descendant, workers included.)
 
+**Budget modes (as built).** A mode is `on` (as above), `off`, or `auto`
+(not yet built). It is `[budget] mode` unless a task has its own, which its
+subtree inherits (`task new --budget-mode`, profile `budget_mode`, `task budget
+--mode`; a node may not set its own or an ancestor's). A row is held to its
+owner's mode. Under `off` the row is inert: usage is still charged, but nothing
+warns, pauses, reports or notifies; `remaining`, `cap` and `child_budget` ignore
+it, so a limit above is not a bound and a child's budget is not refused or cut;
+`check_resume` and the resume write skip it, so a task paused while `on` can be
+resumed; and `[review]` caps are off when `[budget] mode` is. Switching to `on`
+re-checks every row at once.
+
 **Phase 2 (as built).** Time is busy time only, while the agent runs or
 waits on a prompt (P19), not while its pane is merely alive: an idle
 manager waiting on reports spends nothing. At 100% plete pauses the node and

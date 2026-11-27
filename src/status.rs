@@ -1676,6 +1676,27 @@ mod tests {
         assert_eq!(ctx.hold, None);
     }
 
+    /// The sweep and the Stop hook only charge an `off` row: no threshold,
+    /// no pause, however far past its limit it goes.
+    #[test]
+    fn an_off_budget_is_charged_by_a_sweep_and_a_stop_and_never_hit() {
+        let (_home, app) = lab();
+        app.db.set_budget_max("w", Some(100), Some(1)).unwrap();
+        app.db.set_budget_mode("w", Some("off")).unwrap();
+        let dir = busy_w(&app);
+        let w = app.db.get_task("w").unwrap().unwrap();
+        assert_eq!(fold_busy(&app, &w, true, 250).unwrap(), Threshold::None);
+        assert_eq!(used(&app, "w"), (150, 0));
+        let stop = hook("Stop", EventKind::Stopped);
+        let open = || -> Result<App> { panic!("the app is open already") };
+        let ctx = hook_ctx_with(Some(app), &open, &dir, "w", &stop, 400, &|_| true).unwrap();
+        assert_eq!(used(&ctx.app, "w"), (300, 1));
+        assert_eq!(ctx.threshold, Threshold::None);
+        assert_eq!(ctx.hold, None);
+        let w = ctx.app.db.get_task("w").unwrap().unwrap();
+        assert_eq!(w.run_state, RunState::Run);
+    }
+
     #[test]
     fn a_stop_that_uses_the_budget_up_hands_nothing_over() {
         let harness = harness::by_id("claude-code").unwrap();

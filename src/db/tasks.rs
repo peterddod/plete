@@ -1910,8 +1910,14 @@ impl Database {
     /// and its subtree is still within its budget: false, and nothing
     /// written, when a pause or stop changed them since, or a charge used
     /// the budget up (a budget's pause of a row a node holds already leaves
-    /// the row as it was).
-    pub fn resume_run_state(&self, id: &str, checked: (RunState, Option<&Setter>)) -> Result<bool> {
+    /// the row as it was). `inert`: its budget mode is `off`, so its limits
+    /// are not looked at.
+    pub fn resume_run_state(
+        &self,
+        id: &str,
+        checked: (RunState, Option<&Setter>),
+        inert: bool,
+    ) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(task) = get_task_in(&tx, id)? else {
@@ -1920,7 +1926,7 @@ impl Database {
         if (task.run_state, task.run_state_by.as_ref()) != checked {
             return Ok(false);
         }
-        if let Some(row) = budget_in(&tx, id)? {
+        if let Some(row) = budget_in(&tx, id)?.filter(|_| !inert) {
             let (secs, turns) = subtree_used_in(&tx, id)?;
             if row.max_secs.is_some_and(|max| secs >= max)
                 || row.max_turns.is_some_and(|max| turns >= max)
@@ -3252,11 +3258,11 @@ mod tests {
         db.set_run_state("n", RunState::Paused, Some(&Setter::User))
             .unwrap();
         assert!(!db
-            .resume_run_state("n", (RunState::Paused, Some(&by_m)))
+            .resume_run_state("n", (RunState::Paused, Some(&by_m)), false)
             .unwrap());
         assert_eq!(state("n"), (RunState::Paused, Some(Setter::User)));
         assert!(db
-            .resume_run_state("n", (RunState::Paused, Some(&Setter::User)))
+            .resume_run_state("n", (RunState::Paused, Some(&Setter::User)), false)
             .unwrap());
         assert_eq!(state("n"), (RunState::Run, None));
     }
@@ -3277,13 +3283,18 @@ mod tests {
         db.set_run_state("n", RunState::Paused, Some(&Setter::Budget))
             .unwrap();
         assert!(!db
-            .resume_run_state("n", (RunState::Paused, Some(&by_m)))
+            .resume_run_state("n", (RunState::Paused, Some(&by_m)), false)
             .unwrap());
         let n = db.get_task("n").unwrap().unwrap();
         assert_eq!(
             (n.run_state, n.run_state_by),
-            (RunState::Paused, Some(by_m))
+            (RunState::Paused, Some(by_m.clone()))
         );
+        // An inert row (its mode is off) is not looked at.
+        assert!(db
+            .resume_run_state("n", (RunState::Paused, Some(&by_m)), true)
+            .unwrap());
+        assert_eq!(db.get_task("n").unwrap().unwrap().run_state, RunState::Run);
     }
 
     #[test]

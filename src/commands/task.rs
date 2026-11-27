@@ -109,6 +109,9 @@ pub fn new(app: &App, args: &NewTaskArgs) -> Result<()> {
         },
     )?;
     warn_all(&created.warnings);
+    if plan.as_ref().is_some_and(|p| p.budget.is_some()) {
+        crate::manager::budget::note_if_off(app, &created.task);
+    }
     set_notify_flags(app, &created.task.id, &flags)?;
     // Before its agent can start, which reads them.
     let pr = args.pr.or(profile.as_ref().and_then(|p| p.settings.pr));

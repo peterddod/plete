@@ -581,8 +581,9 @@ impl Database {
     }
 
     /// Lift a pause a limit set, if it is set: false when the review was
-    /// not paused, or has used a limit up still.
-    pub fn resume_review(&self, id: &str) -> Result<bool> {
+    /// not paused, or has used a limit up still; `inert`: budgets are `off`,
+    /// so its limits are not looked at.
+    pub fn resume_review(&self, id: &str, inert: bool) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(r) = get_review_in(&tx, id)? else {
@@ -590,8 +591,9 @@ impl Database {
         };
         let b = r.budget();
         if !r.paused
-            || b.max_secs.is_some_and(|max| b.used_secs >= max)
-            || b.max_turns.is_some_and(|max| b.used_turns >= max)
+            || (!inert
+                && (b.max_secs.is_some_and(|max| b.used_secs >= max)
+                    || b.max_turns.is_some_and(|max| b.used_turns >= max)))
         {
             return Ok(false);
         }
@@ -933,9 +935,9 @@ mod tests {
         assert!(check.newly && check.level == 100);
         assert!(db.get_review("r").unwrap().unwrap().paused);
         // Still used up: it stays paused.
-        assert!(!db.resume_review("r").unwrap());
+        assert!(!db.resume_review("r", false).unwrap());
         db.set_review_budget_max("r", None, Some(30)).unwrap();
-        assert!(db.resume_review("r").unwrap());
+        assert!(db.resume_review("r", false).unwrap());
         assert!(!db.get_review("r").unwrap().unwrap().paused);
     }
 
