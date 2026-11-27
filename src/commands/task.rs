@@ -72,9 +72,10 @@ pub fn new(app: &App, args: &NewTaskArgs) -> Result<()> {
                 || d.done_when.is_some()
                 || d.allow.is_some()
                 || !d.budget.is_empty()
+                || d.budget_mode.is_some()
             {
                 bail!(
-                    "--goal/--done/--allow/--budget are for a task with a parent; add --parent {}",
+                    "--goal/--done/--allow/--budget/--budget-mode are for a task with a parent; add --parent {}",
                     assistant::SLUG
                 );
             }
@@ -153,7 +154,7 @@ fn profile_project(app: &App, caller: &Caller, args: &NewTaskArgs) -> Option<Str
 }
 
 /// `d` with what `profile` sets wherever the command line left it unset:
-/// the grant and the budget; and the profile's fan-out limit.
+/// the grant, the budget and its mode; and the profile's fan-out limit.
 pub(crate) fn with_profile(
     d: &Delegation,
     profile: Option<&Profile>,
@@ -165,6 +166,9 @@ pub(crate) fn with_profile(
     let s = &profile.settings;
     if d.allow.is_none() {
         d.allow = s.allow.clone();
+    }
+    if d.budget_mode.is_none() {
+        d.budget_mode = s.budget_mode.clone();
     }
     if d.budget.is_empty() {
         if s.budget.as_deref() == Some(profiles::DEFAULT_BUDGET) {
@@ -1700,6 +1704,27 @@ pub(crate) fn warn_all(warnings: &[String]) {
 mod tests {
     use super::*;
     use crate::harness::AgentMessage;
+
+    #[test]
+    fn a_profile_budget_mode_applies_unless_the_flag_names_one() {
+        let (settings, body) = profiles::parse("+++\nbudget_mode = \"auto\"\n+++\n").unwrap();
+        let profile = Profile {
+            name: "p".into(),
+            source: profiles::Source::Builtin,
+            settings,
+            body,
+        };
+        let (d, _) = with_profile(&Delegation::default(), Some(&profile)).unwrap();
+        assert_eq!(d.budget_mode.as_deref(), Some("auto"));
+        let flagged = Delegation {
+            budget_mode: Some("on".into()),
+            ..Delegation::default()
+        };
+        let (d, _) = with_profile(&flagged, Some(&profile)).unwrap();
+        assert_eq!(d.budget_mode.as_deref(), Some("on"));
+        let (d, _) = with_profile(&Delegation::default(), None).unwrap();
+        assert_eq!(d.budget_mode, None);
+    }
 
     /// Each way a start goes is said as `start_new` has always said it,
     /// the warnings first.

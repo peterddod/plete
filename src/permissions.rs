@@ -933,13 +933,22 @@ fn tree_gate(command: &TreeCommands) -> Gate {
                 false => format!("set task {name}'s grant to {}", caps.join(", ")),
             },
         ),
-        TreeCommands::Budget { name, change } => needs(
-            "task.grant",
-            format!(
-                "changed task {name}'s budget by {}",
-                crate::manager::budget::change_label(*change)
-            ),
-        ),
+        TreeCommands::Budget { name, change, mode } => {
+            let mut what = Vec::new();
+            if let Some(change) = change {
+                what.push(format!(
+                    "by {}",
+                    crate::manager::budget::change_label(*change)
+                ));
+            }
+            if let Some(mode) = mode {
+                what.push(format!("to mode {mode}"));
+            }
+            needs(
+                "task.grant",
+                format!("changed task {name}'s budget {}", what.join(" and ")),
+            )
+        }
         TreeCommands::Pause { name } => needs("task.stop", format!("paused task {name}")),
         TreeCommands::Resume { name } => needs("task.stop", format!("resumed task {name}")),
         TreeCommands::Stop { name, .. } => needs(
