@@ -40,7 +40,7 @@ pub fn safe_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
-/// The directory of one warm-up, `root` being [`crate::config::warmup_root`].
+/// The directory of one warm-up, `root` being the `warmup` directory of the plete home.
 pub fn dir(root: &Path, profile: &str, scope: &str) -> Result<PathBuf> {
     Ok(root.join(safe_name(profile)?).join(safe_name(scope)?))
 }
@@ -62,7 +62,16 @@ pub fn work_dir(dir: &Path) -> PathBuf {
 /// stale, not an error.
 pub fn read_meta(dir: &Path) -> Option<Meta> {
     let text = std::fs::read_to_string(meta_path(dir)).ok()?;
-    serde_json::from_str(&text).ok()
+    let meta: Meta = serde_json::from_str(&text).ok()?;
+    // Later steps use these in paths and argv, so a hand-edited or damaged
+    // file must not smuggle in anything but plain names.
+    let plain = uuid::Uuid::parse_str(&meta.base_session).is_ok()
+        && meta.commits.keys().all(|k| safe_name(k).is_ok())
+        && meta
+            .commits
+            .values()
+            .all(|c| c.bytes().all(|b| b.is_ascii_hexdigit()));
+    plain.then_some(meta)
 }
 
 /// Write `text` to `dir/name` by renaming a temp file over it, so a reader
@@ -94,7 +103,7 @@ mod tests {
 
     fn meta() -> Meta {
         Meta {
-            base_session: "b".into(),
+            base_session: "6f1c1c3e-5b0a-4c53-9a53-2f0f8f3a9d11".into(),
             built_at: 100,
             commits: BTreeMap::from([("jeet".into(), "abc".into())]),
             fingerprint: "f".into(),
@@ -151,12 +160,43 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             meta_path(tmp.path()),
-            r#"{"base_session":"b","built_at":1,"commits":{"r":"abc"},"fingerprint":"f","turns":2,"duration_secs":3}"#,
+            r#"{"base_session":"6f1c1c3e-5b0a-4c53-9a53-2f0f8f3a9d11","built_at":1,"commits":{"r":"abc"},"fingerprint":"f","turns":2,"duration_secs":3}"#,
         )
         .unwrap();
         let m = read_meta(tmp.path()).unwrap();
         assert!(m.files_read.is_empty());
         assert_eq!(m.base_tokens, None);
+    }
+
+    #[test]
+    fn a_meta_with_unsafe_names_reads_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        write_meta(d, &meta()).unwrap();
+        assert!(read_meta(d).is_some());
+        let with = |edit: fn(&mut Meta)| {
+            let mut m = meta();
+            edit(&mut m);
+            write_meta(d, &m).unwrap();
+            read_meta(d)
+        };
+        assert_eq!(with(|m| m.base_session = "../x".into()), None);
+        assert_eq!(with(|m| m.base_session = "--resume".into()), None);
+        assert_eq!(with(|m| m.base_session = "b".into()), None);
+        assert_eq!(with(|m| m.base_session = "".into()), None);
+        assert_eq!(with(|m| m.base_session = "a b".into()), None);
+        assert_eq!(
+            with(|m| {
+                m.commits.insert("../r".into(), "abc".into());
+            }),
+            None
+        );
+        assert_eq!(
+            with(|m| {
+                m.commits.insert("r".into(), "--all".into());
+            }),
+            None
+        );
     }
 
     #[test]

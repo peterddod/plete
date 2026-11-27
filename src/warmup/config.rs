@@ -113,20 +113,18 @@ impl<T: Serialize> Serialize for Trigger<T> {
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Trigger<T> {
+/// Read through a `toml::Value`, as profiles are, so the value's own error
+/// (`not a time of day`) is kept, which an untagged enum would lose.
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for Trigger<T> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw<T> {
-            Flag(bool),
-            Value(T),
-        }
-        match Raw::<T>::deserialize(d)? {
-            Raw::Flag(false) => Ok(Trigger::Off),
-            Raw::Flag(true) => Err(serde::de::Error::custom(
+        match toml::Value::deserialize(d)? {
+            toml::Value::Boolean(false) => Ok(Trigger::Off),
+            toml::Value::Boolean(true) => Err(serde::de::Error::custom(
                 "give a value, or false to turn it off",
             )),
-            Raw::Value(v) => Ok(Trigger::On(v)),
+            value => T::deserialize(value)
+                .map(Trigger::On)
+                .map_err(serde::de::Error::custom),
         }
     }
 }
@@ -240,7 +238,12 @@ pub fn check(c: &Config) -> Result<()> {
     }
     for path in &c.refresh.paths {
         let p = path.trim();
-        if p.is_empty() || p.starts_with('/') || p.split('/').any(|part| part == "..") {
+        if p.is_empty()
+            || p != path
+            || path.chars().any(char::is_control)
+            || p.starts_with('/')
+            || p.split('/').any(|part| part == "..")
+        {
             bail!("warmup.refresh.paths: {path:?} is no path inside the repo");
         }
     }
@@ -313,6 +316,25 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_every_says_what_is_wrong() {
+        let err = |v: &str| {
+            parse(&format!(
+                "prompt = \"m\"\nper = \"repo\"\n[refresh]\nevery = \"{v}\""
+            ))
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(
+            err("25:00").contains("not a time of day"),
+            "{}",
+            err("25:00")
+        );
+        assert!(err("1w").contains("not a duration"), "{}", err("1w"));
+        let e = parse("prompt = \"m\"\nper = \"repo\"\n[refresh]\ncommits = \"x\"").unwrap_err();
+        assert!(e.to_string().contains("invalid type"), "{e}");
+    }
+
+    #[test]
     fn timeout_is_a_duration() {
         let c = parse("prompt = \"m\"\nper = \"repo\"\ntimeout = \"15m\"").unwrap();
         assert_eq!(c.timeout, Span(900));
@@ -340,7 +362,9 @@ mod tests {
         let mut c = ok.clone();
         c.max_base_tokens = 0;
         assert!(check(&c).is_err());
-        for bad in ["", "/etc", "../x", "a/../b"] {
+        for bad in [
+            "", "/etc", "../x", "a/../b", " src/", "src/ ", "sr\0c", "a\nb",
+        ] {
             let mut c = ok.clone();
             c.refresh.paths = vec![bad.into()];
             assert!(check(&c).is_err(), "{bad:?}");
