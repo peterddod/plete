@@ -362,6 +362,10 @@ fn start_tmux(
         name: task.name.clone(),
         dir,
         known_sessions,
+        fork_base: match spec.supports_sessions() {
+            true => app.db.task_fork_base(&task.id)?,
+            false => None,
+        },
         ungated_warning: task.parent_id.is_some(),
         spec,
         hooks,
@@ -417,6 +421,9 @@ pub struct Launch {
     pub spec: AgentSpec,
     /// The sessions the index has recorded for it.
     pub known_sessions: Vec<TaskSessionRecord>,
+    /// A session, and the directory it ran in, for a start with no session
+    /// of its own to fork instead of starting cold.
+    pub fork_base: Option<(String, PathBuf)>,
     /// Environment its agent starts with besides plete's own (its agent
     /// profile's `env`).
     pub env: Vec<(String, String)>,
@@ -587,13 +594,20 @@ fn launch_argv(
         return Ok((argv, None));
     }
 
-    let (id, resume) = pick_session(launch, session)?;
+    let (id, start) = pick_session(launch, session)?;
+    // A fork looks for its base where its own transcripts are kept.
+    if let Start::Fork(base, from) = &start {
+        spec.harness
+            .seed_session(from, &launch.dir, base)
+            .with_context(|| format!("seed session {base} for {}", launch.subject))?;
+    }
     // Recorded before launch, so the session is known even if the agent
-    // never gets as far as its first hook.
+    // never gets as far as its first hook. A fork's base never is.
     record_session(&id)?;
-    let args = match resume {
-        true => spec.harness.resume_args(&id),
-        false => spec.harness.new_session_args(&id, &launch.name),
+    let args = match &start {
+        Start::Resume => spec.harness.resume_args(&id),
+        Start::New => spec.harness.new_session_args(&id, &launch.name),
+        Start::Fork(base, _) => spec.harness.fork_args(base, &id, &launch.name),
     };
     argv.extend(args.unwrap_or_default());
     let hooks = launch
@@ -608,10 +622,21 @@ fn launch_argv(
     Ok((argv, Some(id)))
 }
 
-/// Which session to run, and whether it is resumed. A recorded session that
-/// never got a transcript (the agent died before writing one) cannot be
-/// resumed, so it is started afresh under the same id.
-fn pick_session(launch: &Launch, session: Option<&str>) -> Result<(String, bool)> {
+/// How a launch's session starts.
+#[derive(Debug, PartialEq, Eq)]
+enum Start {
+    New,
+    Resume,
+    /// A new session that begins as a copy of this one, run in this
+    /// directory.
+    Fork(String, PathBuf),
+}
+
+/// Which session to run, and how it starts. A recorded session that never
+/// got a transcript (the agent died before writing one) cannot be resumed,
+/// so it is started afresh under the same id. A start with no session at
+/// all forks the launch's fork base, when it has one and the harness can.
+fn pick_session(launch: &Launch, session: Option<&str>) -> Result<(String, Start)> {
     let (spec, dir, known) = (&launch.spec, &launch.dir, &launch.known_sessions);
     let id = match session {
         Some(id) => {
@@ -630,11 +655,24 @@ fn pick_session(launch: &Launch, session: Option<&str>) -> Result<(String, bool)
         }
         None => match latest_session(dir, known) {
             Some(id) => id,
-            None => return Ok((Uuid::new_v4().to_string(), false)),
+            None => {
+                let fork = launch
+                    .fork_base
+                    .as_ref()
+                    .filter(|_| spec.harness.fork_args("", "", "").is_some());
+                let start = match fork {
+                    Some((base, from)) => Start::Fork(base.clone(), from.clone()),
+                    None => Start::New,
+                };
+                return Ok((Uuid::new_v4().to_string(), start));
+            }
         },
     };
-    let resume = spec.harness.has_session(dir, &id);
-    Ok((id, resume))
+    let start = match spec.harness.has_session(dir, &id) {
+        true => Start::Resume,
+        false => Start::New,
+    };
+    Ok((id, start))
 }
 
 /// The one session of a work task or manager, the one it resumes: the one
@@ -1694,5 +1732,172 @@ mod tests {
         .unwrap();
         assert_eq!(latest_session(dir.path(), &known).as_deref(), Some("b"));
         assert!(latest_session(dir.path(), &[]).is_none());
+    }
+
+    /// A harness that keeps sessions in memory, and forks them when `fork`.
+    struct Fake {
+        fork: bool,
+        have: std::sync::Mutex<Vec<String>>,
+        seeded: std::sync::Mutex<Vec<(PathBuf, PathBuf, String)>>,
+    }
+
+    impl Harness for Fake {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn name(&self) -> &'static str {
+            "Fake"
+        }
+        fn default_command(&self) -> Option<&'static str> {
+            None
+        }
+        fn new_session_args(&self, id: &str, name: &str) -> Option<Vec<String>> {
+            Some(vec!["--new".into(), id.into(), name.into()])
+        }
+        fn resume_args(&self, id: &str) -> Option<Vec<String>> {
+            Some(vec!["--resume".into(), id.into()])
+        }
+        fn fork_args(&self, base: &str, id: &str, name: &str) -> Option<Vec<String>> {
+            self.fork
+                .then(|| ["--fork", base, id, name].map(String::from).to_vec())
+        }
+        fn has_session(&self, _dir: &Path, id: &str) -> bool {
+            self.have.lock().unwrap().iter().any(|s| s == id)
+        }
+        fn seed_session(&self, from: &Path, to: &Path, id: &str) -> Result<()> {
+            self.seeded
+                .lock()
+                .unwrap()
+                .push((from.into(), to.into(), id.into()));
+            Ok(())
+        }
+    }
+
+    fn fake(fork: bool) -> &'static Fake {
+        Box::leak(Box::new(Fake {
+            fork,
+            have: Default::default(),
+            seeded: Default::default(),
+        }))
+    }
+
+    fn launch_for(
+        harness: &'static Fake,
+        known: &[&str],
+        fork_base: Option<(&str, &str)>,
+    ) -> Launch {
+        Launch {
+            id: "t1".into(),
+            slug: "t1".into(),
+            subject: "task t1".into(),
+            name: "t one".into(),
+            dir: PathBuf::from("/work/t1"),
+            spec: AgentSpec {
+                argv: vec!["agent".into()],
+                harness,
+            },
+            known_sessions: known
+                .iter()
+                .map(|id| TaskSessionRecord {
+                    session_id: id.to_string(),
+                    task_id: "t1".into(),
+                    parent_id: None,
+                    name: "t one".into(),
+                    created_at: 1,
+                    last_activity: 1,
+                })
+                .collect(),
+            fork_base: fork_base.map(|(id, dir)| (id.to_string(), PathBuf::from(dir))),
+            env: Vec::new(),
+            hooks: Some(HookSetup {
+                task_id: "t1".into(),
+                ..HookSetup::default()
+            }),
+            ungated_warning: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// `launch_argv` for `launch`, with what was recorded and when.
+    fn argv_of(home: &Path, launch: &Launch, session: Option<&str>) -> (Vec<String>, Vec<String>) {
+        let app = App {
+            config: crate::config::load_or_create(home).unwrap(),
+            db: crate::db::Database::open(&crate::config::index_path(home)).unwrap(),
+            new_home: None,
+            home: home.to_path_buf(),
+        };
+        let mut recorded = Vec::new();
+        let (argv, id) = launch_argv(&app, launch, session, None, |id| {
+            recorded.push(id.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(id.as_deref(), recorded.first().map(String::as_str));
+        (argv, recorded)
+    }
+
+    #[test]
+    fn a_task_with_a_fork_base_and_no_session_forks_it() {
+        let home = tempfile::tempdir().unwrap();
+        let harness = fake(true);
+        let launch = launch_for(harness, &[], Some(("base-1", "/warm/work")));
+        let (argv, recorded) = argv_of(home.path(), &launch, None);
+        assert_eq!(recorded.len(), 1);
+        let new = &recorded[0];
+        assert_ne!(new, "base-1");
+        assert_eq!(&argv[1..5], ["--fork", "base-1", new.as_str(), "t one"]);
+        assert!(!recorded.iter().any(|id| id == "base-1"));
+        assert_eq!(
+            *harness.seeded.lock().unwrap(),
+            [(
+                PathBuf::from("/warm/work"),
+                PathBuf::from("/work/t1"),
+                "base-1".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_later_start_resumes_the_fork_not_the_base() {
+        let home = tempfile::tempdir().unwrap();
+        let harness = fake(true);
+        let first = launch_for(harness, &[], Some(("base-1", "/warm/work")));
+        let (_, recorded) = argv_of(home.path(), &first, None);
+        let new = recorded[0].clone();
+        harness.have.lock().unwrap().push(new.clone());
+        harness.seeded.lock().unwrap().clear();
+
+        // The next start knows the session plete recorded, fork base or not.
+        let second = launch_for(harness, &[&new], Some(("base-1", "/warm/work")));
+        let (argv, recorded) = argv_of(home.path(), &second, Some(&new));
+        assert_eq!(&argv[1..], ["--resume", new.as_str()]);
+        assert_eq!(recorded, [new]);
+        assert!(!argv.iter().any(|a| a == "--fork" || a == "base-1"));
+        assert!(harness.seeded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn without_a_fork_base_a_start_is_as_it_was() {
+        let home = tempfile::tempdir().unwrap();
+        let harness = fake(true);
+        let launch = launch_for(harness, &[], None);
+        let (argv, recorded) = argv_of(home.path(), &launch, None);
+        assert_eq!(&argv[1..], ["--new", recorded[0].as_str(), "t one"]);
+        assert!(harness.seeded.lock().unwrap().is_empty());
+
+        harness.have.lock().unwrap().push("s1".into());
+        let launch = launch_for(harness, &["s1"], None);
+        let (argv, _) = argv_of(home.path(), &launch, Some("s1"));
+        assert_eq!(&argv[1..], ["--resume", "s1"]);
+    }
+
+    #[test]
+    fn a_harness_that_cannot_fork_starts_cold() {
+        let home = tempfile::tempdir().unwrap();
+        let harness = fake(false);
+        let launch = launch_for(harness, &[], Some(("base-1", "/warm/work")));
+        let (argv, recorded) = argv_of(home.path(), &launch, None);
+        assert_eq!(&argv[1..], ["--new", recorded[0].as_str(), "t one"]);
+        assert!(harness.seeded.lock().unwrap().is_empty());
     }
 }

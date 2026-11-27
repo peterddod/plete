@@ -21,8 +21,8 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use super::{
-    shell_quote, AgentMessage, Enforcement, EventKind, Harness, HookEvent, HookSetup, LastTurn,
-    StartSource, StartupPrompt, TrustStep, TurnEnd,
+    shell_quote, AgentMessage, Enforcement, EventKind, Harness, Headless, HookEvent, HookSetup,
+    LastTurn, StartSource, StartupPrompt, Transcript, TrustStep, TurnEnd,
 };
 use crate::agent::{mtime_secs, AgentSession};
 use crate::status::{first_line, DETAIL_MAX};
@@ -112,6 +112,43 @@ impl Harness for ClaudeCode {
 
     fn resume_args(&self, id: &str) -> Option<Vec<String>> {
         Some(vec!["--resume".to_string(), id.to_string()])
+    }
+
+    fn fork_args(&self, base_id: &str, new_id: &str, name: &str) -> Option<Vec<String>> {
+        Some(
+            [
+                "--resume",
+                base_id,
+                "--fork-session",
+                "--session-id",
+                new_id,
+                "-n",
+                name,
+            ]
+            .map(String::from)
+            .to_vec(),
+        )
+    }
+
+    fn headless_args(&self, prompt: &str, opts: &Headless) -> Option<Vec<String>> {
+        let mut args = vec![
+            "-p".to_string(),
+            prompt.to_string(),
+            "--max-turns".to_string(),
+            opts.max_turns.to_string(),
+        ];
+        // One comma-joined value each: the flags take a list, which would
+        // otherwise swallow what follows.
+        for (flag, tools) in [
+            ("--allowedTools", opts.allow),
+            ("--disallowedTools", opts.deny),
+        ] {
+            if !tools.is_empty() {
+                args.push(flag.to_string());
+                args.push(tools.join(","));
+            }
+        }
+        Some(args)
     }
 
     fn add_dir_args(&self, path: &Path) -> Option<Vec<String>> {
@@ -251,6 +288,27 @@ impl Harness for ClaudeCode {
             copied.push(session);
         }
         Ok(copied)
+    }
+
+    /// `to` must exist: Claude names the store by its real path. A session
+    /// already at `to` is left alone.
+    fn seed_session(&self, from: &Path, to: &Path, id: &str) -> Result<()> {
+        let (Some(source), Some(dest)) = (session_dir(from), session_dir(to)) else {
+            bail!("could not locate the Claude Code config directory");
+        };
+        let name = format!("{id}.jsonl");
+        let target = dest.join(&name);
+        if target.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&dest).with_context(|| format!("create {}", dest.display()))?;
+        std::fs::copy(source.join(&name), &target).with_context(|| format!("copy session {id}"))?;
+        Ok(())
+    }
+
+    fn transcript_info(&self, dir: &Path, id: &str) -> Option<Transcript> {
+        let path = session_dir(dir)?.join(format!("{id}.jsonl"));
+        transcript_info(&path, dir).ok()
     }
 
     fn last_messages(&self, dir: &Path, id: &str, n: usize) -> Option<Result<LastTurn>> {
@@ -636,6 +694,64 @@ fn sessions(root: &Path) -> Result<Vec<AgentSession>> {
     }
     sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
     Ok(sessions)
+}
+
+/// The size of the last reply's input and the files read, from the
+/// transcript at `path`, whose session ran in `dir`. A reply's blocks are
+/// separate records sharing one `usage`, so the last record's is the last
+/// reply's. Subagents' records are not the session's own.
+#[allow(dead_code)] // called by the warm-up build, a later step
+fn transcript_info(path: &Path, dir: &Path) -> Result<Transcript> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut last_input_tokens = 0;
+    let mut files_read: Vec<String> = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if record["isSidechain"] == true || record["type"] != "assistant" {
+            continue;
+        }
+        let message = &record["message"];
+        let usage = &message["usage"];
+        if usage.is_object() {
+            last_input_tokens = [
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ]
+            .iter()
+            .filter_map(|k| usage[*k].as_u64())
+            .sum();
+        }
+        let Some(blocks) = message["content"].as_array() else {
+            continue;
+        };
+        for block in blocks {
+            if block["type"] != "tool_use" || block["name"] != "Read" {
+                continue;
+            }
+            let Some(file) = block["input"]["file_path"].as_str() else {
+                continue;
+            };
+            let path = Path::new(file);
+            let shown = path
+                .strip_prefix(&root)
+                .or_else(|_| path.strip_prefix(dir))
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if !files_read.contains(&shown) {
+                files_read.push(shown);
+            }
+        }
+    }
+    Ok(Transcript {
+        last_input_tokens,
+        files_read,
+    })
 }
 
 /// What Claude writes in place of a reply to a turn the user interrupted,
@@ -1475,5 +1591,170 @@ mod tests {
             serde_json::from_str(r#"{"type":"user","message":{"content":[{"text":"hello"}]}}"#)
                 .unwrap();
         assert_eq!(extract_summary(&value).unwrap(), "hello");
+    }
+
+    /// Run `f` with Claude's config directory a fresh temp one; the
+    /// environment is the process's, so these tests take turns.
+    fn with_config_dir<R>(f: impl FnOnce(&Path) -> R) -> R {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = tempfile::tempdir().unwrap();
+        let before = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", config.path());
+        let out = f(config.path());
+        match before {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        out
+    }
+
+    #[test]
+    fn a_fork_resumes_its_base_under_a_new_id() {
+        assert_eq!(
+            ClaudeCode.fork_args("base", "new", "my task").unwrap(),
+            [
+                "--resume",
+                "base",
+                "--fork-session",
+                "--session-id",
+                "new",
+                "-n",
+                "my task"
+            ]
+        );
+    }
+
+    #[test]
+    fn headless_args_put_the_prompt_first_and_each_tool_list_in_one_value() {
+        let allow = vec!["Read".to_string(), "Bash(git log:*)".to_string()];
+        let opts = Headless {
+            max_turns: 30,
+            allow: &allow,
+            deny: &[],
+        };
+        assert_eq!(
+            ClaudeCode.headless_args("explore", &opts).unwrap(),
+            [
+                "-p",
+                "explore",
+                "--max-turns",
+                "30",
+                "--allowedTools",
+                "Read,Bash(git log:*)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_is_seeded_into_another_directorys_store_once() {
+        with_config_dir(|config| {
+            let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let source = session_dir(from.path()).unwrap();
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("base.jsonl"), "one\n").unwrap();
+            std::fs::write(source.join("other.jsonl"), "x\n").unwrap();
+
+            ClaudeCode
+                .seed_session(from.path(), to.path(), "base")
+                .unwrap();
+            let dest = session_dir(to.path()).unwrap();
+            assert!(dest.starts_with(config));
+            assert_eq!(
+                std::fs::read_to_string(dest.join("base.jsonl")).unwrap(),
+                "one\n"
+            );
+            assert!(!dest.join("other.jsonl").exists());
+            assert_eq!(
+                std::fs::read_to_string(source.join("base.jsonl")).unwrap(),
+                "one\n"
+            );
+            assert!(ClaudeCode.has_session(to.path(), "base"));
+
+            // Seeding again leaves what the fork has written alone.
+            std::fs::write(dest.join("base.jsonl"), "changed\n").unwrap();
+            ClaudeCode
+                .seed_session(from.path(), to.path(), "base")
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dest.join("base.jsonl")).unwrap(),
+                "changed\n"
+            );
+            assert!(ClaudeCode
+                .seed_session(from.path(), to.path(), "missing")
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn a_transcript_gives_its_last_input_size_and_the_files_it_read() {
+        with_config_dir(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let src = root.join("src/main.rs");
+            let lines = [
+                serde_json::json!({"type":"user","message":{"content":"go"}}),
+                serde_json::json!({"type":"assistant","message":{"id":"m1",
+                    "usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":5,"output_tokens":9},
+                    "content":[{"type":"tool_use","name":"Read","input":{"file_path":src}},
+                               {"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}),
+                serde_json::json!({"type":"assistant","isSidechain":true,"message":{"id":"s1",
+                    "usage":{"input_tokens":9999},
+                    "content":[{"type":"tool_use","name":"Read","input":{"file_path":root.join("side.rs")}}]}}),
+                serde_json::json!({"type":"assistant","message":{"id":"m2",
+                    "usage":{"input_tokens":1,"cache_read_input_tokens":200,"cache_creation_input_tokens":4},
+                    "content":[{"type":"tool_use","name":"Read","input":{"file_path":src}},
+                               {"type":"tool_use","name":"Read","input":{"file_path":"/etc/hosts"}},
+                               {"type":"text","text":"done"}]}}),
+            ];
+            let store = session_dir(dir.path()).unwrap();
+            std::fs::create_dir_all(&store).unwrap();
+            let body: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            std::fs::write(store.join("s.jsonl"), body.join("\n")).unwrap();
+
+            let info = ClaudeCode.transcript_info(dir.path(), "s").unwrap();
+            assert_eq!(info.last_input_tokens, 205);
+            assert_eq!(info.files_read, ["src/main.rs", "/etc/hosts"]);
+            assert!(ClaudeCode.transcript_info(dir.path(), "none").is_none());
+        });
+    }
+
+    /// The check behind the fork launch (design step 1), by hand against the
+    /// mock API: `cargo test -- --ignored a_fork_started_in_another_cwd`
+    /// with `CLAUDE_BIN` the `claude` to try. A base seeded into another
+    /// directory's store must resume there as a fork under the new id,
+    /// leaving the base's transcript as it was.
+    #[test]
+    #[ignore]
+    fn a_fork_started_in_another_cwd_finds_its_seeded_base() {
+        let bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+        let (from, to) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (base, new) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let run = |dir: &Path, args: Vec<String>| {
+            std::process::Command::new(&bin)
+                .current_dir(dir)
+                .args(["-p", "reply with ok"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let out = run(
+            from.path(),
+            ClaudeCode.new_session_args(&base, "base").unwrap(),
+        );
+        assert!(out.status.success(), "{out:?}");
+        ClaudeCode
+            .seed_session(from.path(), to.path(), &base)
+            .unwrap();
+        let out = run(
+            to.path(),
+            ClaudeCode.fork_args(&base, &new, "fork").unwrap(),
+        );
+        assert!(out.status.success(), "{out:?}");
+        assert!(ClaudeCode.has_session(to.path(), &new));
+        assert!(!ClaudeCode.has_session(from.path(), &new));
     }
 }
