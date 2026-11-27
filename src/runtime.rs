@@ -662,10 +662,9 @@ fn pick_session(launch: &Launch, session: Option<&str>) -> Result<(String, Start
         None => match latest_session(dir, known) {
             Some(id) => id,
             None => {
-                let fork = launch
-                    .fork_base
-                    .as_ref()
-                    .filter(|_| spec.harness.can_fork());
+                let fork = launch.fork_base.as_ref().filter(|_| {
+                    spec.harness.can_fork() && spec.harness.fork_args("", "", "").is_some()
+                });
                 let start = match fork {
                     Some((base, from)) => Start::Fork(base.clone(), from.clone()),
                     None => Start::New,
@@ -1743,6 +1742,8 @@ mod tests {
     /// A harness that keeps sessions in memory, and forks them when `fork`.
     struct Fake {
         fork: bool,
+        /// Says it can fork but has no `fork_args`.
+        misdeclared: bool,
         /// Seeding fails, as for a base that was pruned.
         seed_fails: bool,
         have: std::sync::Mutex<Vec<String>>,
@@ -1771,7 +1772,7 @@ mod tests {
             self.fork
         }
         fn fork_args(&self, base: &str, id: &str, name: &str) -> Option<Vec<String>> {
-            self.fork
+            (self.fork && !self.misdeclared)
                 .then(|| ["--fork", base, id, name].map(String::from).to_vec())
         }
         fn has_session(&self, _dir: &Path, id: &str) -> bool {
@@ -1793,7 +1794,19 @@ mod tests {
     fn fake_failing_to_seed() -> &'static Fake {
         Box::leak(Box::new(Fake {
             fork: true,
+            misdeclared: false,
             seed_fails: true,
+            have: Default::default(),
+            seeded: Default::default(),
+            events: Default::default(),
+        }))
+    }
+
+    fn fake_misdeclared() -> &'static Fake {
+        Box::leak(Box::new(Fake {
+            fork: true,
+            misdeclared: true,
+            seed_fails: false,
             have: Default::default(),
             seeded: Default::default(),
             events: Default::default(),
@@ -1803,6 +1816,7 @@ mod tests {
     fn fake(fork: bool) -> &'static Fake {
         Box::leak(Box::new(Fake {
             fork,
+            misdeclared: false,
             seed_fails: false,
             have: Default::default(),
             seeded: Default::default(),
@@ -1938,6 +1952,16 @@ mod tests {
         assert_ne!(recorded[0], "base-1");
         assert_eq!(&argv[1..], ["--new", recorded[0].as_str(), "t one"]);
         assert!(!argv.iter().any(|a| a == "--fork" || a == "base-1"));
+    }
+
+    #[test]
+    fn a_harness_that_says_it_forks_but_has_no_fork_args_starts_cold() {
+        let home = tempfile::tempdir().unwrap();
+        let harness = fake_misdeclared();
+        let launch = launch_for(harness, &[], Some(("base-1", "/warm/work")));
+        let (argv, recorded) = argv_of(home.path(), harness, &launch, None);
+        assert_eq!(&argv[1..], ["--new", recorded[0].as_str(), "t one"]);
+        assert!(harness.seeded.lock().unwrap().is_empty());
     }
 
     #[test]

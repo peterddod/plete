@@ -752,8 +752,11 @@ fn transcript_info(path: &Path, dir: &Path) -> Option<Transcript> {
         .iter()
         .filter_map(|k| usage[*k].as_u64())
         .collect();
-        if !counted.is_empty() {
-            last_input_tokens = Some(counted.iter().sum());
+        // A synthetic or error reply counts nothing; it is not the last
+        // real input.
+        let total: u64 = counted.iter().sum();
+        if total > 0 && message["model"] != "<synthetic>" {
+            last_input_tokens = Some(total);
         }
         let Some(blocks) = message["content"].as_array() else {
             continue;
@@ -1760,6 +1763,11 @@ mod tests {
                     reply(serde_json::json!({"input_tokens": 7, "cache_read_input_tokens": 90})),
                     reply(serde_json::json!({"output_tokens": 3})),
                     reply(serde_json::json!({})),
+                    reply(serde_json::json!({"input_tokens": 0, "cache_read_input_tokens": 0})),
+                    line(
+                        serde_json::json!({"type":"assistant","message":{"model":"<synthetic>",
+                        "usage":{"input_tokens": 5},"content":[]}}),
+                    ),
                 ],
             );
             let info = ClaudeCode.transcript_info(dir.path(), "s").unwrap();
