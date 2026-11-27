@@ -1000,7 +1000,9 @@ impl PrMode {
 /// `[budget]` in config.toml: the budget mode and, for `auto`, the
 /// classifier and the bounds on its growth. Each value is checked where it
 /// is used ([`Config::budget_policy`]), so a typo breaks budgets and not the
-/// whole config.
+/// whole config. Only the mode string and zero values are refused lazily; a
+/// misspelt key or a negative number still fails the config load, as in the
+/// other sections.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
@@ -2327,17 +2329,20 @@ mod tests {
             "[budget]\nmode = \"sometimes\"\n",
         )
         .unwrap();
-        assert!(load_or_create(dir.path()).is_ok());
+        let config = load_or_create(dir.path()).unwrap();
+        assert_eq!(config.budget.mode.as_deref(), Some("sometimes"));
+        let err = config.budget_policy().unwrap_err().to_string();
+        assert!(err.contains("[budget] mode"), "{err}");
     }
 
     #[test]
     fn an_empty_budget_table_writes_nothing_back() {
         let config: Config = toml::from_str("[budget]\n").unwrap();
         assert_eq!(config.budget, BudgetConfig::default());
-        assert!(!toml::to_string(&config).unwrap().contains("budget"));
+        assert!(!toml::to_string(&config).unwrap().contains("[budget]"));
         assert!(!toml::to_string(&Config::default())
             .unwrap()
-            .contains("budget"));
+            .contains("[budget]"));
     }
 
     #[test]

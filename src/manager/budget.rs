@@ -655,6 +655,17 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_only_row_has_no_limit_to_count() {
+        let (_dir, app) = lab();
+        let w = get(&app, "w");
+        app.db.set_budget_mode("w", Some("off")).unwrap();
+        let row = app.db.budget("w").unwrap().unwrap();
+        assert_eq!(percent(&row, (100, 5)), None);
+        assert_eq!(usage(&row, (100, 5)), "");
+        assert_eq!(remaining(&app, &w).unwrap(), Limits::default());
+    }
+
+    #[test]
     fn effective_mode_refuses_what_it_cannot_read() {
         let (_dir, mut app) = lab();
         let w = get(&app, "w");

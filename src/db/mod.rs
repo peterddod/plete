@@ -1968,6 +1968,23 @@ mod tests {
     }
 
     #[test]
+    fn a_consulted_level_must_be_0_80_or_100() {
+        let (_dir, db) = open();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO tasks (id, slug, name, created_at, last_activity)
+                     VALUES ('t', 't', 't', 1, 1);
+                 INSERT INTO task_budgets (task_id, consulted) VALUES ('t', 80);",
+            )
+            .unwrap();
+        let bad = db.conn().execute(
+            "UPDATE task_budgets SET consulted = 50 WHERE task_id = 't'",
+            [],
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
     fn an_index_stamped_by_the_workspace_builds_is_migrated_not_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
