@@ -176,6 +176,7 @@ impl ReviewRecord {
             used_secs: self.used_secs,
             used_turns: self.used_turns,
             warned: self.warned,
+            ..BudgetRow::default()
         }
     }
 }

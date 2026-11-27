@@ -584,6 +584,22 @@ const MIGRATIONS: &[&str] = &[
         WHERE task_id IN (SELECT id FROM tasks WHERE kind = 'manager');
     UPDATE tasks SET kind = 'work' WHERE kind = 'manager';
     ",
+    // v17: budget modes. `mode` is a task's own override (NULL: inherit),
+    // left unconstrained so a bad value is refused where it is used. `base_*`
+    // is the limit a human set, which auto growth is bounded by; `consulted`
+    // is the threshold a classifier was last asked at; `net_reported` that
+    // the auto-growth limit was told; `last_decision` a small JSON text.
+    "
+    ALTER TABLE task_budgets ADD COLUMN mode TEXT;
+    ALTER TABLE task_budgets ADD COLUMN grows INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE task_budgets ADD COLUMN base_secs INTEGER;
+    ALTER TABLE task_budgets ADD COLUMN base_turns INTEGER;
+    ALTER TABLE task_budgets ADD COLUMN consulted INTEGER NOT NULL DEFAULT 0
+        CHECK (consulted IN (0, 80, 100));
+    ALTER TABLE task_budgets ADD COLUMN last_decision TEXT;
+    ALTER TABLE task_budgets ADD COLUMN net_reported INTEGER NOT NULL DEFAULT 0;
+    UPDATE task_budgets SET base_secs = max_secs, base_turns = max_turns;
+    ",
 ];
 
 /// A repository in the index. Its trunk is in the store, except for one
@@ -1105,7 +1121,8 @@ mod tests {
     fn a_manager_becomes_a_planner_task() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
-        let before = MIGRATIONS.len() - 1;
+        // The index as v15 left it.
+        let before = 15;
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(BASELINE).unwrap();
@@ -1890,6 +1907,81 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 7);
+    }
+
+    #[test]
+    fn a_v16_index_gains_the_budget_mode_columns_after_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(BASELINE).unwrap();
+            for sql in &MIGRATIONS[..16] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute_batch(
+                "PRAGMA user_version = 16;
+                 INSERT INTO tasks (id, slug, name, kind, created_at, last_activity)
+                     VALUES ('a', 'assistant', 'assistant', 'assistant', 1, 1);
+                 INSERT INTO tasks (id, slug, name, parent_id, created_at, last_activity)
+                     VALUES ('w', 'w', 'w', 'a', 1, 1), ('u', 'u', 'u', 'a', 1, 1);
+                 INSERT INTO task_budgets
+                     (task_id, max_secs, max_turns, used_secs, used_turns, warned)
+                     VALUES ('w', 3600, 20, 100, 3, 80), ('u', NULL, NULL, 5, 1, 0);",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(db.schema_version().unwrap(), 17);
+
+        let w = db.budget("w").unwrap().unwrap();
+        assert_eq!(
+            (w.max_secs, w.max_turns, w.used_secs, w.warned),
+            (Some(3600), Some(20), 100, 80)
+        );
+        assert_eq!((w.base_secs, w.base_turns), (Some(3600), Some(20)));
+        assert_eq!((w.mode.as_deref(), w.grows, w.consulted), (None, 0, 0));
+        assert_eq!((w.last_decision.as_deref(), w.net_reported), (None, false));
+        // Use without a limit has no base.
+        let u = db.budget("u").unwrap().unwrap();
+        assert_eq!((u.base_secs, u.base_turns), (None, None));
+
+        let backups: Vec<_> = std::fs::read_dir(dir.path().join("backups"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert!(backups[0].starts_with("index-v16-"), "{backups:?}");
+
+        // Opening again changes nothing and makes no second backup.
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 17);
+        assert_eq!(db.budget("w").unwrap().unwrap(), w);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("backups"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_consulted_level_must_be_0_80_or_100() {
+        let (_dir, db) = open();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO tasks (id, slug, name, created_at, last_activity)
+                     VALUES ('t', 't', 't', 1, 1);
+                 INSERT INTO task_budgets (task_id, consulted) VALUES ('t', 80);",
+            )
+            .unwrap();
+        let bad = db.conn().execute(
+            "UPDATE task_budgets SET consulted = 50 WHERE task_id = 't'",
+            [],
+        );
+        assert!(bad.is_err());
     }
 
     #[test]
