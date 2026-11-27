@@ -317,7 +317,28 @@ pub struct BudgetRow {
     pub base_turns: Option<i64>,
     /// The threshold a classifier was last asked at: 0, 80 or 100.
     pub consulted: u8,
-    /// The last classifier decision, as JSON text.
+    /// The last classifier decision, as JSON text: one object, which the
+    /// writer (the classifier's apply step) and the readers (`task budget`,
+    /// `task show`, the TUI) agree on:
+    ///
+    /// ```text
+    /// {"level": 80, "decision": "grow", "by": "+1h", "applied": "+1h",
+    ///  "reason": "…", "outcome": "done", "at": 1790000000}
+    /// ```
+    ///
+    /// - `level`: the threshold crossed, 80 or 100.
+    /// - `decision`: `grow`, `stop` or `ask`; absent when the call failed.
+    /// - `by`: what a `grow` asked for, as `plete task budget` takes it
+    ///   (`+1h`, `+20turns`, `+1h,20turns`); only for `grow`.
+    /// - `applied`: what was actually added after the minimum step, doubling,
+    ///   parent and safety-net clamps, same form; only for `grow`.
+    /// - `reason`: at most 300 characters, or the error when it failed. It is
+    ///   written from what a task wrote, so readers fence it.
+    /// - `outcome`: `done`, `failed` or `skipped`.
+    /// - `at`: unix seconds.
+    ///
+    /// Readers print `decision` (else `outcome`), `by`, `level` and `reason`,
+    /// and ignore any other key and any value that is not an object.
     pub last_decision: Option<String>,
     /// Whether the auto-growth limit was told.
     pub net_reported: bool,

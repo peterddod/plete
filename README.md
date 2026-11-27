@@ -1248,7 +1248,12 @@ its grant (`task.grant`); what a task loses, the tasks below it lose too.
 sets one (`task.grant`), within what is left above it (a unit kept or
 lowered is not checked); the 80% and 100%
 reports start over, and a limit set at or below what the task has used
-pauses it at once.
+pauses it at once. `plete task budget <task>` with no change prints its
+limits and use, its mode and where that comes from (`global`, or `override on
+<task>`), how many times auto has grown it (of `[budget] max_grows`) and its
+last decision; `plete task show` has the same in its `budget:` line
+(`mode: auto (grown 2×, base 4h)`) and, with `--json`, as `mode`,
+`mode_source`, `grows`, `base_secs`, `base_turns` and `last_decision`.
 
 **Budget mode.** `[budget] mode = "on"` (the default) is everything above.
 `"off"` turns budgeting off, `[review]` time and turns caps included: usage is
@@ -1266,6 +1271,10 @@ the parent's limit and is held when it pauses. Switching to `on` re-checks every
 limit at once and may pause tasks already over. A review's caps follow
 `[budget] mode` only. Editing it in config.toml takes effect at the next
 charge.
+In the TUI's agents view an `off` task's limit shows as a bold `BUDGET OFF` in
+place of its use, with no `budget %` note or `$`; the header says `budgets: off`
+whenever `[budget] mode` or any task in the tree is off; and an `auto` task that
+has grown shows `↑n` after its use.
 
 `plete manager new|ls|show|grant|budget|pause|resume|stop` still work for
 one release as deprecated aliases (each prints a deprecation line): `manager

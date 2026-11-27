@@ -8129,6 +8129,7 @@ mod tests {
                 held: 0,
                 setter: None,
                 budget: None,
+                mode: crate::manager::budget::Mode::On,
                 inbox: None,
                 pr: None,
                 queued: false,
@@ -8699,6 +8700,7 @@ mod tests {
                     held: 0,
                     setter: None,
                     budget: None,
+                    mode: crate::manager::budget::Mode::On,
                     inbox,
                     pr: None,
                     queued: false,
@@ -8749,6 +8751,7 @@ mod tests {
                 held: 0,
                 setter: None,
                 budget: None,
+                mode: crate::manager::budget::Mode::On,
                 inbox: Some(0),
                 pr: None,
                 queued: false,
@@ -8956,6 +8959,35 @@ mod tests {
             text.contains(format!("its own open ask: #{asked} question").as_str()),
             "{text}"
         );
+        // The mode, what auto grew it by and its last decision are the ones
+        // `plete task show` prints.
+        app.db.set_budget_max(&w.id, Some(3600), None).unwrap();
+        app.db.set_budget_mode(&w.id, Some("auto")).unwrap();
+        rusqlite::Connection::open(crate::config::index_path(&app.home))
+            .unwrap()
+            .execute(
+                "UPDATE task_budgets SET grows = 2, last_decision = ?2 WHERE task_id = ?1",
+                rusqlite::params![
+                    w.id,
+                    r#"{"level":80,"decision":"grow","by":"+1h","reason":"progress"}"#
+                ],
+            )
+            .unwrap();
+        let pane = brief_lines(&app, &w).unwrap();
+        let said = commands::manager::shown_text(
+            &commands::manager::shown(&app, &Caller::User, &w).unwrap(),
+        );
+        // The very lines `task show` prints, not a copy of them.
+        for prefix in ["budget: ", "last decision: "] {
+            let line = said.lines().find(|l| l.starts_with(prefix)).unwrap();
+            assert!(pane.iter().any(|l| l == line), "{prefix}: {pane:?}");
+        }
+        assert!(pane
+            .iter()
+            .any(|l| l.ends_with("mode: auto (grown 2×, base 1h)")));
+        assert!(pane
+            .iter()
+            .any(|l| l == "last decision: grow +1h at 80%: progress"));
         // The CLI's `manager show` refuses the assistant; `b` reads it.
         let text = brief_lines(&app, &root).unwrap().join("\n");
         assert!(text.contains("- api (work, active)"), "{text}");

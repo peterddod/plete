@@ -50,6 +50,9 @@ pub struct NodeInfo {
     pub setter: Option<String>,
     /// Its own limits, and what its subtree has used (seconds, turns).
     pub budget: Option<(BudgetRow, (i64, i64))>,
+    /// How its budget is enforced: its own override, an ancestor's, or the
+    /// global mode.
+    pub mode: budget::Mode,
     /// What is queued in its inbox; `None` while a hook holds the inbox, so
     /// the last count stands.
     pub inbox: Option<usize>,
@@ -76,6 +79,8 @@ pub struct TreeInfo {
     pub max_live: Option<u32>,
     /// Starts waiting on `max_live`.
     pub queued: usize,
+    /// `[budget] mode` is `off`.
+    pub budgets_off: bool,
     /// By task id: the assistant and its active descendants.
     pub nodes: HashMap<String, NodeInfo>,
 }
@@ -235,7 +240,9 @@ pub(super) fn row_urgency(row: &TaskRow, info: Option<&TreeInfo>) -> Urgency {
         row.activity.as_ref(),
         node.and_then(|n| n.ask).map(|(_, kind, user)| (kind, user)),
         node.is_some_and(|n| n.done),
-        node.and_then(|n| n.budget.as_ref())
+        // An `off` row has no percent that matters.
+        node.filter(|n| n.mode != budget::Mode::Off)
+            .and_then(|n| n.budget.as_ref())
             .and_then(|(row, used)| budget::percent(row, *used)),
         task.run_state_by == Some(Setter::Budget),
     )
@@ -254,6 +261,10 @@ pub fn gather(app: &App, tmux_ok: bool) -> Result<TreeInfo> {
         },
         max_live: app.config.manager_policy().ok().map(|p| p.max_live),
         queued: queued_starts.len(),
+        budgets_off: app
+            .config
+            .budget_policy()
+            .is_ok_and(|p| p.mode == budget::Mode::Off),
         nodes: HashMap::new(),
     };
     let Some(root) = app.db.get_assistant_task()? else {
@@ -293,6 +304,9 @@ pub fn gather(app: &App, tmux_ok: bool) -> Result<TreeInfo> {
             held: 0,
             setter,
             budget,
+            // Quietly: a warning would scribble on the alternate screen. A
+            // value that cannot be read is in the `b` pane.
+            mode: budget::effective_mode(app, task).map_or(budget::Mode::On, |(mode, _)| mode),
             inbox: messages::try_peek(&tasks::task_dir(app, task)).map(|q| q.len()),
             pr,
             queued: queued_starts.contains(&task.id),
@@ -595,6 +609,7 @@ mod tests {
                 held: 0,
                 setter: None,
                 budget: None,
+                mode: budget::Mode::On,
                 inbox: Some(0),
                 pr: None,
                 queued: false,
