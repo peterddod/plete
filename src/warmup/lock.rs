@@ -26,7 +26,40 @@ pub struct Lock(PathBuf);
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // Only our own file: `clear` may have removed the directory, and a
+        // waiter made the lock again since.
+        let ours = std::fs::read_to_string(&self.0)
+            .is_ok_and(|text| text.trim() == std::process::id().to_string());
+        if ours {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+/// Remove a dead holder's lock file. Callers that saw it dead take turns
+/// (an `flock` on a file beside it) and look again, so a late one does not
+/// remove the live lock an earlier one made; nobody makes a lock while the
+/// dead one is there, so the look and the removal cannot be split.
+fn reclaim(path: &Path) {
+    #[cfg(unix)]
+    let _turn = {
+        use std::os::fd::AsRawFd;
+        let mut name = path.as_os_str().to_owned();
+        name.push(".reclaim");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(name)
+            .ok();
+        if let Some(file) = &file {
+            // SAFETY: a blocking lock on a descriptor we own, dropped with it.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        }
+        file
+    };
+    if !holder_alive(path) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -68,11 +101,7 @@ pub fn try_acquire(path: &Path) -> Result<Option<Lock>> {
                 if holder_alive(path) {
                     return Ok(None);
                 }
-                match std::fs::remove_file(path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == ErrorKind::NotFound => {}
-                    Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
-                }
+                reclaim(path);
             }
             Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
         }
@@ -149,6 +178,53 @@ mod tests {
         drop(first);
         assert!(!is_held(&path));
         assert!(try_acquire(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_lock_is_removed_on_drop_only_if_it_is_still_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".lock");
+        let ours = try_acquire(&path).unwrap().unwrap();
+        // Replaced by another process's, as after `clear` and a waiter.
+        std::fs::write(&path, "4194999\n").unwrap();
+        drop(ours);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "4194999");
+        // Its directory gone: nothing to remove, nothing made.
+        let gone = tmp.path().join("d/.lock");
+        let lock = try_acquire(&gone).unwrap().unwrap();
+        std::fs::remove_dir_all(gone.parent().unwrap()).unwrap();
+        drop(lock);
+        assert!(!gone.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn callers_that_all_see_a_dead_holder_do_not_all_get_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Arc::new(tmp.path().join(".lock"));
+        for _ in 0..20 {
+            std::fs::write(&*path, "4194999\n").unwrap();
+            let held = Arc::new(AtomicUsize::new(0));
+            let most = Arc::new(AtomicUsize::new(0));
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let (path, held, most) = (path.clone(), held.clone(), most.clone());
+                    std::thread::spawn(move || {
+                        if let Some(lock) = try_acquire(&path).unwrap() {
+                            let now = held.fetch_add(1, Ordering::SeqCst) + 1;
+                            most.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(20));
+                            held.fetch_sub(1, Ordering::SeqCst);
+                            drop(lock);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(most.load(Ordering::SeqCst), 1);
+            let _ = std::fs::remove_file(&*path);
+        }
     }
 
     #[test]

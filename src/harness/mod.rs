@@ -152,7 +152,6 @@ pub trait Harness: Sync {
 
     /// Arguments that run one prompt to completion with nobody at the
     /// terminal, within `opts`. Not for a session plete records.
-    #[allow(dead_code)] // called by the warm-up build, a later step
     fn headless_args(&self, _prompt: &str, _opts: &Headless) -> Option<Vec<String>> {
         None
     }
@@ -288,7 +287,6 @@ pub trait Harness: Sync {
 
     /// What session `id`, started in `dir`, read and cost, from its record.
     /// `None` when it keeps none plete can read.
-    #[allow(dead_code)] // called by the warm-up build, a later step
     fn transcript_info(&self, _dir: &Path, _id: &str) -> Option<Transcript> {
         None
     }
@@ -455,7 +453,6 @@ pub enum EventKind {
 }
 
 /// What a headless run may do, for [`Harness::headless_args`].
-#[allow(dead_code)] // called by the warm-up build, a later step
 #[derive(Debug, Clone, Default)]
 pub struct Headless<'a> {
     /// The most turns it may take.
@@ -468,7 +465,6 @@ pub struct Headless<'a> {
 
 /// What a session's record says of its size and reading, from
 /// [`Harness::transcript_info`].
-#[allow(dead_code)] // called by the warm-up build, a later step
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcript {
     /// What its last reply was given as input: new, cached and cache-written

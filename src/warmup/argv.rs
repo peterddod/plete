@@ -6,8 +6,9 @@
 //! - `--permission-mode dontAsk` denies every tool not allowed, in `-p`;
 //! - `--setting-sources ""` stops the user's, project's and local settings
 //!   (allow-lists, hooks, `env`) from widening it;
-//! - the deny rules `Bash(*--output*)` and `Bash(*--pre*)` stop what the
-//!   allowed `git log|diff|show --output=FILE` and `rg --pre CMD` could do:
+//! - the deny rules `Bash(*--output*)`, `Bash(*--pre*)` and
+//!   `Bash(*--hostname-bin*)` stop what the allowed `git log|diff|show
+//!   --output=FILE`, `rg --pre CMD` and `rg --hostname-bin CMD` could do:
 //!   write a file, run a command. Other spellings of these rules
 //!   (`Bash(git log:*--output*)`, `Bash(rg * --pre*)`) match nothing.
 
@@ -40,6 +41,7 @@ pub const DENY: &[&str] = &[
     "WebSearch",
     "Bash(*--output*)",
     "Bash(*--pre*)",
+    "Bash(*--hostname-bin*)",
 ];
 
 /// Added to the profile's prompt.
@@ -171,10 +173,11 @@ mod tests {
             // (`Bash(git log:*--output*)`, `Bash(rg * --pre*)`) match nothing.
             "Bash(*--output*)",
             "Bash(*--pre*)",
+            "Bash(*--hostname-bin*)",
         ] {
             assert!(deny.contains(&tool), "{tool}");
         }
-        assert_eq!(deny.len(), 7);
+        assert_eq!(deny.len(), 8);
     }
 
     #[test]

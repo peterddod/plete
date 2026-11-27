@@ -52,13 +52,7 @@ impl Source {
 
 /// A repo's id as one directory name, as the store's fetch locks flatten it.
 pub fn dir_name(repo_id: &str) -> String {
-    repo_id
-        .chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
-            _ => '_',
-        })
-        .collect()
+    store::flat_name(repo_id)
 }
 
 /// One repo of a warm-up, at the default branch as fetched.
@@ -419,17 +413,16 @@ fn run_headless(job: &Job, work: &Path, args: &[String], dir: &Path) -> Result<S
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("start `{}`", job.program))?;
+    // Ended with everything it started however this function ends: a
+    // timeout, an error, a panic, or a signal to plete (`on_signal`).
+    let mut child = Group::spawn(&mut cmd).with_context(|| format!("start `{}`", job.program))?;
     let limit = Duration::from_secs(job.cfg.timeout.secs());
     let started = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().context("wait for the warm-up")? {
+        if let Some(status) = child.0.try_wait().context("wait for the warm-up")? {
             break status;
         }
         if started.elapsed() >= limit {
-            kill_group(&mut child);
             bail!("it timed out after {}s (`timeout`)", limit.as_secs());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -453,17 +446,70 @@ fn run_headless(job: &Job, work: &Path, args: &[String], dir: &Path) -> Result<S
     Ok(text)
 }
 
-/// Kill `child` and everything it started, which share its process group.
-fn kill_group(child: &mut std::process::Child) {
+/// A running warm-up and the process group it leads. Dropping it kills the
+/// group and reaps the child, so none is orphaned by an early return or a
+/// panic, and a normal exit does not leave its grandchildren behind.
+struct Group(std::process::Child);
+
+/// The group a signal to plete ends: 0 when none runs.
+static RUNNING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+impl Group {
+    fn spawn(cmd: &mut Command) -> Result<Group> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn()?;
+        on_signal();
+        RUNNING.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+        Ok(Group(child))
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        RUNNING.store(0, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            // SAFETY: a signal to the group the child was made leader of.
+            unsafe {
+                libc::killpg(self.0.id() as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Once per process: a SIGINT, SIGTERM or SIGHUP kills the warm-up's group
+/// before plete dies as it would have. With none running it only does the
+/// latter, so installing it changes nothing for what runs after.
+fn on_signal() {
     #[cfg(unix)]
     {
-        // SAFETY: a signal to the group the child was made leader of.
-        unsafe {
-            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-        }
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            for signal in [
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGTERM,
+                signal_hook::consts::SIGHUP,
+            ] {
+                // SAFETY: only `killpg` (async-signal-safe) and the default
+                // handler run in it.
+                let _ = unsafe {
+                    signal_hook::low_level::register(signal, move || {
+                        let group = RUNNING.load(std::sync::atomic::Ordering::SeqCst);
+                        if group > 0 {
+                            libc::killpg(group, libc::SIGKILL);
+                        }
+                        let _ = signal_hook::low_level::emulate_default_handler(signal);
+                    })
+                };
+            }
+        });
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -713,8 +759,35 @@ mod tests {
         assert_eq!(cache::read_meta(&lab.dir()), None);
         let child = std::fs::read_to_string(lab.tmp.path().join("child")).unwrap();
         let pid: u32 = child.trim().parse().unwrap();
-        // Gone, or a zombie not yet reaped by init.
-        let mut gone = false;
+        assert!(gone(pid), "the child outlived the warm-up");
+    }
+
+    #[test]
+    fn dropping_the_guard_kills_the_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("child");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 30 & echo $! > '{}'; wait", file.display()));
+        let group = Group::spawn(&mut cmd).unwrap();
+        for _ in 0..100 {
+            if std::fs::read_to_string(&file).is_ok_and(|t| t.trim().parse::<u32>().is_ok()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let pid: u32 = std::fs::read_to_string(&file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(crate::review::process_alive(pid));
+        drop(group);
+        assert!(gone(pid), "the grandchild outlived the guard");
+    }
+
+    /// Gone, or a zombie not yet reaped by init.
+    fn gone(pid: u32) -> bool {
         for _ in 0..50 {
             let state = Command::new("ps")
                 .args(["-o", "stat=", "-p", &pid.to_string()])
@@ -722,12 +795,11 @@ mod tests {
                 .unwrap();
             let state = String::from_utf8_lossy(&state.stdout);
             if state.trim().is_empty() || state.trim().starts_with('Z') {
-                gone = true;
-                break;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(gone, "the child outlived the warm-up");
+        false
     }
 
     #[test]

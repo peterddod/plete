@@ -734,7 +734,6 @@ fn sessions(root: &Path) -> Result<Vec<AgentSession>> {
 /// transcript at `path`, whose session ran in `dir`. A reply's blocks are
 /// separate records sharing one `usage`, so the last record's is the last
 /// reply's. Subagents' records are not the session's own.
-#[allow(dead_code)] // called by the warm-up build, a later step
 fn transcript_info(path: &Path, dir: &Path) -> Option<Transcript> {
     let file = std::fs::File::open(path).ok()?;
     let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
