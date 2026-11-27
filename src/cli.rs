@@ -1139,6 +1139,26 @@ mod tests {
     }
 
     #[test]
+    fn clap_offers_the_budget_modes_as_completions() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let task = cmd.find_subcommand("task").unwrap();
+        let values = |sub: &str, arg: &str| -> Vec<String> {
+            task.find_subcommand(sub)
+                .unwrap()
+                .get_arguments()
+                .find(|a| a.get_id() == arg)
+                .unwrap()
+                .get_possible_values()
+                .iter()
+                .map(|v| v.get_name().to_string())
+                .collect()
+        };
+        assert_eq!(values("new", "budget_mode"), ["on", "off", "auto"]);
+        assert_eq!(values("budget", "mode"), ["on", "off", "auto", "inherit"]);
+    }
+
+    #[test]
     fn review_takes_a_pr_or_a_subcommand() {
         let Some(Commands::Review { pr, command, .. }) = parse(&["review", "55"]).command else {
             panic!("expected review");

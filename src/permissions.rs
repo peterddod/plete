@@ -944,10 +944,12 @@ fn tree_gate(command: &TreeCommands) -> Gate {
             if let Some(mode) = mode {
                 what.push(format!("to mode {mode}"));
             }
-            needs(
-                "task.grant",
-                format!("changed task {name}'s budget {}", what.join(" and ")),
-            )
+            let mut action = format!("changed task {name}'s budget");
+            if !what.is_empty() {
+                action.push(' ');
+                action.push_str(&what.join(" and "));
+            }
+            needs("task.grant", action)
         }
         TreeCommands::Pause { name } => needs("task.stop", format!("paused task {name}")),
         TreeCommands::Resume { name } => needs("task.stop", format!("resumed task {name}")),
