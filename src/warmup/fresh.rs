@@ -3,7 +3,7 @@
 use std::fmt;
 
 use super::cache::Meta;
-use super::config::{Config, Every};
+use super::config::{Config, Every, Trigger};
 
 /// The git facts freshness needs, per repo (as keyed in `Meta::commits`),
 /// against the freshly fetched default branch. `None`: git could not say, as
@@ -61,6 +61,10 @@ pub fn staleness(
     let Some(meta) = meta else {
         return Some(Why::NoBase);
     };
+    // A base of no repo says nothing about any.
+    if meta.commits.is_empty() {
+        return Some(Why::NoBase);
+    }
     if meta.fingerprint != fingerprint {
         return Some(Why::Fingerprint);
     }
@@ -70,25 +74,15 @@ pub fn staleness(
         }
     }
     let paths = &cfg.refresh.paths;
-    let sum = |ask: &dyn Fn(&str, &str) -> Option<u64>| -> Result<u64, Why> {
-        meta.commits
-            .iter()
-            .map(|(repo, base)| ask(repo, base).ok_or_else(|| Why::Unknown(repo.clone())))
-            .sum()
-    };
-    if let Some(limit) = cfg.refresh.commits.on() {
-        match sum(&|r, b| git.commits_since(r, b, paths)) {
-            Ok(n) if n > *limit => return Some(Why::Commits(n)),
-            Ok(_) => {}
-            Err(why) => return Some(why),
-        }
+    if let Some(why) = over(meta, &cfg.refresh.commits, Why::Commits, |r, b| {
+        git.commits_since(r, b, paths)
+    }) {
+        return Some(why);
     }
-    if let Some(limit) = cfg.refresh.lines.on() {
-        match sum(&|r, b| git.lines_since(r, b, paths)) {
-            Ok(n) if n > *limit => return Some(Why::Lines(n)),
-            Ok(_) => {}
-            Err(why) => return Some(why),
-        }
+    if let Some(why) = over(meta, &cfg.refresh.lines, Why::Lines, |r, b| {
+        git.lines_since(r, b, paths)
+    }) {
+        return Some(why);
     }
     // A harness that cannot report reads leaves this rule out.
     if !meta.files_read.is_empty() {
@@ -109,10 +103,34 @@ pub fn staleness(
     None
 }
 
+/// Stale when `ask`, summed over the base's repos, is past a trigger's limit;
+/// stale too when git cannot answer for one of them.
+fn over(
+    meta: &Meta,
+    limit: &Trigger<u64>,
+    why: fn(u64) -> Why,
+    ask: impl Fn(&str, &str) -> Option<u64>,
+) -> Option<Why> {
+    let limit = limit.on()?;
+    let mut total = 0u64;
+    for (repo, base) in &meta.commits {
+        match ask(repo, base) {
+            Some(n) => total = total.saturating_add(n),
+            None => return Some(Why::Unknown(repo.clone())),
+        }
+    }
+    (total > *limit).then(|| why(total))
+}
+
+/// `utc_offset` is the zone's offset at `now`; a zone change (DST) between
+/// the build and now is not accounted for. A build exactly at the time of day
+/// is fresh: the occurrence must be after it.
 fn every_fired(every: Every, built_at: i64, now: i64, utc_offset: i64) -> bool {
     const DAY: i64 = 86_400;
     match every {
-        Every::Span(span) => now.saturating_sub(built_at) >= span.secs() as i64,
+        Every::Span(span) => {
+            now.saturating_sub(built_at) >= i64::try_from(span.secs()).unwrap_or(i64::MAX)
+        }
         Every::At(minutes) => {
             // The latest local `HH:MM` at or before now; stale once it falls
             // after the build.
@@ -133,14 +151,7 @@ pub fn fingerprint(cfg: &Config, model: Option<&str>, harness_version: &str) -> 
     let mut table = toml::Table::try_from(cfg).expect("a warmup config serializes");
     table.remove("refresh");
     let text = format!("{table}\0{}\0{harness_version}", model.unwrap_or_default());
-    format!("{:016x}", fnv1a(text.as_bytes()))
-}
-
-/// FNV-1a: stable across Rust versions, unlike `DefaultHasher`.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
-    })
+    format!("{:016x}", crate::projects::fnv1a(text.as_bytes()))
 }
 
 #[cfg(test)]
@@ -209,7 +220,7 @@ mod tests {
         }
     }
 
-    fn stale(meta: &Meta, cfg: &Config, now: i64, git: &Fake) -> Option<Why> {
+    fn stale(meta: &Meta, cfg: &Config, now: i64, git: &dyn GitView) -> Option<Why> {
         staleness(Some(meta), cfg, "fp", now, 0, git)
     }
 
@@ -425,6 +436,128 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_span_never_fires() {
+        let mut c = cfg();
+        c.refresh.every = Trigger::On(Every::Span(Span(u64::MAX)));
+        assert_eq!(stale(&meta(), &c, T0 + 10_000_000, &Fake::at(0, 0)), None);
+    }
+
+    #[test]
+    fn a_base_of_no_repos_is_stale() {
+        let m = Meta {
+            commits: BTreeMap::new(),
+            ..meta()
+        };
+        assert_eq!(stale(&m, &cfg(), T0, &Fake::at(0, 0)), Some(Why::NoBase));
+    }
+
+    #[test]
+    fn a_build_exactly_at_the_time_of_day_is_fresh_until_the_next() {
+        let mut c = cfg();
+        c.refresh.every = Trigger::On(Every::At(6 * 60));
+        let day = 1_699_920_000;
+        let m = Meta {
+            built_at: day + 6 * 3600,
+            ..meta()
+        };
+        let g = Fake::at(0, 0);
+        assert_eq!(stale(&m, &c, day + 6 * 3600, &g), None);
+        assert_eq!(stale(&m, &c, day + 86_400 + 6 * 3600, &g), Some(Why::Every));
+    }
+
+    /// Per-repo answers by name.
+    type Answer = (Option<u64>, Option<u64>, Vec<String>);
+    struct Multi(BTreeMap<&'static str, Answer>);
+
+    impl GitView for Multi {
+        fn commits_since(&self, r: &str, _: &str, _: &[String]) -> Option<u64> {
+            self.0[r].0
+        }
+        fn lines_since(&self, r: &str, _: &str, _: &[String]) -> Option<u64> {
+            self.0[r].1
+        }
+        fn changed_files(&self, r: &str, _: &str) -> Option<Vec<String>> {
+            Some(self.0[r].2.clone())
+        }
+    }
+
+    fn two_repos() -> Meta {
+        let mut m = meta();
+        m.commits.insert("s".into(), "base2".into());
+        m
+    }
+
+    #[test]
+    fn lines_sum_across_repos() {
+        let g = Multi(BTreeMap::from([
+            ("r", (Some(0), Some(300), vec![])),
+            ("s", (Some(0), Some(300), vec![])),
+        ]));
+        assert_eq!(stale(&two_repos(), &cfg(), T0, &g), Some(Why::Lines(600)));
+    }
+
+    #[test]
+    fn a_read_file_changed_in_either_repo_is_found() {
+        let m = Meta {
+            files_read: vec!["r/a.rs".into(), "s/b.rs".into()],
+            ..two_repos()
+        };
+        let g = Multi(BTreeMap::from([
+            ("r", (Some(0), Some(0), vec!["x.rs".into()])),
+            ("s", (Some(0), Some(0), vec!["b.rs".into()])),
+        ]));
+        assert_eq!(
+            stale(&m, &cfg(), T0, &g),
+            Some(Why::FileChanged("s/b.rs".into()))
+        );
+    }
+
+    #[test]
+    fn one_repo_unanswered_makes_the_base_stale() {
+        let g = Multi(BTreeMap::from([
+            ("r", (Some(0), Some(0), vec![])),
+            ("s", (None, Some(0), vec![])),
+        ]));
+        assert_eq!(
+            stale(&two_repos(), &cfg(), T0, &g),
+            Some(Why::Unknown("s".into()))
+        );
+    }
+
+    #[test]
+    fn with_several_triggers_over_the_first_in_order_is_reported() {
+        // Order: fingerprint, every, commits, lines, read files.
+        let m = Meta {
+            files_read: vec!["r/a.rs".into()],
+            ..meta()
+        };
+        let g = Fake {
+            changed: vec!["a.rs".into()],
+            ..Fake::at(99, 9999)
+        };
+        let late = T0 + 10_000_000;
+        assert_eq!(
+            staleness(Some(&m), &cfg(), "else", late, 0, &g),
+            Some(Why::Fingerprint)
+        );
+        assert_eq!(stale(&m, &cfg(), late, &g), Some(Why::Every));
+        assert_eq!(stale(&m, &cfg(), T0, &g), Some(Why::Commits(99)));
+        let g = Fake {
+            changed: vec!["a.rs".into()],
+            ..Fake::at(0, 9999)
+        };
+        assert_eq!(stale(&m, &cfg(), T0, &g), Some(Why::Lines(9999)));
+        let g = Fake {
+            changed: vec!["a.rs".into()],
+            ..Fake::at(0, 0)
+        };
+        assert_eq!(
+            stale(&m, &cfg(), T0, &g),
+            Some(Why::FileChanged("r/a.rs".into()))
+        );
+    }
+
+    #[test]
     fn a_project_sums_its_repos() {
         let mut m = meta();
         m.commits.insert("s".into(), "base2".into());
@@ -459,6 +592,15 @@ mod tests {
         let mut per = c.clone();
         per.per = crate::warmup::config::Per::Project;
         assert_ne!(base, fingerprint(&per, Some("opus"), "2.1.327"));
+        for edit in [
+            |c: &mut Config| c.timeout = Span(60),
+            |c: &mut Config| c.max_turns = 5,
+            |c: &mut Config| c.max_base_tokens = 1,
+        ] {
+            let mut e = c.clone();
+            edit(&mut e);
+            assert_ne!(base, fingerprint(&e, Some("opus"), "2.1.327"));
+        }
         // A refresh-only edit leaves it alone.
         let mut r = c.clone();
         r.refresh.commits = Trigger::On(5);

@@ -883,6 +883,28 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_warmup_section_lists_the_profile_as_broken() {
+        let (_dir, app) = app();
+        let user = app.home.join("agents");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(
+            user.join("good.md"),
+            "+++\n[warmup]\nprompt = \"m\"\nper = \"repo\"\n+++\nGo.",
+        )
+        .unwrap();
+        std::fs::write(
+            user.join("typo.md"),
+            "+++\n[warmup]\nprompt = \"m\"\nper = \"repo\"\nmax_turn = 3\n+++\nGo.",
+        )
+        .unwrap();
+        let (profiles, broken) = list(&app, None);
+        assert!(profiles.iter().any(|p| p.name == "good"));
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].name, "typo");
+        assert!(format!("{:#}", broken[0].error).contains("max_turn"));
+    }
+
+    #[test]
     fn a_new_profile_starts_from_another_or_a_starter_that_reads() {
         let (s, _) = parse(&starter("docs", None).unwrap()).unwrap();
         assert!(s.description.unwrap().contains("docs"));

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 const META: &str = "meta.json";
@@ -32,16 +32,11 @@ pub struct Meta {
     pub base_tokens: Option<u64>,
 }
 
-/// `name` if it is one safe directory name: a profile, or a repo's store id or
-/// a project's name as a scope.
+/// `name` if it is one safe directory name: a profile, or a repo's store id
+/// or a project's name as a scope.
 pub fn safe_name(name: &str) -> Result<&str> {
-    let bad = name.is_empty()
-        || name.starts_with('.')
-        || name.contains(['/', '\\', '\0'])
-        || name.chars().any(char::is_control);
-    if bad {
-        bail!("{name:?} is not a name a warm-up can be kept under");
-    }
+    crate::projects::check_name(name)
+        .map_err(|_| anyhow::anyhow!("{name:?} is not a name a warm-up can be kept under"))?;
     Ok(name)
 }
 
@@ -70,14 +65,19 @@ pub fn read_meta(dir: &Path) -> Option<Meta> {
     serde_json::from_str(&text).ok()
 }
 
-/// Write `meta` by renaming a temp file over `meta.json`, so a reader never
-/// sees half of it.
-pub fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
+/// Write `text` to `dir/name` by renaming a temp file over it, so a reader
+/// never sees half of it. The temp name holds the pid, so two writers do not
+/// share one.
+fn write_atomic(dir: &Path, name: &str, text: &str) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let tmp = dir.join(format!("{META}.tmp"));
-    let text = serde_json::to_string_pretty(meta).context("write meta")?;
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, meta_path(dir)).with_context(|| format!("write {}", META))
+    std::fs::rename(&tmp, dir.join(name)).with_context(|| format!("write {name}"))
+}
+
+pub fn write_meta(dir: &Path, meta: &Meta) -> Result<()> {
+    let text = serde_json::to_string_pretty(meta).context("write meta")?;
+    write_atomic(dir, META, &text)
 }
 
 pub fn read_context(dir: &Path) -> Option<String> {
@@ -85,9 +85,7 @@ pub fn read_context(dir: &Path) -> Option<String> {
 }
 
 pub fn write_context(dir: &Path, text: &str) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let path = context_path(dir);
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))
+    write_atomic(dir, CONTEXT, text)
 }
 
 #[cfg(test)]
@@ -136,8 +134,29 @@ mod tests {
         write_context(&d, "# map\n").unwrap();
         assert_eq!(read_meta(&d), Some(meta()));
         assert_eq!(read_context(&d).as_deref(), Some("# map\n"));
-        assert!(!d.join("meta.json.tmp").exists());
+        let left: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        // A rewrite replaces.
+        write_context(&d, "# new\n").unwrap();
+        assert_eq!(read_context(&d).as_deref(), Some("# new\n"));
         assert_eq!(work_dir(&d), d.join("work"));
+    }
+
+    #[test]
+    fn an_older_meta_without_optional_fields_still_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            meta_path(tmp.path()),
+            r#"{"base_session":"b","built_at":1,"commits":{"r":"abc"},"fingerprint":"f","turns":2,"duration_secs":3}"#,
+        )
+        .unwrap();
+        let m = read_meta(tmp.path()).unwrap();
+        assert!(m.files_read.is_empty());
+        assert_eq!(m.base_tokens, None);
     }
 
     #[test]

@@ -128,7 +128,7 @@ pub fn parse(text: &str) -> Result<ProjectConfig> {
 
 /// A name that is safe to look a project up by: one plain path component,
 /// so it can never climb out of the projects directory.
-fn check_name(name: &str) -> Result<()> {
+pub(crate) fn check_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.starts_with('.')
         || name.contains(['/', '\\'])

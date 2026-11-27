@@ -337,6 +337,9 @@ mod tests {
         let mut c = ok.clone();
         c.max_turns = 0;
         assert!(check(&c).is_err());
+        let mut c = ok.clone();
+        c.max_base_tokens = 0;
+        assert!(check(&c).is_err());
         for bad in ["", "/etc", "../x", "a/../b"] {
             let mut c = ok.clone();
             c.refresh.paths = vec![bad.into()];

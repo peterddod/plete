@@ -1488,12 +1488,6 @@ pub fn agents_root(home: &Path) -> PathBuf {
     home.join("agents")
 }
 
-/// Warm-up bases ([`crate::warmup`]), one directory per profile and scope.
-#[allow(dead_code)] // until the build and `plete warmup` use it
-pub fn warmup_root(home: &Path) -> PathBuf {
-    home.join("warmup")
-}
-
 /// The assistant's home: its AGENTS.md, worklog, todo, inbox and
 /// `actions.log`.
 pub fn assistant_dir(home: &Path) -> PathBuf {
