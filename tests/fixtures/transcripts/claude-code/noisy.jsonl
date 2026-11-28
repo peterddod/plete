@@ -1,0 +1,11 @@
+{"isSidechain": false, "type": "user", "message": {"role": "user", "content": "go"}}
+{"isSidechain": false, "type": "assistant", "message": {"id": "a1", "role": "assistant", "content": [{"type": "text", "text": "Part one."}]}}
+{"isSidechain": false, "type": "assistant", "message": {"id": "a1", "role": "assistant", "stop_reason": "tool_use", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "false"}}]}}
+ÿþ not utf-8 {
+{"isSidechain": false, "type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": "boom"}]}}
+{"isSidechain": false, "type": "assistant", "message": {"id": "a1", "role": "assistant", "content": [{"type": "text", "text": "Part two."}]}}
+{"isSidechain": false, "type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}}
+{"isSidechain": false, "type": "user", "message": {"role": "user", "content": "<system-reminder>\nnote\n</system-reminder>"}}
+{"isSidechain": false, "isCompactSummary": true, "type": "user", "message": {"role": "user", "content": "This session is being continued..."}}
+{"isSidechain": false, "type": "user", "message": {"role": "user", "content": "next prompt"}}
+{"isSidechain": false, "type": "assistant", "message": {"id": "a2", "role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Done."}]}}

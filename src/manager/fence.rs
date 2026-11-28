@@ -48,7 +48,7 @@ pub fn mark_interrupt(fenced: &str) -> String {
 
 /// The body of a fence: cleaned, on as many lines as it has, but unable to
 /// close the fence or open another.
-fn fence_body(text: &str) -> String {
+pub fn fence_body(text: &str) -> String {
     let body: String = messages::clean(text)
         .chars()
         .map(|c| match c {

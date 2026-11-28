@@ -15,3 +15,5 @@ Reply with ONE JSON object and nothing else: no prose before or after it, no cod
 `by` only with `grow`. `reason` at most 300 characters; say what you saw.
 
 {bundle}
+
+The bundle ends above. Reply with the JSON object only.

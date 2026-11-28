@@ -465,6 +465,8 @@ pub struct ToolCall {
     pub name: String,
     pub input_summary: String,
     pub output_summary: Option<String>,
+    /// The result says the call failed.
+    pub is_error: bool,
 }
 
 /// One reply of the agent's, its text blocks joined.

@@ -795,18 +795,36 @@ fn cut(text: &str, max: usize) -> String {
     }
 }
 
+/// A user record plete or the harness wrote, not the user: an interrupt
+/// notice, or nothing but a system reminder.
+fn injected(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with(INTERRUPTED)
+        || (text.starts_with("<system-reminder>")
+            && text.ends_with("</system-reminder>")
+            && text.matches("<system-reminder>").count() == 1)
+}
+
 /// The last `n` turns of the transcript at `path`: each user prompt and
 /// each agent reply with its tool calls, results attached to their calls.
+/// Like [`last_turn`], the blocks of one reply (the records sharing a
+/// `message.id`) are one turn. A line that is not JSON, or not UTF-8, is
+/// skipped.
 fn recent_turns(path: &Path, n: usize) -> Result<Vec<TranscriptTurn>> {
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     // Only the last `n` are kept: transcripts run to many megabytes.
     let mut turns: VecDeque<TranscriptTurn> = VecDeque::new();
-    for line in BufReader::new(file).lines() {
+    // The `message.id` of the reply that is the last turn, if it is.
+    let mut open: Option<String> = None;
+    for line in BufReader::new(file).split(b'\n') {
         let line = line.with_context(|| format!("read {}", path.display()))?;
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
-        if record["isSidechain"] == true || record["isMeta"] == true {
+        if record["isSidechain"] == true
+            || record["isMeta"] == true
+            || record["isCompactSummary"] == true
+        {
             continue;
         }
         let content = &record["message"]["content"];
@@ -823,16 +841,32 @@ fn recent_turns(path: &Path, n: usize) -> Result<Vec<TranscriptTurn>> {
                         name: b["name"].as_str().unwrap_or("?").to_string(),
                         input_summary: cut(&b["input"].to_string(), TOOL_TEXT_MAX),
                         output_summary: None,
+                        is_error: false,
                     })
                     .collect();
                 if text.is_empty() && tool_calls.is_empty() {
                     continue;
                 }
-                turns.push_back(TranscriptTurn {
-                    role: "assistant",
-                    text,
-                    tool_calls,
-                });
+                let id = record["message"]["id"].as_str().map(str::to_string);
+                match turns.back_mut() {
+                    Some(turn) if id.is_some() && id == open => {
+                        if !text.is_empty() {
+                            if !turn.text.is_empty() {
+                                turn.text.push_str("\n\n");
+                            }
+                            turn.text.push_str(&text);
+                        }
+                        turn.tool_calls.extend(tool_calls);
+                    }
+                    _ => {
+                        turns.push_back(TranscriptTurn {
+                            role: "assistant",
+                            text,
+                            tool_calls,
+                        });
+                        open = id;
+                    }
+                }
             }
             Some("user") => {
                 // A tool's result belongs to the call that made it.
@@ -855,6 +889,7 @@ fn recent_turns(path: &Path, n: usize) -> Result<Vec<TranscriptTurn>> {
                         .find(|c| c.id == id);
                     if let Some(call) = call {
                         call.output_summary = Some(cut(&output, TOOL_TEXT_MAX));
+                        call.is_error = result["is_error"] == true;
                     }
                 }
                 if !results.is_empty() {
@@ -864,7 +899,10 @@ fn recent_turns(path: &Path, n: usize) -> Result<Vec<TranscriptTurn>> {
                     Some(text) => text.to_string(),
                     None => record_text(content),
                 };
-                if text.trim().is_empty() || LOCAL_COMMAND.iter().any(|c| text.starts_with(c)) {
+                if text.trim().is_empty()
+                    || injected(&text)
+                    || LOCAL_COMMAND.iter().any(|c| text.starts_with(c))
+                {
                     continue;
                 }
                 turns.push_back(TranscriptTurn {
@@ -872,6 +910,7 @@ fn recent_turns(path: &Path, n: usize) -> Result<Vec<TranscriptTurn>> {
                     text,
                     tool_calls: Vec::new(),
                 });
+                open = None;
             }
             _ => {}
         }
@@ -1449,6 +1488,29 @@ mod tests {
         let last = recent_turns(&transcript_path("tools"), 2).unwrap();
         assert_eq!(last.len(), 2);
         assert_eq!(last[1].text, "Fixed.");
+    }
+
+    #[test]
+    fn recent_turns_make_one_turn_of_a_reply_and_leave_out_what_the_user_did_not_say() {
+        let turns = recent_turns(&transcript_path("noisy"), 10).unwrap();
+        let said: Vec<(&str, &str)> = turns.iter().map(|t| (t.role, t.text.as_str())).collect();
+        // One reply in three records is one turn; a line that is not UTF-8 is
+        // skipped; an interrupt notice, a reminder and a compact summary are
+        // not the user's.
+        assert_eq!(
+            said,
+            [
+                ("user", "go"),
+                ("assistant", "Part one.\n\nPart two."),
+                ("user", "next prompt"),
+                ("assistant", "Done."),
+            ]
+        );
+        let call = &turns[1].tool_calls[0];
+        assert_eq!(call.output_summary.as_deref(), Some("boom"));
+        assert!(call.is_error);
+        let ok = recent_turns(&transcript_path("tools"), 10).unwrap();
+        assert!(!ok[1].tool_calls[0].is_error);
     }
 
     #[test]

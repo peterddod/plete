@@ -706,6 +706,8 @@ pub fn gate(command: Option<&Commands>, terminal: bool) -> Gate {
         | Commands::Doctor { .. }
         // Started by plete itself, under the command that was checked.
         | Commands::ReviewJob { .. }
+        // Run by a person or the assistant; it applies nothing, and a node is
+        // refused it elsewhere.
         | Commands::Budget { .. }
         | Commands::StoreSync
         | Commands::TaskHook { .. }
@@ -1465,7 +1467,8 @@ fn node_only(command: Option<&Commands>) -> Option<&'static str> {
         Commands::Brief { .. } => Some("read what was kept for the assistant"),
         // Only `plete review` starts one, and a Node may not review.
         Commands::ReviewJob { .. } => Some("run review jobs"),
-        // Run by plete, from a process with no task's identity.
+        // Run by a person or the assistant to try the classifier, never by
+        // plete itself, and never by a node.
         Commands::Budget { .. } => Some("run budget classifications"),
         _ if stops_all(command) => Some("stop every task under the assistant"),
         _ => None,

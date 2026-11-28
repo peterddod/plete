@@ -171,7 +171,50 @@ pub fn run(inv: &Invocation, prompt: &str, timeout: Duration) -> Result<String> 
     run_command(command(inv, &[]), prompt, timeout)
 }
 
+/// The longest a classifier may be given, whatever is configured: a sum
+/// that does not overflow an `Instant`.
+const LONGEST: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long to wait for a reader thread once the command's group is dead.
+const READER_WAIT: Duration = Duration::from_secs(2);
+
+/// Kills a process group when dropped, so no way out of [`run_command`] (an
+/// error, a panic) leaves what the command started running.
+struct GroupKill(i32);
+
+impl GroupKill {
+    fn kill(&self) {
+        // SAFETY: kill(2) on the process group `run_command` made; an
+        // already dead group is only an ESRCH.
+        unsafe { libc::kill(-self.0, libc::SIGKILL) };
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// What `from` printed up to `max` bytes (and whether it printed more), sent
+/// on the channel; the rest is drained so the writer is never blocked.
+fn read_capped(
+    mut from: impl Read + Send + 'static,
+    max: usize,
+) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut from).take(max as u64 + 1).read_to_end(&mut buf);
+        let over = buf.len() > max;
+        buf.truncate(max);
+        let _ = tx.send((buf, over));
+        let _ = std::io::copy(&mut from, &mut std::io::sink());
+    });
+    rx
+}
+
 fn run_command(mut cmd: Command, prompt: &str, timeout: Duration) -> Result<String> {
+    let timeout = timeout.min(LONGEST);
     let mut child = cmd
         .process_group(0)
         .stdin(Stdio::piped())
@@ -179,53 +222,51 @@ fn run_command(mut cmd: Command, prompt: &str, timeout: Duration) -> Result<Stri
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("start {}", cmd.get_program().to_string_lossy()))?;
-    let pid = child.id() as i32;
+    // The command leads its own group (`process_group(0)`), whose id is its pid.
+    let group = GroupKill(child.id() as i32);
     let mut stdin = child.stdin.take().expect("piped");
-    let mut stdout = child.stdout.take().expect("piped");
-    let mut stderr = child.stderr.take().expect("piped");
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
     // Each on its own thread: a prompt larger than a pipe, or output the
     // command writes before it reads, must not stop the clock.
     let prompt = prompt.to_string();
-    let writer = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let _ = stdin.write_all(prompt.as_bytes());
     });
-    let out = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut stdout).take(ANSWER_MAX as u64).read_to_end(&mut buf);
-        buf
-    });
-    let err = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = (&mut stderr).take(4096).read_to_end(&mut buf);
-        buf
-    });
+    let out = read_capped(stdout, ANSWER_MAX);
+    let err = read_capped(stderr, 4096);
     let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait().context("wait for the classifier")? {
             break Some(status);
         }
         if Instant::now() >= deadline {
-            // The group, so nothing it started outlives it.
-            // SAFETY: kill(2) on a process group this function made.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            group.kill();
             let _ = child.wait();
             break None;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let _ = writer.join();
-    let stdout = String::from_utf8_lossy(&out.join().unwrap_or_default()).to_string();
-    let stderr = String::from_utf8_lossy(&err.join().unwrap_or_default()).to_string();
+    // The group is killed whichever way it ended, so nothing it started
+    // outlives it or keeps its output open; the readers then see the end.
+    group.kill();
+    let stdout = out.recv_timeout(READER_WAIT).unwrap_or_default();
+    let stderr = err.recv_timeout(READER_WAIT).unwrap_or_default();
     let Some(status) = status else {
         bail!("timed out after {}s", timeout.as_secs());
     };
     if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr.0);
         let why = stderr
             .lines()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("no output");
         bail!("exited with {status}: {}", why.trim());
     }
+    if stdout.1 {
+        bail!("printed more than {ANSWER_MAX} bytes");
+    }
+    let stdout = String::from_utf8_lossy(&stdout.0).to_string();
     if stdout.trim().is_empty() {
         bail!("printed nothing");
     }
@@ -296,7 +337,14 @@ pub fn parse_decision(text: &str) -> Result<Decision> {
     let Some(reason) = map.get("reason").and_then(|v| v.as_str()) else {
         bail!("there is no `reason`");
     };
-    let reason: String = reason.trim().chars().take(REASON_MAX).collect();
+    let reason: String = crate::messages::clean(reason)
+        .trim()
+        .chars()
+        .take(REASON_MAX)
+        .collect();
+    if reason.is_empty() {
+        bail!("the `reason` is empty");
+    }
     Ok(Decision { kind, by, reason })
 }
 
@@ -321,11 +369,13 @@ impl Bounds {
 }
 
 /// `by` raised to the minimum step and cut to doubling, in each unit it
-/// names that the row has a limit in; an error when none is left. The
-/// parent's room and the safety net are the caller's to apply on top.
+/// names that the row has a limit in; an error when none is left. Where the
+/// limit is itself below the minimum step, the minimum wins: the parent's
+/// room and the safety net are the caller's to apply on top, and refuse a
+/// grow they cannot cover.
 pub fn clamp_grow(by: Limits, bounds: &Bounds) -> Result<Limits> {
     let unit = |by: Option<i64>, min: Option<i64>, max: Option<i64>| match (by, min, max) {
-        (Some(by), Some(min), Some(max)) => Some(by.max(min).min(max)),
+        (Some(by), Some(min), Some(max)) => Some(by.max(min).min(max.max(min))),
         _ => None,
     };
     let grown = Limits {
@@ -372,57 +422,140 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-/// What git says in `path`, read-only and with no prompt; `None` if it fails.
+/// How much of what git prints is read, and how long it may take.
+const GIT_READ: usize = 64 * 1024;
+const GIT_WAIT: Duration = Duration::from_secs(10);
+
+/// What git says in `path`, read-only: `args` is a subcommand and its
+/// arguments. `path` is a task's own repository, so nothing it configures may
+/// run (an external diff, a textconv filter, an fsmonitor hook), no
+/// environment of ours may point git elsewhere, and what it prints and the
+/// time it takes are bounded (git is killed on overrun, and only what was
+/// read is kept). `None` if it fails.
 fn git_text(path: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
+    let (sub, rest) = args.split_first()?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(path)
-        .args(args)
+        .args(["-c", "core.fsmonitor=false", "-c", "core.pager=cat"])
+        .arg(sub);
+    if *sub == "diff" {
+        cmd.args(["--no-ext-diff", "--no-textconv", "--no-color"]);
+    }
+    cmd.args(rest)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_PAGER",
+    ] {
+        cmd.env_remove(name);
+    }
+    let mut child = cmd
+        .process_group(0)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    let group = GroupKill(child.id() as i32);
+    let out = read_capped(child.stdout.take()?, GIT_READ);
+    let deadline = Instant::now() + GIT_WAIT;
+    let (buf, over) = out.recv_timeout(GIT_WAIT).map_err(|_| group.kill()).ok()?;
+    let ok = if over {
+        // Enough was read; it need not go on.
+        group.kill();
+        true
+    } else {
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                break status.success();
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    group.kill();
+    let _ = child.wait();
+    ok.then(|| String::from_utf8_lossy(&buf).trim_end().to_string())
 }
+
+/// The prompt template: the user's `budget-classifier.md` in the templates
+/// directory if there is one (which must hold `{bundle}`), else the built-in.
+fn template(app: &App) -> Result<String> {
+    let path = crate::config::templates_dir(&app.home).join("budget-classifier.md");
+    if !std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+        return Ok(TEMPLATE.to_string());
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("read the template override {}", path.display()))?;
+    if !text.contains("{bundle}") {
+        bail!(
+            "the template override {} has no {{bundle}} to put the task's bundle in",
+            path.display()
+        );
+    }
+    Ok(text)
+}
+
+/// The least room the bundle is left, whatever the template takes.
+const MIN_ROOM: usize = 4 * 1024;
 
 /// The bundle about `task`, crossing `level` per cent: its brief, mode,
 /// limits and the bounds; its last 10 turns; the tail of its `actions.log`;
 /// each worktree's diff and commits; its last reports and its children's.
-/// Each part is cut from its oldest end, the whole to [`MAX_BUNDLE`], and
-/// all of it is fenced as data the task wrote. A part that cannot be read
-/// is a note, never an error.
+/// Each part is cut from its oldest end, measured as it will be fenced (a
+/// `<` or `>` is three bytes there), and all of it is fenced as data the
+/// task wrote. The fenced bundle and the prompt template around it come to
+/// at most [`MAX_BUNDLE`]; a cut that is still needed is made inside the
+/// fence, from the end, so the brief and both tags stay. A part that cannot
+/// be read is a note, never an error.
 pub fn build_bundle(app: &App, task: &TaskRecord, level: u8, bounds: &Bounds) -> Result<String> {
+    const FROM: &str = "the task and what it wrote";
+    let room = MAX_BUNDLE
+        .saturating_sub(template(app)?.len())
+        .max(MIN_ROOM)
+        .saturating_sub(fence::fence_message(FROM, "").len());
     let parts = [
-        (2500, "The task", part_task(app, task, level, bounds)?),
-        (5000, "Its last turns", part_turns(app, task)),
+        (2000, "The task", part_task(app, task, level, bounds)?),
+        (3500, "Its last turns", part_turns(app, task)),
         (
-            2500,
+            2000,
             "Its actions.log (last 100 lines)",
             part_log(app, task),
         ),
-        // Room for a diff of DIFF_MAX, and the commits and stat before it.
+        // Room for a diff of DIFF_MAX, and the commits, stat and status.
         (12000, "Its worktrees", part_git(app, task)?),
         (
-            2000,
+            1500,
             "Its reports, and its children's last",
             part_reports(app, task)?,
         ),
     ];
     let mut text = String::new();
     for (max, title, body) in parts {
-        text.push_str(&format!(
-            "## {title}\n{}\n\n",
-            truncate_oldest(body.trim_end(), max)
-        ));
+        let body = fence::fence_body(body.trim_end());
+        text.push_str(&format!("## {title}\n{}\n\n", truncate_oldest(&body, max)));
     }
-    let fenced = fence::fence_message("the task and what it wrote", text.trim_end());
-    if fenced.len() > MAX_BUNDLE {
-        // The parts' caps leave room; this is the guarantee.
-        return Ok(truncate_oldest(&fenced, MAX_BUNDLE));
+    let text = truncate_newest(text.trim_end(), room);
+    Ok(fence::fence_message(FROM, &text))
+}
+
+/// `text` cut to its first `max` characters.
+fn head(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
     }
-    Ok(fenced)
 }
 
 fn part_task(app: &App, task: &TaskRecord, level: u8, bounds: &Bounds) -> Result<String> {
@@ -444,9 +577,9 @@ fn part_task(app: &App, task: &TaskRecord, level: u8, bounds: &Bounds) -> Result
     let mut out = format!("task: {} ({})\n", task.slug, task.name);
     match app.db.get_brief(&task.id)? {
         Some(brief) => {
-            out.push_str(&format!("goal: {}\n", brief.goal));
+            out.push_str(&format!("goal: {}\n", head(&brief.goal, 800)));
             if let Some(done) = brief.done_when {
-                out.push_str(&format!("done when: {done}\n"));
+                out.push_str(&format!("done when: {}\n", head(&done, 400)));
             }
         }
         None => out.push_str("no brief\n"),
@@ -508,7 +641,8 @@ fn part_turns(app: &App, task: &TaskRecord) -> String {
                 for call in &turn.tool_calls {
                     text.push_str(&format!("\n  tool {}({})", call.name, call.input_summary));
                     if let Some(output) = &call.output_summary {
-                        text.push_str(&format!(" -> {output}"));
+                        let failed = if call.is_error { "FAILED: " } else { "" };
+                        text.push_str(&format!(" -> {failed}{output}"));
                     }
                 }
                 text
@@ -547,33 +681,45 @@ fn part_git(app: &App, task: &TaskRecord) -> Result<String> {
             .unwrap_or_else(|| "main".to_string());
         let base = [format!("origin/{default}"), default]
             .iter()
-            .find_map(|b| crate::git::merge_base(&path, b));
+            .filter(|b| !b.starts_with('-'))
+            .find_map(|b| git_text(&path, &["merge-base", b, "HEAD"]))
+            .filter(|sha| !sha.is_empty());
         let (stat, diff, log) = match &base {
             Some(base) => (
-                git_text(&path, &["diff", "--stat", base]),
-                git_text(&path, &["diff", base]),
+                git_text(&path, &["diff", "--stat", base, "--"]),
+                git_text(&path, &["diff", base, "--"]),
                 git_text(
                     &path,
-                    &["log", "--oneline", "-n", "20", &format!("{base}..HEAD")],
+                    &[
+                        "log",
+                        "--oneline",
+                        "-n",
+                        "20",
+                        &format!("{base}..HEAD"),
+                        "--",
+                    ],
                 ),
             ),
             None => (
-                git_text(&path, &["diff", "--stat", "HEAD"]),
-                git_text(&path, &["diff", "HEAD"]),
-                git_text(&path, &["log", "--oneline", "-n", "20"]),
+                git_text(&path, &["diff", "--stat", "HEAD", "--"]),
+                git_text(&path, &["diff", "HEAD", "--"]),
+                git_text(&path, &["log", "--oneline", "-n", "20", "--"]),
             ),
         };
+        let status = git_text(&path, &["status", "--short", "--untracked-files=normal"]);
         let note = |text: Option<String>| match text {
             Some(t) if t.trim().is_empty() => "none".to_string(),
             Some(t) => t,
             None => "git could not say".to_string(),
         };
         out.push(format!(
-            "{} (branch {}):\ncommits since the branch point:\n{}\ndiff --stat:\n{}\ndiff:\n{}",
+            "{} (branch {}):\ncommits since the branch point:\n{}\ndiff --stat:\n{}\n\
+             uncommitted and untracked files:\n{}\ndiff:\n{}",
             wt.dir_name,
             wt.branch.as_deref().unwrap_or("detached"),
             truncate_newest(&note(log), 1500),
             truncate_newest(&note(stat), 1000),
+            truncate_newest(&note(status), 800),
             truncate_newest(&note(diff), DIFF_MAX),
         ));
     }
@@ -582,13 +728,7 @@ fn part_git(app: &App, task: &TaskRecord) -> Result<String> {
 
 fn part_reports(app: &App, task: &TaskRecord) -> Result<String> {
     let mut lines = Vec::new();
-    let own: Vec<_> = app
-        .db
-        .reports_for(&task.id, 50)?
-        .into_iter()
-        .filter(|r| r.task_id == task.id)
-        .take(5)
-        .collect();
+    let own = app.db.reports_about(&task.id, 5)?;
     for report in own.iter().rev() {
         lines.push(format!(
             "#{} {}: {}",
@@ -617,13 +757,7 @@ fn part_reports(app: &App, task: &TaskRecord) -> Result<String> {
 /// The prompt around `bundle`: the user's `budget-classifier.md` in the
 /// templates directory if there is one, else the built-in one.
 pub fn prompt(app: &App, bundle: &str) -> Result<String> {
-    let path = crate::config::templates_dir(&app.home).join("budget-classifier.md");
-    let template = match std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
-        true => std::fs::read_to_string(&path)
-            .with_context(|| format!("read the template override {}", path.display()))?,
-        false => TEMPLATE.to_string(),
-    };
-    Ok(template.replacen("{bundle}", bundle, 1))
+    Ok(template(app)?.replacen("{bundle}", bundle, 1))
 }
 
 #[cfg(test)]
@@ -767,13 +901,13 @@ mod tests {
 
     /// A script under `dir` that runs `body` as a shell script.
     fn script(dir: &Path, body: &str) -> Invocation {
-        use std::os::unix::fs::PermissionsExt;
+        // Run by `sh`, not exec'd: a file just written and still open to
+        // another test's fork would be ETXTBSY.
         let path = dir.join("fake.sh");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&path, format!("{body}\n")).unwrap();
         Invocation {
-            program: path.to_string_lossy().to_string(),
-            args: vec![],
+            program: "/bin/sh".to_string(),
+            args: vec![path.to_string_lossy().to_string()],
             cwd: dir.to_path_buf(),
             env_remove: identity_vars(std::iter::empty()),
         }
@@ -801,6 +935,7 @@ mod tests {
         let err = said("echo '   '").unwrap_err().to_string();
         assert!(err.contains("printed nothing"), "{err}");
         let mut missing = script(dir.path(), "true");
+        missing.args.clear();
         missing.program = dir.path().join("absent").to_string_lossy().to_string();
         assert!(run(&missing, "p", sec).is_err());
     }
@@ -824,12 +959,57 @@ mod tests {
         let took = started.elapsed();
         assert!(err.contains("timed out after 1s"), "{err}");
         assert!(
-            took >= Duration::from_secs(1) && took < Duration::from_millis(2500),
+            took >= Duration::from_secs(1) && took < Duration::from_secs(4),
             "{took:?}"
         );
         // Neither it nor the child it started got to write.
         std::thread::sleep(Duration::from_millis(2500));
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_command_that_exits_but_leaves_a_process_holding_its_output_does_not_hang_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let inv = script(
+            dir.path(),
+            &format!("(sleep 3; touch {}) &\necho answer", marker.display()),
+        );
+        let started = Instant::now();
+        let said = run(&inv, "p", Duration::from_secs(20)).unwrap();
+        assert_eq!(said.trim(), "answer");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // What it left behind was killed with its group.
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_timeout_too_large_for_a_clock_is_bounded_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = script(dir.path(), "echo ok");
+        let said = run(&inv, "p", Duration::from_secs(u64::MAX)).unwrap();
+        assert_eq!(said.trim(), "ok");
+    }
+
+    #[test]
+    fn an_answer_over_the_cap_is_reported_as_too_long_not_as_a_bad_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = script(dir.path(), "head -c 70000 /dev/zero | tr '\\0' x");
+        let err = run(&inv, "p", Duration::from_secs(10))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("printed more than 65536 bytes"), "{err}");
+        // At the cap exactly is still an answer.
+        let inv = script(dir.path(), "head -c 65536 /dev/zero | tr '\\0' x");
+        assert_eq!(
+            run(&inv, "p", Duration::from_secs(10)).unwrap().len(),
+            65536
+        );
     }
 
     #[test]
@@ -1056,6 +1236,88 @@ mod tests {
     }
 
     #[test]
+    fn text_heavy_in_angle_brackets_is_measured_as_fenced_and_keeps_the_fence_and_the_brief() {
+        let (_dir, mut app) = lab();
+        let m = busy(&mut app);
+        // Each `<` and `>` is three bytes once fenced.
+        let heavy: String = (0..3000).map(|_| "-> <T> ").collect();
+        assert!(heavy.len() > 20_000);
+        let wt = crate::tasks::task_dir(&app, &m).join("api");
+        std::fs::write(wt.join("a.txt"), format!("{heavy}\n{heavy}\n")).unwrap();
+        let log = format!("{heavy}\n{heavy}\n");
+        std::fs::write(crate::permissions::actions_log_for(&app, &m), log).unwrap();
+        app.db
+            .insert_report(
+                "m",
+                &super::super::root(&app).unwrap().id,
+                ReportKind::Progress,
+                &heavy,
+                30,
+            )
+            .unwrap();
+        let bundle = build_bundle(&app, &m, 80, &bounds_of(&app, "m")).unwrap();
+        let whole = prompt(&app, &bundle).unwrap();
+        assert!(whole.len() <= MAX_BUNDLE, "{}", whole.len());
+        assert!(bundle.starts_with("<plete-message"), "{}", &bundle[..60]);
+        assert!(bundle.ends_with("</plete-message>"));
+        assert_eq!(bundle.matches("</plete-message>").count(), 1);
+        assert!(bundle.contains("task: m (m)") && bundle.contains("goal: ship the API"));
+        assert!(bundle.contains("crossed: 80% of a limit"));
+        // A template that takes more of the room leaves the bundle less, and
+        // the whole still fits.
+        let templates = config::templates_dir(&app.home);
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(
+            templates.join("budget-classifier.md"),
+            format!("{}\n{{bundle}}\n", "rules ".repeat(2500)),
+        )
+        .unwrap();
+        let bundle = build_bundle(&app, &m, 80, &bounds_of(&app, "m")).unwrap();
+        let whole = prompt(&app, &bundle).unwrap();
+        assert!(whole.len() <= MAX_BUNDLE, "{}", whole.len());
+        assert!(bundle.starts_with("<plete-message") && bundle.ends_with("</plete-message>"));
+        assert!(bundle.contains("task: m (m)"), "the brief is what stays");
+    }
+
+    #[test]
+    fn nothing_a_task_configured_in_its_repository_runs_to_read_it() {
+        let (_dir, mut app) = lab();
+        let m = busy(&mut app);
+        let wt = crate::tasks::task_dir(&app, &m).join("api");
+        let ran = wt.parent().unwrap().join("ran");
+        let hook = wt.parent().unwrap().join("hook.sh");
+        std::fs::write(&hook, format!("touch {}\ncat\n", ran.display())).unwrap();
+        let hook = format!("sh {}", hook.display());
+        git(&wt, &["config", "diff.external", &hook]);
+        git(&wt, &["config", "core.fsmonitor", &hook]);
+        git(&wt, &["config", "diff.x.textconv", &hook]);
+        std::fs::write(wt.join(".gitattributes"), "*.txt diff=x\n").unwrap();
+        std::fs::write(wt.join("untracked-file.rs"), "x\n").unwrap();
+        let bundle = build_bundle(&app, &m, 80, &bounds_of(&app, "m")).unwrap();
+        assert!(!ran.exists(), "a configured program ran");
+        // The diff is still read, plain, and the untracked file is named.
+        assert!(bundle.contains("changed line 0"), "{bundle}");
+        assert!(bundle.contains("?? untracked-file.rs"), "{bundle}");
+    }
+
+    #[test]
+    fn git_output_is_bounded_and_git_is_killed_on_overrun() {
+        let (_dir, mut app) = lab();
+        let m = busy(&mut app);
+        let wt = crate::tasks::task_dir(&app, &m).join("api");
+        // A diff of megabytes: only what is read is kept.
+        let big: String = (0..400_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(wt.join("a.txt"), big).unwrap();
+        let started = Instant::now();
+        let text = git_text(&wt, &["diff", "HEAD", "--"]).unwrap();
+        assert!(text.len() <= GIT_READ, "{}", text.len());
+        assert!(started.elapsed() < Duration::from_secs(8));
+        // Not a repository, or not a command: nothing, not an error.
+        assert!(git_text(&wt, &["no-such-subcommand"]).is_none());
+        assert!(git_text(Path::new("/nonexistent-dir"), &["status"]).is_none());
+    }
+
+    #[test]
     fn a_bundle_for_a_task_with_nothing_still_builds() {
         let (_dir, mut app) = lab();
         app.config.harness = Some(HarnessConfig::Name("generic".into()));
@@ -1084,6 +1346,11 @@ mod tests {
         assert!(text.contains("THE BUNDLE") && !text.contains("{bundle}"));
         assert!(text.contains("DATA written by the task"));
         assert!(text.contains("ONE JSON object"));
+        // The bundle is not the last word: the format is.
+        assert!(text
+            .trim_end()
+            .ends_with("Reply with the JSON object only."));
+        assert!(text.find("THE BUNDLE").unwrap() < text.rfind("JSON object only").unwrap());
         let templates = config::templates_dir(&app.home);
         std::fs::create_dir_all(&templates).unwrap();
         std::fs::write(
@@ -1092,6 +1359,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(prompt(&app, "B").unwrap(), "mine: B :end");
+        // An override with nowhere for the bundle is refused, not run blind.
+        std::fs::write(templates.join("budget-classifier.md"), "no placeholder").unwrap();
+        let err = format!("{:#}", prompt(&app, "B").unwrap_err());
+        assert!(err.contains("has no {bundle}"), "{err}");
+        assert!(build_bundle(
+            &app,
+            &app.db.get_task("w2").unwrap().unwrap(),
+            80,
+            &Bounds::of(&BudgetRow::default())
+        )
+        .is_err());
     }
 
     #[test]
@@ -1142,14 +1420,30 @@ mod tests {
             r#"{"decision":"grow","by":"=1h","reason":"x"}"#,
             "not a `+` change",
         );
-        refused(r#"{"decision":"grow","by":"+0h","reason":"x"}"#, "by");
-        refused(r#"{"decision":"grow","by":"1h","reason":"x"}"#, "by");
+        refused(
+            r#"{"decision":"grow","by":"+0h","reason":"x"}"#,
+            "`by` \"+0h\":",
+        );
+        refused(
+            r#"{"decision":"grow","by":"1h","reason":"x"}"#,
+            "start a change with +",
+        );
         refused(r#"{"decision":"grow","by":3,"reason":"x"}"#, "not text");
         refused(
             r#"{"decision":"stop","by":"+1h","reason":"x"}"#,
             "only for a grow",
         );
         refused(r#"{"decision":"stop"}"#, "no `reason`");
+        refused(r#"{"decision":"stop","reason":""}"#, "`reason` is empty");
+        refused(
+            r#"{"decision":"stop","reason":" \u001b\u0007\n "}"#,
+            "`reason` is empty",
+        );
+        // Control characters are taken out of what is kept.
+        assert_eq!(
+            ok(r#"{"decision":"stop","reason":"a\u001b[2Jb\u0007c\nd"}"#).reason,
+            "a[2Jbc\nd"
+        );
     }
 
     #[test]
@@ -1173,12 +1467,14 @@ mod tests {
             limits(Some(900), None)
         );
         assert!(clamp_grow(limits(None, Some(9)), &time_only).is_err());
-        // A limit smaller than the step: doubling wins.
+        // A limit smaller than the step: the minimum step wins (the parent's
+        // room refuses it if there is none).
         let small = Bounds {
             max: limits(Some(300), None),
             ..bounds
         };
-        assert_eq!(by_with(&small, Some(60)), limits(Some(300), None));
+        assert_eq!(by_with(&small, Some(60)), limits(Some(600), None));
+        assert_eq!(by_with(&small, Some(3600)), limits(Some(600), None));
     }
 
     fn by_with(bounds: &Bounds, secs: Option<i64>) -> Limits {
