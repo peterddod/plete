@@ -706,6 +706,7 @@ pub fn gate(command: Option<&Commands>, terminal: bool) -> Gate {
         | Commands::Doctor { .. }
         // Started by plete itself, under the command that was checked.
         | Commands::ReviewJob { .. }
+        | Commands::Budget { .. }
         | Commands::StoreSync
         | Commands::TaskHook { .. }
         | Commands::TaskStartup { .. }
@@ -1464,6 +1465,8 @@ fn node_only(command: Option<&Commands>) -> Option<&'static str> {
         Commands::Brief { .. } => Some("read what was kept for the assistant"),
         // Only `plete review` starts one, and a Node may not review.
         Commands::ReviewJob { .. } => Some("run review jobs"),
+        // Run by plete, from a process with no task's identity.
+        Commands::Budget { .. } => Some("run budget classifications"),
         _ if stops_all(command) => Some("stop every task under the assistant"),
         _ => None,
     }
@@ -1770,6 +1773,7 @@ fn node_scope(command: Option<&Commands>) -> Option<Scope> {
         | Commands::Todo { .. }
         | Commands::Brief { .. }
         | Commands::ReviewJob { .. }
+        | Commands::Budget { .. }
         | Commands::StoreSync
         | Commands::TaskHook { .. }
         | Commands::TaskStartup { .. }
@@ -3105,6 +3109,7 @@ mod tests {
             &["todo", "add", "x"],
             &["todo", "ls"],
             &["review-job", "s"],
+            &["budget", "classify", "x", "--level", "80"],
             &["tasks"],
         ];
         for args in refused {
@@ -3185,6 +3190,7 @@ mod tests {
             (&["review", "explore", "x"], false),
             (&["pr", "merge", "1"], true),
             (&["review-job", "s"], true),
+            (&["budget", "classify", "x", "--level", "80"], true),
             (&["sync"], false),
             (&["store-sync"], true),
             (&["tasks"], true),

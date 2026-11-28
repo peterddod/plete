@@ -261,6 +261,26 @@ pub trait Harness: Sync {
         None
     }
 
+    /// The arguments after the program for a one-shot, tool-less call of
+    /// `model` that reads its prompt on stdin and prints its answer on
+    /// stdout, and touches nothing of the user's (no tools, MCP servers,
+    /// settings or session). `None` when the harness has no such mode: the
+    /// classifier then needs `[budget] classifier_command`.
+    fn classifier_args(&self, _model: &str) -> Option<Vec<String>> {
+        None
+    }
+
+    /// The last `n` turns of session `id`, started in `dir`, oldest first,
+    /// with their tool calls. `None` when it keeps no record plete can read.
+    fn recent_turns(
+        &self,
+        _dir: &Path,
+        _id: &str,
+        _n: usize,
+    ) -> Option<Result<Vec<TranscriptTurn>>> {
+        None
+    }
+
     /// When any of its sessions in `dir` last recorded anything; cheap.
     fn latest_activity(&self, _dir: &Path) -> Option<i64> {
         None
@@ -424,6 +444,27 @@ pub struct LastTurn {
     /// Unix seconds the last turn ended, or for one still running, when it
     /// last recorded anything. `None` when nothing says.
     pub at: Option<i64>,
+}
+
+/// One turn of a session's transcript: what the user or the agent said, and
+/// the tools the agent called with what came back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptTurn {
+    /// `user` or `assistant`.
+    pub role: &'static str,
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// A tool call in a [`TranscriptTurn`]: its input and, once the result is
+/// in, its output, each cut short.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    /// The harness's id for the call, which its result names.
+    pub id: String,
+    pub name: String,
+    pub input_summary: String,
+    pub output_summary: Option<String>,
 }
 
 /// One reply of the agent's, its text blocks joined.

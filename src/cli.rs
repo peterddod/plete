@@ -95,6 +95,13 @@ pub enum Commands {
     #[command(hide = true)]
     ReviewJob { review: String },
 
+    /// What plete runs for budgets (run by plete)
+    #[command(hide = true)]
+    Budget {
+        #[command(subcommand)]
+        command: BudgetCommands,
+    },
+
     /// Fetch every repository in the store, fast-forwarding clean trunks
     Sync {
         /// Sync only this repository
@@ -676,6 +683,18 @@ pub struct Delegation {
 }
 
 #[derive(Subcommand)]
+pub enum BudgetCommands {
+    /// Ask the classifier what to do with a task that crossed a threshold,
+    /// and print its answer; applies nothing
+    Classify {
+        task: String,
+        /// The threshold crossed, in per cent
+        #[arg(long, value_parser = ["80", "100"])]
+        level: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ManagerCommands {
     /// Make a manager and start its agent: under the assistant, or under
     /// --parent; it reads its brief and delegates to tasks below it
@@ -1136,6 +1155,28 @@ mod tests {
         assert!(bad(&["task", "new", "x", "--budget-mode", "inherit"]));
         assert!(bad(&["task", "new", "x", "--budget-mode", "sometimes"]));
         assert!(bad(&["task", "budget", "x", "--mode", "sometimes"]));
+    }
+
+    #[test]
+    fn the_hidden_classify_command_takes_a_task_and_a_level() {
+        let Some(Commands::Budget {
+            command: BudgetCommands::Classify { task, level },
+        }) = parse(&["budget", "classify", "m", "--level", "80"]).command
+        else {
+            panic!("expected budget classify");
+        };
+        assert_eq!((task.as_str(), level.as_str()), ("m", "80"));
+        let bad = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("plete").chain(args.iter().copied())).is_err()
+        };
+        assert!(bad(&["budget", "classify", "m", "--level", "90"]));
+        assert!(bad(&["budget", "classify", "m"]));
+        // Hidden from help.
+        use clap::CommandFactory;
+        assert!(Cli::command()
+            .find_subcommand("budget")
+            .unwrap()
+            .is_hide_set());
     }
 
     #[test]
