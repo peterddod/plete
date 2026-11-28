@@ -26,4 +26,5 @@ pub mod sync;
 pub mod task;
 pub mod tasks;
 pub mod todo;
+pub mod warmup;
 pub mod worktree;

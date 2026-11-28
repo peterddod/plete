@@ -210,14 +210,19 @@ fn lock_path(home: &Path) -> PathBuf {
 /// One repo's fetch lock. The id is flattened to a single file name; two ids
 /// that flatten alike only share a lock, which costs a wait, never a clash.
 fn repo_lock_path(home: &Path, repo_id: &str) -> PathBuf {
-    let name: String = repo_id
+    home.join(REPO_LOCK_DIR)
+        .join(format!("{}.lock", flat_name(repo_id)))
+}
+
+/// A repo's id as one file or directory name.
+pub fn flat_name(repo_id: &str) -> String {
+    repo_id
         .chars()
         .map(|c| match c {
             'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
             _ => '_',
         })
-        .collect();
-    home.join(REPO_LOCK_DIR).join(format!("{name}.lock"))
+        .collect()
 }
 
 pub fn last_sync(home: &Path) -> Option<i64> {

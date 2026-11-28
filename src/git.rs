@@ -797,7 +797,7 @@ pub fn worktree_prune(repo_path: &Path) -> Result<()> {
 
 /// Run git in `dir` and return its stdout, failing with git's own message.
 /// `env` is added to git's environment and `input`, if any, is its stdin.
-fn git_output(
+pub(crate) fn git_output(
     dir: &Path,
     args: &[&str],
     env: &[(&str, &Path)],

@@ -136,6 +136,26 @@ pub trait Harness: Sync {
         None
     }
 
+    /// Whether [`Harness::fork_args`] and [`Harness::seed_session`] work, so
+    /// a start may fork.
+    fn can_fork(&self) -> bool {
+        false
+    }
+
+    /// Arguments that start a new session `new_id` as a fork of recorded
+    /// session `base_id`, named `name`: it begins with the base's history,
+    /// and the base is left as it was. The base's transcript must already be
+    /// where the harness looks for it ([`Harness::seed_session`]).
+    fn fork_args(&self, _base_id: &str, _new_id: &str, _name: &str) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Arguments that run one prompt to completion with nobody at the
+    /// terminal, within `opts`. Not for a session plete records.
+    fn headless_args(&self, _prompt: &str, _opts: &Headless) -> Option<Vec<String>> {
+        None
+    }
+
     /// Arguments that give this launch the MCP servers in the file at
     /// `path`, `{"mcpServers": {…}}` (an agent profile's `mcp`).
     fn mcp_args(&self, _path: &Path) -> Option<Vec<String>> {
@@ -252,6 +272,23 @@ pub trait Harness: Sync {
     /// started in `to`, returning those copied.
     fn copy_sessions(&self, _from: &Path, _to: &Path) -> Result<Vec<AgentSession>> {
         Ok(Vec::new())
+    }
+
+    /// Copy the one session `id`, started in `from`, to where it looks for
+    /// those started in `to`, which must exist, so a fork started in `to`
+    /// finds it. A session already there is left alone.
+    fn seed_session(&self, _from: &Path, _to: &Path, _id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete the record of session `id`, started in `dir`, so a warm-up
+    /// replaced by a newer one leaves nothing behind. Missing is fine.
+    fn forget_session(&self, _dir: &Path, _id: &str) {}
+
+    /// What session `id`, started in `dir`, read and cost, from its record.
+    /// `None` when it keeps none plete can read.
+    fn transcript_info(&self, _dir: &Path, _id: &str) -> Option<Transcript> {
+        None
     }
 
     /// What session `id`, started in `dir`, last said: its last `n`
@@ -415,6 +452,29 @@ pub enum EventKind {
     Ended { cleared: bool },
 }
 
+/// What a headless run may do, for [`Harness::headless_args`].
+#[derive(Debug, Clone, Default)]
+pub struct Headless<'a> {
+    /// The most turns it may take.
+    pub max_turns: u32,
+    /// Tools (in the harness's syntax) it may use without asking.
+    pub allow: &'a [String],
+    /// Tools it may not use.
+    pub deny: &'a [String],
+}
+
+/// What a session's record says of its size and reading, from
+/// [`Harness::transcript_info`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transcript {
+    /// What its last reply was given as input: new, cached and cache-written
+    /// tokens, which is what a fork of it starts with.
+    pub last_input_tokens: u64,
+    /// The files it read, relative to its directory where under it, once
+    /// each, in the order first read.
+    pub files_read: Vec<String>,
+}
+
 /// What a session last said, from [`Harness::last_messages`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LastTurn {
@@ -527,6 +587,13 @@ pub fn version_warning(harness: &dyn Harness, program: &str) -> Option<String> {
             })
         })
         .clone()
+}
+
+/// The version `program --version` prints, asked once per run: what a
+/// warm-up's fingerprint holds.
+pub fn program_version(program: &str) -> Option<String> {
+    static ASKED: OnceLock<Option<String>> = OnceLock::new();
+    ASKED.get_or_init(|| installed_version(program)).clone()
 }
 
 /// The version `program --version` prints, given a couple of seconds.

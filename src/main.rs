@@ -41,6 +41,7 @@ mod todo;
 mod tui;
 mod waiter;
 mod wake;
+mod warmup;
 mod watch;
 mod worktrees;
 
@@ -50,8 +51,8 @@ use clap_complete::CompleteEnv;
 
 use cli::{
     AgentsCommands, Cli, Commands, DoctorCommands, InboxCommands, ManagerCommands, PrCommands,
-    ProjectCommands, ReviewCommands, SetupCommands, TaskCommands, TodoCommands, WatchCommands,
-    WorktreeArgs, WorktreeCommands,
+    ProjectCommands, ReviewCommands, SetupCommands, TaskCommands, TodoCommands, WarmupCommands,
+    WatchCommands, WorktreeArgs, WorktreeCommands,
 };
 
 fn main() -> Result<()> {
@@ -265,6 +266,21 @@ fn run(command: Option<Commands>, wake: Option<waiter::WakeEnv>) -> Result<()> {
                 } => commands::agents::new(&app, &name, from.as_deref(), project.as_deref())?,
                 AgentsCommands::Edit { name, project } => {
                     commands::agents::edit(&app, &name, project.as_deref())?
+                }
+            }
+        }
+        Commands::Warmup { command } => {
+            let app = context::App::open()?;
+            match command.unwrap_or(WarmupCommands::Ls { json: false }) {
+                WarmupCommands::Ls { json } => commands::warmup::ls(&app, json)?,
+                WarmupCommands::Show { profile, scope } => {
+                    commands::warmup::show(&app, &profile, &scope)?
+                }
+                WarmupCommands::Refresh { profile, scope } => {
+                    commands::warmup::refresh(&app, &profile, scope.as_deref())?
+                }
+                WarmupCommands::Clear { profile, scope } => {
+                    commands::warmup::clear(&app, profile.as_deref(), scope.as_deref())?
                 }
             }
         }

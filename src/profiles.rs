@@ -116,6 +116,9 @@ pub struct Settings {
     /// Harness rules added for its agent, as `[permissions.task]`'s.
     #[serde(default, skip_serializing_if = "RoleRules::is_empty")]
     pub permissions: RoleRules,
+    /// Opts into a cached warm-up session ([`crate::warmup`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup: Option<crate::warmup::Config>,
 }
 
 /// `mcp` in a profile.
@@ -233,6 +236,9 @@ fn check(s: &Settings) -> Result<()> {
         if key.starts_with("PLETE_") || key.starts_with("JEET_") {
             bail!("env: {key} is plete's own; a profile may not set it");
         }
+    }
+    if let Some(w) = &s.warmup {
+        crate::warmup::check(w)?;
     }
     if let Some(Mcp::File(path)) = &s.mcp {
         if path.trim().is_empty() {
@@ -622,6 +628,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_warmup_section_reads_and_a_bad_one_is_refused() {
+        let (s, _) = parse(
+            "+++\n[warmup]\nprompt = \"map\"\nper = \"repo\"\n[warmup.refresh]\ncommits = false\n+++\nGo.",
+        )
+        .unwrap();
+        let w = s.warmup.expect("warmup");
+        assert_eq!(w.prompt, "map");
+        assert_eq!(w.max_turns, 30);
+        for bad in [
+            "[warmup]\nprompt = \"m\"",
+            "[warmup]\nprompt = \"m\"\nper = \"repo\"\nturns = 1",
+            "[warmup]\nprompt = \"m\"\nper = \"repo\"\n[warmup.refresh]\nevery = \"25:00\"",
+            "[warmup]\nprompt = \" \"\nper = \"repo\"",
+            "[warmup]\nprompt = \"m\"\nper = \"repo\"\nmax_turns = 0",
+        ] {
+            assert!(parse(&format!("+++\n{bad}\n+++\n")).is_err(), "{bad}");
+        }
+        // Without it a profile is unchanged, and serializes without the key.
+        let (s, _) = parse("+++\nmodel = \"x\"\n+++\n").unwrap();
+        assert_eq!(s.warmup, None);
+        assert!(!toml::to_string(&s).unwrap().contains("warmup"));
+    }
+
+    #[test]
     fn a_profile_is_its_settings_then_its_body() {
         let (s, body) = parse(
             "+++\ndescription = \"plans\"\nmodel = \"opus\"\nallow = [\"task.create\"]\n\
@@ -850,6 +880,28 @@ mod tests {
         );
         assert_eq!(broken.len(), 1);
         assert_eq!(broken[0].name, "bad");
+    }
+
+    #[test]
+    fn a_bad_warmup_section_lists_the_profile_as_broken() {
+        let (_dir, app) = app();
+        let user = app.home.join("agents");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(
+            user.join("good.md"),
+            "+++\n[warmup]\nprompt = \"m\"\nper = \"repo\"\n+++\nGo.",
+        )
+        .unwrap();
+        std::fs::write(
+            user.join("typo.md"),
+            "+++\n[warmup]\nprompt = \"m\"\nper = \"repo\"\nmax_turn = 3\n+++\nGo.",
+        )
+        .unwrap();
+        let (profiles, broken) = list(&app, None);
+        assert!(profiles.iter().any(|p| p.name == "good"));
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].name, "typo");
+        assert!(format!("{:#}", broken[0].error).contains("max_turn"));
     }
 
     #[test]

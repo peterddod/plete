@@ -1109,6 +1109,7 @@ fn start_tmux(
         name: review.slug.clone(),
         dir,
         known_sessions,
+        fork_base: None,
         ungated_warning: true,
         spec,
         hooks,

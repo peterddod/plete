@@ -584,6 +584,16 @@ const MIGRATIONS: &[&str] = &[
         WHERE task_id IN (SELECT id FROM tasks WHERE kind = 'manager');
     UPDATE tasks SET kind = 'work' WHERE kind = 'manager';
     ",
+    // v17: the session a task's first start forks (a warm-up's base) and the
+    // directory it ran in. Its own table, like `task_agents`; no row for a
+    // task that starts cold.
+    "
+    CREATE TABLE task_fork_base (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL,
+        dir TEXT NOT NULL
+    );
+    ",
 ];
 
 /// A repository in the index. Its trunk is in the store, except for one
@@ -1105,7 +1115,7 @@ mod tests {
     fn a_manager_becomes_a_planner_task() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
-        let before = MIGRATIONS.len() - 1;
+        let before = 15;
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(BASELINE).unwrap();

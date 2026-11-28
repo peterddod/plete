@@ -169,3 +169,37 @@ pub fn branch_names(filter: Option<&str>) -> Vec<String> {
     out.dedup();
     out
 }
+
+/// Profiles with a `[warmup]`, built or not.
+pub fn warmup_profile_candidates() -> Vec<CompletionCandidate> {
+    let Ok(app) = App::open() else {
+        return Vec::new();
+    };
+    let (profiles, _) = crate::profiles::list(&app, None);
+    profiles
+        .into_iter()
+        .filter(|p| p.settings.warmup.is_some())
+        .map(|p| CompletionCandidate::new(p.name))
+        .collect()
+}
+
+/// What a warm-up may be of: the scopes kept, and the repos (by store id) and
+/// projects that one could be built for.
+pub fn warmup_scope_candidates() -> Vec<CompletionCandidate> {
+    let Ok(app) = App::open() else {
+        return Vec::new();
+    };
+    let mut names: std::collections::BTreeSet<String> = crate::commands::warmup::kept(&app)
+        .into_iter()
+        .map(|(_, scope)| scope)
+        .collect();
+    names.extend(
+        app.db
+            .list_repos(None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.id),
+    );
+    names.extend(crate::projects::list(&app).unwrap_or_default());
+    names.into_iter().map(CompletionCandidate::new).collect()
+}
