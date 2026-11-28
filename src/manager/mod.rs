@@ -6,6 +6,7 @@
 //! [`crate::assistant`] keeps its sessions and windows.
 
 pub mod budget;
+pub mod classifier;
 pub mod context;
 pub mod fence;
 pub mod run;

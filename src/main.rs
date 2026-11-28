@@ -119,6 +119,7 @@ fn runs_by_a_person(command: Option<&Commands>) -> bool {
                 | Commands::Complete { .. }
                 | Commands::InitShell
                 | Commands::ReviewJob { .. }
+                | Commands::Budget { .. }
                 | Commands::StoreSync
                 | Commands::TaskHook { .. }
                 | Commands::TaskStartup { .. }
@@ -329,6 +330,10 @@ fn run(command: Option<Commands>, wake: Option<waiter::WakeEnv>) -> Result<()> {
             }
         }
         Commands::ReviewJob { review } => review::run_job(&review)?,
+        Commands::Budget { command } => {
+            let app = context::App::open()?;
+            commands::budget::run(&app, command)?;
+        }
         Commands::Sync { repo } => {
             let app = context::App::open()?;
             commands::sync::run(&app, repo.as_deref())?;

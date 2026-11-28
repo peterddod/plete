@@ -1027,11 +1027,12 @@ pub struct BudgetConfig {
     pub classifier_model: Option<String>,
 
     /// The classifier's command line, `{model}` substituted (default: the
-    /// harness's).
+    /// harness's). It runs with plete's own variables (`PLETE_*`, `JEET_*`)
+    /// removed from its environment and nothing else, so its login works.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifier_command: Option<String>,
 
-    /// Seconds the classifier may take (default: 90).
+    /// Seconds the classifier may take (default: 90); over a day is a day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classifier_timeout_secs: Option<u64>,
 }

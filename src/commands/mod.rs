@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod alias;
+pub mod budget;
 pub mod chat;
 pub mod clone;
 pub mod completions;

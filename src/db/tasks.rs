@@ -1548,6 +1548,18 @@ impl Database {
         self.last_report_where(task_id, CLOSES_ASK)
     }
 
+    /// The reports about `id` itself, of any kind, newest first, at most
+    /// `limit`.
+    pub fn reports_about(&self, id: &str, limit: u32) -> Result<Vec<TaskReportRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TASK_REPORT_COLUMNS} FROM task_reports
+             WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![id, limit], task_report_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The reports about `id` and those sent to it, newest first, at most
     /// `limit`.
     pub fn reports_for(&self, id: &str, limit: u32) -> Result<Vec<TaskReportRecord>> {
@@ -2666,6 +2678,9 @@ mod tests {
         // The parent sees everything sent to it.
         assert_eq!(db.reports_for("a", 50).unwrap().len(), 3);
         assert!(db.reports_for("nobody", 50).unwrap().is_empty());
+        // Only the node's own, newest first, however many were sent to it.
+        assert_eq!(ids(db.reports_about("c", 50).unwrap()), [last, by]);
+        assert_eq!(ids(db.reports_about("c", 1).unwrap()), [last]);
     }
 
     /// The assistant `a`, manager `m` under it, and `c` under `m`.

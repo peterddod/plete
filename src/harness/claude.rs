@@ -22,7 +22,7 @@ use serde::Deserialize;
 
 use super::{
     shell_quote, AgentMessage, Enforcement, EventKind, Harness, HookEvent, HookSetup, LastTurn,
-    StartSource, StartupPrompt, TrustStep, TurnEnd,
+    StartSource, StartupPrompt, ToolCall, TranscriptTurn, TrustStep, TurnEnd,
 };
 use crate::agent::{mtime_secs, AgentSession};
 use crate::status::{first_line, DETAIL_MAX};
@@ -260,6 +260,41 @@ impl Harness for ClaudeCode {
             )));
         };
         Some(last_turn(&sessions.join(format!("{id}.jsonl")), n))
+    }
+
+    /// `-p` prints the answer to the prompt on stdin. `--tools ""` removes
+    /// every built-in tool, `--strict-mcp-config` (with no `--mcp-config`)
+    /// loads no MCP server, `--setting-sources ""` no user, project or local
+    /// settings (so none of plete's hooks, which would charge the call to a
+    /// task), and the rest no slash commands, saved session or Chrome.
+    /// Checked against Claude Code 2.1.327.
+    fn classifier_args(&self, model: &str) -> Option<Vec<String>> {
+        Some(
+            [
+                "-p",
+                "--model",
+                model,
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "",
+                "--disable-slash-commands",
+                "--no-session-persistence",
+                "--no-chrome",
+            ]
+            .map(String::from)
+            .to_vec(),
+        )
+    }
+
+    fn recent_turns(&self, dir: &Path, id: &str, n: usize) -> Option<Result<Vec<TranscriptTurn>>> {
+        let Some(sessions) = session_dir(dir) else {
+            return Some(Err(anyhow::anyhow!(
+                "could not locate the Claude Code config directory"
+            )));
+        };
+        Some(recent_turns(&sessions.join(format!("{id}.jsonl")), n))
     }
 
     /// Only directory metadata is read, so it is cheap however long the
@@ -747,6 +782,143 @@ fn last_turn(path: &Path, n: usize) -> Result<LastTurn> {
         end,
         at,
     })
+}
+
+/// What of a tool's input or output is kept.
+const TOOL_TEXT_MAX: usize = 500;
+
+fn cut(text: &str, max: usize) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+/// A user record plete or the harness wrote, not the user: an interrupt
+/// notice, or nothing but a system reminder.
+fn injected(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with(INTERRUPTED)
+        || (text.starts_with("<system-reminder>")
+            && text.ends_with("</system-reminder>")
+            && text.matches("<system-reminder>").count() == 1)
+}
+
+/// The last `n` turns of the transcript at `path`: each user prompt and
+/// each agent reply with its tool calls, results attached to their calls.
+/// Like [`last_turn`], the blocks of one reply (the records sharing a
+/// `message.id`) are one turn. A line that is not JSON, or not UTF-8, is
+/// skipped.
+fn recent_turns(path: &Path, n: usize) -> Result<Vec<TranscriptTurn>> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    // Only the last `n` are kept: transcripts run to many megabytes.
+    let mut turns: VecDeque<TranscriptTurn> = VecDeque::new();
+    // The `message.id` of the reply that is the last turn, if it is.
+    let mut open: Option<String> = None;
+    for line in BufReader::new(file).split(b'\n') {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if record["isSidechain"] == true
+            || record["isMeta"] == true
+            || record["isCompactSummary"] == true
+        {
+            continue;
+        }
+        let content = &record["message"]["content"];
+        match record["type"].as_str() {
+            Some("assistant") => {
+                let text = record_text(content);
+                let tool_calls: Vec<ToolCall> = content
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b["type"] == "tool_use")
+                    .map(|b| ToolCall {
+                        id: b["id"].as_str().unwrap_or_default().to_string(),
+                        name: b["name"].as_str().unwrap_or("?").to_string(),
+                        input_summary: cut(&b["input"].to_string(), TOOL_TEXT_MAX),
+                        output_summary: None,
+                        is_error: false,
+                    })
+                    .collect();
+                if text.is_empty() && tool_calls.is_empty() {
+                    continue;
+                }
+                let id = record["message"]["id"].as_str().map(str::to_string);
+                match turns.back_mut() {
+                    Some(turn) if id.is_some() && id == open => {
+                        if !text.is_empty() {
+                            if !turn.text.is_empty() {
+                                turn.text.push_str("\n\n");
+                            }
+                            turn.text.push_str(&text);
+                        }
+                        turn.tool_calls.extend(tool_calls);
+                    }
+                    _ => {
+                        turns.push_back(TranscriptTurn {
+                            role: "assistant",
+                            text,
+                            tool_calls,
+                        });
+                        open = id;
+                    }
+                }
+            }
+            Some("user") => {
+                // A tool's result belongs to the call that made it.
+                let results: Vec<&serde_json::Value> = content
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b["type"] == "tool_result")
+                    .collect();
+                for result in &results {
+                    let id = result["tool_use_id"].as_str().unwrap_or_default();
+                    let output = match &result["content"] {
+                        serde_json::Value::String(text) => text.clone(),
+                        other => record_text(other),
+                    };
+                    let call = turns
+                        .iter_mut()
+                        .rev()
+                        .flat_map(|t| t.tool_calls.iter_mut())
+                        .find(|c| c.id == id);
+                    if let Some(call) = call {
+                        call.output_summary = Some(cut(&output, TOOL_TEXT_MAX));
+                        call.is_error = result["is_error"] == true;
+                    }
+                }
+                if !results.is_empty() {
+                    continue;
+                }
+                let text = match content.as_str() {
+                    Some(text) => text.to_string(),
+                    None => record_text(content),
+                };
+                if text.trim().is_empty()
+                    || injected(&text)
+                    || LOCAL_COMMAND.iter().any(|c| text.starts_with(c))
+                {
+                    continue;
+                }
+                turns.push_back(TranscriptTurn {
+                    role: "user",
+                    text,
+                    tool_calls: Vec::new(),
+                });
+                open = None;
+            }
+            _ => {}
+        }
+        while turns.len() > n {
+            turns.pop_front();
+        }
+    }
+    Ok(turns.into_iter().collect())
 }
 
 /// The text blocks of a record's content, joined.
@@ -1277,6 +1449,126 @@ mod tests {
             value["hookSpecificOutput"]["additionalContext"],
             "hello\nworld"
         );
+    }
+
+    fn transcript_path(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/transcripts/claude-code")
+            .join(format!("{name}.jsonl"))
+    }
+
+    #[test]
+    fn recent_turns_pair_a_tool_call_with_its_result() {
+        let turns = recent_turns(&transcript_path("tools"), 10).unwrap();
+        // The subagent's and the meta record are left out.
+        let said: Vec<(&str, &str)> = turns.iter().map(|t| (t.role, t.text.as_str())).collect();
+        assert_eq!(
+            said,
+            [
+                ("user", "Run the tests and fix what fails."),
+                ("assistant", "Running them."),
+                ("assistant", ""),
+                ("assistant", "Fixed."),
+            ]
+        );
+        let bash = &turns[1].tool_calls[0];
+        assert_eq!(bash.name, "Bash");
+        assert_eq!(bash.input_summary, r#"{"command":"cargo test"}"#);
+        assert_eq!(
+            bash.output_summary.as_deref(),
+            Some("test a ... FAILED\nfailures: a")
+        );
+        // A result in blocks is read too.
+        assert_eq!(
+            turns[2].tool_calls[0].output_summary.as_deref(),
+            Some("fn a() {}")
+        );
+        assert!(turns[3].tool_calls.is_empty());
+        // Only the last n.
+        let last = recent_turns(&transcript_path("tools"), 2).unwrap();
+        assert_eq!(last.len(), 2);
+        assert_eq!(last[1].text, "Fixed.");
+    }
+
+    #[test]
+    fn recent_turns_make_one_turn_of_a_reply_and_leave_out_what_the_user_did_not_say() {
+        let turns = recent_turns(&transcript_path("noisy"), 10).unwrap();
+        let said: Vec<(&str, &str)> = turns.iter().map(|t| (t.role, t.text.as_str())).collect();
+        // One reply in three records is one turn; a line that is not UTF-8 is
+        // skipped; an interrupt notice, a reminder and a compact summary are
+        // not the user's.
+        assert_eq!(
+            said,
+            [
+                ("user", "go"),
+                ("assistant", "Part one.\n\nPart two."),
+                ("user", "next prompt"),
+                ("assistant", "Done."),
+            ]
+        );
+        let call = &turns[1].tool_calls[0];
+        assert_eq!(call.output_summary.as_deref(), Some("boom"));
+        assert!(call.is_error);
+        let ok = recent_turns(&transcript_path("tools"), 10).unwrap();
+        assert!(!ok[1].tool_calls[0].is_error);
+    }
+
+    #[test]
+    fn recent_turns_keep_ten_and_cut_a_tools_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut lines = Vec::new();
+        for i in 0..12 {
+            lines.push(format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"prompt {i}"}}}}"#
+            ));
+        }
+        lines.push(
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"t","name":"Bash","input":{}}]}}"#
+                .into(),
+        );
+        lines.push(format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"t","content":"{}"}}]}}}}"#,
+            "x".repeat(900)
+        ));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let turns = recent_turns(&path, 10).unwrap();
+        assert_eq!(turns.len(), 10);
+        // 12 prompts and a reply, the last ten: prompts 3..=11 and the reply.
+        assert_eq!(turns[0].text, "prompt 3");
+        let output = turns[9].tool_calls[0].output_summary.as_ref().unwrap();
+        assert_eq!(output.chars().count(), 501, "500 and the mark");
+        assert!(output.ends_with('…'));
+    }
+
+    #[test]
+    fn the_default_classifier_args_are_tool_less_and_isolated() {
+        let args = ClaudeCode.classifier_args("haiku").unwrap();
+        let pair = |flag: &str, value: &str| args.windows(2).any(|w| w[0] == flag && w[1] == value);
+        assert_eq!(args[0], "-p");
+        assert!(pair("--model", "haiku"));
+        // The empty strings are real arguments.
+        assert!(pair("--tools", ""));
+        assert!(pair("--setting-sources", ""));
+        for flag in [
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+            "--no-chrome",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "{flag}: {args:?}");
+        }
+        for flag in [
+            "--mcp-config",
+            "--add-dir",
+            "--allowedTools",
+            "--dangerously-skip-permissions",
+            "--settings",
+            "--session-id",
+        ] {
+            assert!(!args.iter().any(|a| a == flag), "{flag}: {args:?}");
+        }
+        assert!(super::super::Generic.classifier_args("haiku").is_none());
     }
 
     fn pane(name: &str) -> String {
