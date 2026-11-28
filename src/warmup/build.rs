@@ -483,9 +483,21 @@ impl Drop for Group {
     }
 }
 
+/// Whether `signal` is ignored now (`SIG_IGN`), without changing it.
+#[cfg(unix)]
+fn ignored(signal: i32) -> bool {
+    // SAFETY: reads the disposition; `old` is zeroed and written by the call.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut old) == 0
+            && old.sa_sigaction == libc::SIG_IGN
+    }
+}
+
 /// Once per process: a SIGINT, SIGTERM or SIGHUP kills the warm-up's group
 /// before plete dies as it would have. With none running it only does the
-/// latter, so installing it changes nothing for what runs after.
+/// latter, so installing it changes nothing for what runs after. A signal
+/// ignored when plete started (`nohup` ignores SIGHUP) stays ignored.
 fn on_signal() {
     #[cfg(unix)]
     {
@@ -496,6 +508,9 @@ fn on_signal() {
                 signal_hook::consts::SIGTERM,
                 signal_hook::consts::SIGHUP,
             ] {
+                if ignored(signal) {
+                    continue;
+                }
                 // SAFETY: only `killpg` (async-signal-safe) and the default
                 // handler run in it.
                 let _ = unsafe {
@@ -520,6 +535,17 @@ mod tests {
     use crate::warmup::config::Span;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
+
+    #[test]
+    fn a_signal_ignored_at_start_is_seen_as_ignored() {
+        // SIGUSR2: nothing else in the tests uses it.
+        let sig = libc::SIGUSR2;
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
+        assert!(!ignored(sig));
+        unsafe { libc::signal(sig, libc::SIG_IGN) };
+        assert!(ignored(sig));
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
+    }
 
     /// Claude Code's flags, with a transcript and a session store of its own.
     struct Fake {

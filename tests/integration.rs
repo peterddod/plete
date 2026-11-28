@@ -18623,7 +18623,8 @@ fn warmup_ls_is_stale_by_the_clock_and_building_while_locked() {
 #[test]
 fn a_build_charges_no_task_and_takes_no_live_slot() {
     let lab = WarmupLab::new("");
-    lab.lab.new_task_with("kid", &["--parent", "assistant"]);
+    lab.lab
+        .new_task_with("kid", &["--parent", "assistant", "--budget", "30m,20turns"]);
     let usage = || -> Vec<(i64, i64)> {
         let index = lab.lab.index();
         let mut stmt = index
@@ -18634,6 +18635,9 @@ fn a_build_charges_no_task_and_takes_no_live_slot() {
     };
     let live = || stdout_of(&lab.plete(&["manager", "ls"]));
     let (before, listed) = (usage(), live());
+    // The task has a budget row, so the comparison is not of nothing.
+    assert!(!before.is_empty());
+    assert!(listed.contains("kid"), "{listed}");
     succeeded(&lab.plete(&["warmup", "refresh", "mapper", "acme/widget"]));
     assert_eq!(usage(), before);
     assert_eq!(live(), listed);
