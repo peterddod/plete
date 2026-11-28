@@ -182,7 +182,18 @@ const READER_WAIT: Duration = Duration::from_secs(2);
 struct GroupKill(i32);
 
 impl GroupKill {
+    /// Leave the group alone from now on: for a caller that has reaped its
+    /// leader and so knows nothing is left, where the pid may be another
+    /// group's by now.
+    fn disarm(&mut self) {
+        self.0 = 0;
+    }
+
     fn kill(&self) {
+        // Never `kill(-0)`, which is this process's own group.
+        if self.0 == 0 {
+            return;
+        }
         // SAFETY: kill(2) on the process group `run_command` made; an
         // already dead group is only an ESRCH.
         unsafe { libc::kill(-self.0, libc::SIGKILL) };
@@ -465,27 +476,39 @@ fn git_text(path: &Path, args: &[&str]) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let group = GroupKill(child.id() as i32);
+    let mut group = GroupKill(child.id() as i32);
     let out = read_capped(child.stdout.take()?, GIT_READ);
     let deadline = Instant::now() + GIT_WAIT;
-    let (buf, over) = out.recv_timeout(GIT_WAIT).map_err(|_| group.kill()).ok()?;
+    let Ok((buf, over)) = out.recv_timeout(GIT_WAIT) else {
+        // Hung: killed and reaped, nothing left to stray.
+        group.kill();
+        let _ = child.wait();
+        group.disarm();
+        return None;
+    };
     let ok = if over {
         // Enough was read; it need not go on.
         group.kill();
+        let _ = child.wait();
+        group.disarm();
         true
     } else {
         loop {
             if let Ok(Some(status)) = child.try_wait() {
+                // Reaped: git leaves nothing running, and its pid may be
+                // another group's now.
+                group.disarm();
                 break status.success();
             }
             if Instant::now() >= deadline {
+                group.kill();
+                let _ = child.wait();
+                group.disarm();
                 break false;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
     };
-    group.kill();
-    let _ = child.wait();
     ok.then(|| String::from_utf8_lossy(&buf).trim_end().to_string())
 }
 
@@ -526,15 +549,15 @@ pub fn build_bundle(app: &App, task: &TaskRecord, level: u8, bounds: &Bounds) ->
         .max(MIN_ROOM)
         .saturating_sub(fence::fence_message(FROM, "").len());
     let parts = [
-        (2000, "The task", part_task(app, task, level, bounds)?),
-        (3500, "Its last turns", part_turns(app, task)),
+        (4000, "The task", part_task(app, task, level, bounds)?),
+        (3000, "Its last turns", part_turns(app, task)),
         (
-            2000,
+            1500,
             "Its actions.log (last 100 lines)",
             part_log(app, task),
         ),
         // Room for a diff of DIFF_MAX, and the commits, stat and status.
-        (12000, "Its worktrees", part_git(app, task)?),
+        (11500, "Its worktrees", part_git(app, task)?),
         (
             1500,
             "Its reports, and its children's last",
@@ -577,9 +600,9 @@ fn part_task(app: &App, task: &TaskRecord, level: u8, bounds: &Bounds) -> Result
     let mut out = format!("task: {} ({})\n", task.slug, task.name);
     match app.db.get_brief(&task.id)? {
         Some(brief) => {
-            out.push_str(&format!("goal: {}\n", head(&brief.goal, 800)));
+            out.push_str(&format!("goal: {}\n", head(&brief.goal, 600)));
             if let Some(done) = brief.done_when {
-                out.push_str(&format!("done when: {}\n", head(&done, 400)));
+                out.push_str(&format!("done when: {}\n", head(&done, 300)));
             }
         }
         None => out.push_str("no brief\n"),
@@ -1280,6 +1303,32 @@ mod tests {
     }
 
     #[test]
+    fn a_long_goal_of_wide_and_bracket_text_leaves_the_task_line_and_its_start() {
+        let (_dir, mut app) = lab();
+        app.config.harness = Some(HarnessConfig::Name("generic".into()));
+        app.config.agent = Some("some-agent".into());
+        let w2 = app.db.get_task("w2").unwrap().unwrap();
+        // Three bytes a character once fenced, 900 of them.
+        app.db
+            .insert_brief(&TaskBriefRecord {
+                task_id: "w2".into(),
+                goal: "<>日".repeat(300),
+                done_when: Some("日>".repeat(300)),
+                created_by: "user".into(),
+            })
+            .unwrap();
+        let bundle = build_bundle(&app, &w2, 80, &bounds_of_or_none(&app)).unwrap();
+        assert!(bundle.contains("task: w2 (w2)"), "{bundle}");
+        assert!(bundle.contains("goal: ‹›日‹›日"), "{bundle}");
+        assert!(bundle.contains("done when: 日›日›"), "{bundle}");
+        assert!(bundle.contains("crossed: 80% of a limit"), "{bundle}");
+        assert!(bundle.contains("bounds on a grow"), "{bundle}");
+        assert!(!bundle.contains("[…older text cut]\ngoal"), "{bundle}");
+        let whole = prompt(&app, &bundle).unwrap();
+        assert!(whole.len() <= MAX_BUNDLE, "{}", whole.len());
+    }
+
+    #[test]
     fn nothing_a_task_configured_in_its_repository_runs_to_read_it() {
         let (_dir, mut app) = lab();
         let m = busy(&mut app);
@@ -1295,6 +1344,17 @@ mod tests {
         std::fs::write(wt.join("untracked-file.rs"), "x\n").unwrap();
         let bundle = build_bundle(&app, &m, 80, &bounds_of(&app, "m")).unwrap();
         assert!(!ran.exists(), "a configured program ran");
+        // The same setup does run it when git is not held back, so the
+        // marker means something.
+        let plain = Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["diff", "HEAD"])
+            .env_remove("GIT_EXTERNAL_DIFF")
+            .output()
+            .unwrap();
+        assert!(plain.status.success(), "{plain:?}");
+        assert!(ran.exists(), "the setup would not have run the hook anyway");
         // The diff is still read, plain, and the untracked file is named.
         assert!(bundle.contains("changed line 0"), "{bundle}");
         assert!(bundle.contains("?? untracked-file.rs"), "{bundle}");
