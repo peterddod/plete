@@ -18594,3 +18594,47 @@ fn a_task_with_a_parent_may_read_warmups_but_not_rebuild_or_clear_them() {
     succeeded(&lab.plete(&["warmup", "refresh", "mapper"]));
     succeeded(&lab.plete(&["warmup", "clear", "mapper"]));
 }
+
+#[cfg(unix)]
+#[test]
+fn warmup_ls_is_stale_by_the_clock_and_building_while_locked() {
+    let lab = WarmupLab::new("[warmup.refresh]\nevery = \"6h\"\n");
+    succeeded(&lab.plete(&["warmup", "refresh", "mapper", "acme/widget"]));
+    assert!(stdout_of(&lab.plete(&["warmup", "ls"])).contains("fresh"));
+    // Built a day ago.
+    let path = lab.dir().join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let built = meta["built_at"].as_i64().unwrap() - 86_400;
+    meta["built_at"] = built.into();
+    std::fs::write(&path, meta.to_string()).unwrap();
+    let listed = stdout_of(&lab.plete(&["warmup", "ls"]));
+    assert!(
+        listed.contains("stale: refresh schedule passed"),
+        "{listed}"
+    );
+    // A live process holds the key's lock: a build is running.
+    std::fs::write(lab.dir().join(".lock"), format!("{}\n", std::process::id())).unwrap();
+    let listed = stdout_of(&lab.plete(&["warmup", "ls"]));
+    assert!(listed.contains("building"), "{listed}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_build_charges_no_task_and_takes_no_live_slot() {
+    let lab = WarmupLab::new("");
+    lab.lab.new_task_with("kid", &["--parent", "assistant"]);
+    let usage = || -> Vec<(i64, i64)> {
+        let index = lab.lab.index();
+        let mut stmt = index
+            .prepare("SELECT used_secs, used_turns FROM task_budgets ORDER BY task_id")
+            .unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    };
+    let live = || stdout_of(&lab.plete(&["manager", "ls"]));
+    let (before, listed) = (usage(), live());
+    succeeded(&lab.plete(&["warmup", "refresh", "mapper", "acme/widget"]));
+    assert_eq!(usage(), before);
+    assert_eq!(live(), listed);
+}
